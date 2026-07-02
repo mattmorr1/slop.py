@@ -20,6 +20,9 @@ pub struct FunctionFacts {
     pub name_line: u32,
     pub start_line: u32,
     pub end_line: u32,
+    /// Raw source from the `def` (or leading decorator) through the `:` —
+    /// the type-annotated header used verbatim in skeletons.
+    pub signature: String,
     /// Token-based cyclomatic complexity: 1 + branch keywords.
     pub complexity: u32,
     /// Blake3, hex. Empty when the body is below the significance floor.
@@ -227,11 +230,16 @@ fn function_facts(
         + usize::from(params.vararg.is_some())
         + usize::from(params.kwarg.is_some())) as u32;
 
+    let signature = source[TextRange::new(full.start(), body.start())]
+        .trim_end()
+        .to_string();
+
     FunctionFacts {
         name: func.name.to_string(),
         name_line: lines.line(func.name.range().start()),
         start_line: lines.line(full.start()),
         end_line: lines.line(full.end()),
+        signature,
         complexity,
         body_hash,
         structural_hash,

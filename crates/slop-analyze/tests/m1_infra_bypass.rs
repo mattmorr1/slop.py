@@ -227,7 +227,7 @@ fn channel_inference_stays_silent_without_dominance() {
     // Three unrelated Net acquirers in the slopped repo: no 80% winner.
     let (built, _) = analyze("toy_repo_slopped", true);
     let proposals = slop_analyze::infer::infer_channels(&built);
-    assert!(proposals.get("net").is_none(), "{proposals:?}");
+    assert!(!proposals.contains_key("net"), "{proposals:?}");
 }
 
 #[test]
