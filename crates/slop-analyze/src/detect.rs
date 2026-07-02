@@ -144,14 +144,57 @@ pub fn circular_import(built: &BuiltGraph) -> Vec<Finding> {
 
 /// Dead island: a function nothing in the repo calls and that isn't a
 /// declared entry point — the classic hallucinated-structure signal.
-pub fn dead_island(built: &BuiltGraph, policy: &Policy) -> Vec<Finding> {
+/// `decorated` holds entity IDs of functions with any decorator: those are
+/// exempt (framework registration — routes, MCP handlers, fixtures,
+/// properties — is invocation without a by-name reference).
+pub fn dead_island(
+    built: &BuiltGraph,
+    policy: &Policy,
+    decorated: &std::collections::HashSet<String>,
+) -> Vec<Finding> {
     let graph = &built.graph;
+
+    // Methods of classes with class-level external dependencies (base
+    // classes, class decorators — e.g. `class Net(nn.Module)`) implement a
+    // framework contract and get called by the framework, not by name.
+    // Exempting them trades a few false negatives for a large real
+    // false-positive class (found dogfooding geoguessrbot's torch models).
+    let mut framework_classes: std::collections::HashSet<petgraph::graph::NodeIndex> =
+        std::collections::HashSet::new();
+    for (idx, entity) in graph.entities() {
+        if entity.entity_type != NodeType::Class {
+            continue;
+        }
+        let has_external_dep = graph
+            .graph
+            .edges_directed(idx, Direction::Outgoing)
+            .any(|e| {
+                *e.weight() == EdgeKind::Calls
+                    && graph.entity(e.target()).entity_type == NodeType::EffectSource
+            });
+        if has_external_dep {
+            framework_classes.insert(idx);
+        }
+    }
+
     let mut findings = Vec::new();
     for (idx, entity) in graph.entities() {
         if entity.entity_type != NodeType::Function {
             continue;
         }
         if policy.is_entry_point(&entity.id) {
+            continue;
+        }
+        if decorated.contains(&entity.id) {
+            continue;
+        }
+        let framework_method = graph
+            .graph
+            .edges_directed(idx, Direction::Incoming)
+            .any(|e| {
+                *e.weight() == EdgeKind::Contains && framework_classes.contains(&e.source())
+            });
+        if framework_method {
             continue;
         }
         let referenced = graph
@@ -396,9 +439,20 @@ pub fn run_all(
     policy: &Policy,
     facts: &[crate::source::FileFacts],
 ) -> Vec<Finding> {
+    let index = crate::source::location_index(built);
+    let decorated: std::collections::HashSet<String> = facts
+        .iter()
+        .flat_map(|ff| {
+            ff.functions
+                .iter()
+                .filter(|f| f.decorated)
+                .map(|f| label(built, &index, &ff.file, f))
+        })
+        .collect();
+
     let mut findings = infra_bypass(built, policy);
     findings.extend(circular_import(built));
-    findings.extend(dead_island(built, policy));
+    findings.extend(dead_island(built, policy, &decorated));
     findings.extend(purity_lie(built));
     findings.extend(source_detectors(built, facts));
     findings.sort_by(|a, b| {

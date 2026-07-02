@@ -29,6 +29,9 @@ pub struct FunctionFacts {
     pub significant_tokens: u32,
     pub comment_lines: u32,
     pub code_lines: u32,
+    /// Any decorator present: the function may be framework-registered
+    /// (routes, MCP handlers, fixtures) and called without a by-name ref.
+    pub decorated: bool,
 }
 
 struct LineIndex(Vec<TextSize>);
@@ -224,6 +227,7 @@ fn function_facts(
         significant_tokens: significant,
         comment_lines,
         code_lines: code_line_set.len() as u32,
+        decorated: !func.decorator_list.is_empty(),
     }
 }
 
