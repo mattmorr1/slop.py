@@ -1,0 +1,10 @@
+[package]
+name = "slop-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+petgraph = { workspace = true }
+serde = { workspace = true }
+blake3 = { workspace = true }
