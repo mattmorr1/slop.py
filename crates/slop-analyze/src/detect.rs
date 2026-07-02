@@ -455,6 +455,7 @@ pub fn run_all(
     findings.extend(dead_island(built, policy, &decorated));
     findings.extend(purity_lie(built));
     findings.extend(source_detectors(built, facts));
+    findings.extend(crate::naming::naming_convention(built));
     findings.sort_by(|a, b| {
         b.severity
             .cmp(&a.severity)

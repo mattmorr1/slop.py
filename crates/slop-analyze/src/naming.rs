@@ -1,0 +1,119 @@
+//! Naming-convention detector (fuzzy => Advisory only, D12).
+//!
+//! Codebase-relative: the dominant case style is measured from the
+//! function-name population, deviants are flagged. Plus absolute AI-slop
+//! name patterns (`_v2`, `helper_`, `temp_`).
+
+use slop_graph::NodeType;
+
+use crate::build::BuiltGraph;
+use crate::findings::{Finding, Severity};
+
+const DOMINANCE: f64 = 0.9;
+const MIN_POPULATION: usize = 5;
+
+const SLOP_SUFFIXES: &[&str] = &["_v2", "_v3", "_new", "_old", "_final", "_copy", "_backup"];
+const SLOP_PREFIXES: &[&str] = &["helper_", "temp_", "my_"];
+
+#[derive(PartialEq, Clone, Copy)]
+enum CaseStyle {
+    Snake,
+    Camel,
+    Other,
+}
+
+fn case_style(name: &str) -> CaseStyle {
+    let has_underscore = name.contains('_');
+    let has_inner_upper = name.chars().skip(1).any(|c| c.is_uppercase());
+    match (has_underscore, has_inner_upper) {
+        (_, false) => CaseStyle::Snake, // single-word names count as snake
+        (false, true) => CaseStyle::Camel,
+        (true, true) => CaseStyle::Other,
+    }
+}
+
+pub fn naming_convention(built: &BuiltGraph) -> Vec<Finding> {
+    let functions: Vec<_> = built
+        .graph
+        .entities()
+        .filter(|(_, e)| e.entity_type == NodeType::Function)
+        .map(|(_, e)| e)
+        .collect();
+
+    let mut findings = Vec::new();
+
+    // Population-relative case style.
+    if functions.len() >= MIN_POPULATION {
+        let named: Vec<(&str, CaseStyle)> = functions
+            .iter()
+            .map(|e| {
+                let name = e.id.rsplit("::").next().unwrap_or(&e.id);
+                (name, case_style(name))
+            })
+            .collect();
+        let snake = named.iter().filter(|(_, s)| *s == CaseStyle::Snake).count();
+        if snake as f64 / named.len() as f64 >= DOMINANCE {
+            for (entity, (name, style)) in functions.iter().zip(&named) {
+                if *style != CaseStyle::Snake && !name.starts_with("__") {
+                    findings.push(Finding {
+                        rule: "naming-convention",
+                        severity: Severity::Advisory,
+                        entity: entity.id.clone(),
+                        file: entity.file.clone(),
+                        lines: entity.source_range,
+                        message: format!(
+                            "`{name}` deviates from this codebase's dominant snake_case style ({snake}/{} functions)",
+                            named.len()
+                        ),
+                        fix_guidance: format!("Rename `{name}` to snake_case"),
+                    });
+                }
+            }
+        }
+    }
+
+    // Absolute slop-name patterns. Normalize camelCase to snake_case first
+    // so `fetchDataV2` matches `_v2`.
+    for entity in &functions {
+        let name = entity.id.rsplit("::").next().unwrap_or(&entity.id);
+        let mut lower = String::with_capacity(name.len() + 4);
+        for ch in name.chars() {
+            if ch.is_uppercase() && !lower.is_empty() && !lower.ends_with('_') {
+                lower.push('_');
+            }
+            lower.extend(ch.to_lowercase());
+        }
+        let suffix = SLOP_SUFFIXES.iter().find(|s| lower.ends_with(**s));
+        let prefix = SLOP_PREFIXES.iter().find(|p| lower.starts_with(**p));
+        if let Some(pattern) = suffix.or(prefix) {
+            findings.push(Finding {
+                rule: "slop-name",
+                severity: Severity::Advisory,
+                entity: entity.id.clone(),
+                file: entity.file.clone(),
+                lines: entity.source_range,
+                message: format!(
+                    "`{name}` carries the throwaway marker `{pattern}` — a versioned/placeholder name that outlives its intent"
+                ),
+                fix_guidance: format!(
+                    "Rename `{name}` to describe what it does; if it supersedes an older function, delete the old one instead of versioning the name"
+                ),
+            });
+        }
+    }
+
+    findings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn case_style_classification() {
+        assert!(matches!(case_style("parse_date"), CaseStyle::Snake));
+        assert!(matches!(case_style("main"), CaseStyle::Snake));
+        assert!(matches!(case_style("fetchData"), CaseStyle::Camel));
+        assert!(matches!(case_style("fetch_Data"), CaseStyle::Other));
+    }
+}

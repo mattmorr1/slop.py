@@ -13,4 +13,5 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 slop-analyze = { workspace = true }
 slop-graph = { workspace = true }
+slop-llm = { workspace = true }
 slop-resolve = { workspace = true }

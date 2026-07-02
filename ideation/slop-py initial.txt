@@ -1,18 +1,3 @@
-╭─── Claude Code v2.1.198 ─────────────────────────────────────────────────────╮
-│                                               │ Tips for getting started     │
-│               Welcome back Matt!              │ Run /init to create a CLAUD… │
-│                                               │ ──────────────────────────── │
-│                    ▐▛███▜▌                    │ What's new                   │
-│                   ▝▜█████▛▘                   │ Claude in Chrome is now gen… │
-│                     ▘▘ ▝▝                     │ Added background agent noti… │
-│                                               │ Added `/dataviz` skill for … │
-│   Opus 4.8 · Claude Team · DeepTempo Parent   │ /release-notes for more      │
-│          ~/Documents/GitHub/slop.py           │                              │
-╰──────────────────────────────────────────────────────────────────────────────╯
-
- ▎ Fable 5 is back.
- ▎ Until July 7, you can use up to 50% of your plan's weekly usage limit on Fable 5. If you hit your limit, you can continue on Fable 5 with usage credits. Fable 5 draws down usage faster than Opus 4.8. Learn more
-
 ❯ /mcp 
   ⎿  MCP dialog dismissed
 

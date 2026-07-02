@@ -32,6 +32,10 @@ pub struct FunctionFacts {
     /// Any decorator present: the function may be framework-registered
     /// (routes, MCP handlers, fixtures) and called without a by-name ref.
     pub decorated: bool,
+    /// Total parameter count (self included) — Tier-3 bucket key component.
+    pub param_count: u32,
+    /// Body contains `return <expr>` at any depth.
+    pub returns_value: bool,
 }
 
 struct LineIndex(Vec<TextSize>);
@@ -216,6 +220,13 @@ fn function_facts(
         (String::new(), String::new())
     };
 
+    let params = &func.parameters;
+    let param_count = (params.posonlyargs.len()
+        + params.args.len()
+        + params.kwonlyargs.len()
+        + usize::from(params.vararg.is_some())
+        + usize::from(params.kwarg.is_some())) as u32;
+
     FunctionFacts {
         name: func.name.to_string(),
         name_line: lines.line(func.name.range().start()),
@@ -228,7 +239,42 @@ fn function_facts(
         comment_lines,
         code_lines: code_line_set.len() as u32,
         decorated: !func.decorator_list.is_empty(),
+        param_count,
+        returns_value: body_returns_value(&func.body),
     }
+}
+
+fn body_returns_value(stmts: &[Stmt]) -> bool {
+    for stmt in stmts {
+        let found = match stmt {
+            Stmt::Return(r) => r.value.is_some(),
+            // Nested function defs are their own scope — don't descend.
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
+            Stmt::If(s) => {
+                body_returns_value(&s.body)
+                    || s.elif_else_clauses
+                        .iter()
+                        .any(|c| body_returns_value(&c.body))
+            }
+            Stmt::While(s) => body_returns_value(&s.body) || body_returns_value(&s.orelse),
+            Stmt::For(s) => body_returns_value(&s.body) || body_returns_value(&s.orelse),
+            Stmt::With(s) => body_returns_value(&s.body),
+            Stmt::Try(s) => {
+                body_returns_value(&s.body)
+                    || s.handlers.iter().any(|h| {
+                        let ast::ExceptHandler::ExceptHandler(h) = h;
+                        body_returns_value(&h.body)
+                    })
+                    || body_returns_value(&s.orelse)
+                    || body_returns_value(&s.finalbody)
+            }
+            _ => false,
+        };
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

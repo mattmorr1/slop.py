@@ -4,6 +4,7 @@ members = [
     "crates/slop",
     "crates/slop-analyze",
     "crates/slop-graph",
+    "crates/slop-llm",
     "crates/slop-parse",
     "crates/slop-resolve",
 ]
@@ -27,8 +28,10 @@ toml = "0.8"
 ruff_python_parser = "0.0.3"
 ruff_python_ast = "0.0.3"
 ruff_text_size = "0.0.3"
+ureq = { version = "2", features = ["json"] }
 
 slop-graph = { path = "crates/slop-graph" }
+slop-llm = { path = "crates/slop-llm" }
 slop-parse = { path = "crates/slop-parse" }
 slop-resolve = { path = "crates/slop-resolve" }
 slop-analyze = { path = "crates/slop-analyze" }

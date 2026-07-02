@@ -9,6 +9,8 @@ pub mod entity_id;
 pub mod findings;
 pub mod health;
 pub mod infer;
+pub mod naming;
 pub mod policy;
 pub mod source;
 pub mod suppress;
+pub mod tier3;
