@@ -18,11 +18,14 @@ pub struct Policy {
 
 impl Policy {
     pub fn load(repo_root: &Path) -> Result<Self> {
-        let path = repo_root.join("slop.toml");
+        Self::load_file(&repo_root.join("slop.toml"))
+    }
+
+    pub fn load_file(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path)
+        let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }

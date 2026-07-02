@@ -17,12 +17,16 @@ pub struct Seed {
 }
 
 /// M1 seed table: Net only. Grows to the full lattice in M2.
+///
+/// Prefixes are deliberately narrow: `urllib.parse` and `http.cookies` are
+/// pure — seeding all of `urllib`/`http` flags URL formatting as network
+/// I/O (found dogfooding stress-analysis).
 pub const SEEDS: &[Seed] = &[
-    Seed { module_prefix: "urllib", effect: Effect::Net },
+    Seed { module_prefix: "urllib.request", effect: Effect::Net },
     Seed { module_prefix: "urllib3", effect: Effect::Net },
     Seed { module_prefix: "requests", effect: Effect::Net },
     Seed { module_prefix: "socket", effect: Effect::Net },
-    Seed { module_prefix: "http", effect: Effect::Net },
+    Seed { module_prefix: "http.client", effect: Effect::Net },
     Seed { module_prefix: "httpx", effect: Effect::Net },
     Seed { module_prefix: "aiohttp", effect: Effect::Net },
 ];

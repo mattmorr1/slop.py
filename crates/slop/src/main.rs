@@ -25,6 +25,9 @@ enum Command {
         /// Judge the whole repo instead of the diff (audit-lite)
         #[arg(long)]
         all: bool,
+        /// Path to a slop.toml policy (default: <repo>/slop.toml)
+        #[arg(long)]
+        policy: Option<PathBuf>,
         /// Git ref to diff against (default: HEAD)
         #[arg(long, default_value = "HEAD")]
         base: String,
@@ -59,6 +62,7 @@ fn main() -> Result<()> {
             repo,
             index,
             all,
+            policy,
             base,
         } => {
             let index_path = index.unwrap_or_else(|| repo.join("index.scip"));
@@ -71,7 +75,10 @@ fn main() -> Result<()> {
                 );
             }
             let resolver = ScipResolver::load(&index_path)?;
-            let policy = Policy::load(&repo)?;
+            let policy = match policy {
+                Some(path) => Policy::load_file(&path)?,
+                None => Policy::load(&repo)?,
+            };
 
             let mut built = build::build_graph(&resolver);
             effects::infer_effects(&mut built);

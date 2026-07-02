@@ -14,8 +14,11 @@ use crate::policy::Policy;
 /// the sanctioned channel — are exactly what code is supposed to do and are
 /// never flagged.
 pub fn infra_bypass(built: &BuiltGraph, policy: &Policy) -> Vec<Finding> {
-    let mut findings = Vec::new();
     let graph = &built.graph;
+    // One finding per (entity, effect), aggregating every raw source it
+    // touches — per-source findings triple-report a single bypass.
+    let mut offenders: Vec<(petgraph::graph::NodeIndex, slop_graph::Effect, Vec<String>)> =
+        Vec::new();
 
     for (idx, entity) in graph.entities() {
         // Modules acquire effects through import statements alone; judging
@@ -30,37 +33,56 @@ pub fn infra_bypass(built: &BuiltGraph, policy: &Policy) -> Vec<Finding> {
             }
             let source = graph.entity(edge.target());
             for &effect in &source.effect_signature.0 {
-                let channels = policy.channels_for(effect);
-                if channels.is_empty() {
+                if policy.channels_for(effect).is_empty() {
                     continue; // no policy for this effect => silent (D8)
                 }
                 if policy.is_sanctioned(effect, &entity.id) {
                     continue;
                 }
-                findings.push(Finding {
-                    rule: "infra-bypass",
-                    severity: Severity::Blocking,
-                    entity: entity.id.clone(),
-                    file: entity.file.clone(),
-                    lines: entity.source_range,
-                    message: format!(
-                        "`{}` acquires a raw {:?} effect directly via `{}`; this codebase routes {:?} I/O through {}",
-                        entity.id,
-                        effect,
-                        source.id,
-                        effect,
-                        channels.join(", "),
-                    ),
-                    fix_guidance: format!(
-                        "Delegate the {:?} operation to the sanctioned channel `{}` instead of calling `{}` directly",
-                        effect,
-                        channels.join("` or `"),
-                        source.id,
-                    ),
-                });
+                match offenders
+                    .iter_mut()
+                    .find(|(n, e, _)| *n == idx && *e == effect)
+                {
+                    Some((_, _, sources)) => {
+                        if !sources.contains(&source.id) {
+                            sources.push(source.id.clone());
+                        }
+                    }
+                    None => offenders.push((idx, effect, vec![source.id.clone()])),
+                }
             }
         }
     }
+
+    let mut findings: Vec<Finding> = offenders
+        .into_iter()
+        .map(|(idx, effect, mut sources)| {
+            sources.sort();
+            let entity = graph.entity(idx);
+            let channels = policy.channels_for(effect);
+            Finding {
+                rule: "infra-bypass",
+                severity: Severity::Blocking,
+                entity: entity.id.clone(),
+                file: entity.file.clone(),
+                lines: entity.source_range,
+                message: format!(
+                    "`{}` acquires a raw {:?} effect directly via `{}`; this codebase routes {:?} I/O through {}",
+                    entity.id,
+                    effect,
+                    sources.join("`, `"),
+                    effect,
+                    channels.join(", "),
+                ),
+                fix_guidance: format!(
+                    "Delegate the {:?} operation to the sanctioned channel `{}` instead of using `{}` directly",
+                    effect,
+                    channels.join("` or `"),
+                    sources.join("`, `"),
+                ),
+            }
+        })
+        .collect();
 
     findings.sort_by(|a, b| {
         b.severity
@@ -68,7 +90,6 @@ pub fn infra_bypass(built: &BuiltGraph, policy: &Policy) -> Vec<Finding> {
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.lines.0.cmp(&b.lines.0))
     });
-    findings.dedup_by(|a, b| a.entity == b.entity && a.rule == b.rule && a.message == b.message);
     findings
 }
 
