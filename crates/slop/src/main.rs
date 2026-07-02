@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::process::Command as Process;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use slop_analyze::{build, detect, diff, effects, policy::Policy};
 use slop_resolve::{Resolver, ScipResolver};
 
 #[derive(Parser)]
@@ -13,6 +15,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Analyze a repo. Default: judge only the working-tree diff (vs HEAD).
+    Check {
+        /// Repo root (must contain slop.toml for policy-gated checks)
+        repo: PathBuf,
+        /// Path to index.scip (default: <repo>/index.scip)
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Judge the whole repo instead of the diff (audit-lite)
+        #[arg(long)]
+        all: bool,
+        /// Git ref to diff against (default: HEAD)
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+    },
     /// Debug: load a SCIP index and print what the resolver sees.
     IndexInfo {
         /// Path to index.scip
@@ -39,6 +55,72 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Check {
+            repo,
+            index,
+            all,
+            base,
+        } => {
+            let index_path = index.unwrap_or_else(|| repo.join("index.scip"));
+            if !index_path.exists() {
+                bail!(
+                    "no SCIP index at {} — generate one with:\n  npx --yes @sourcegraph/scip-python index {} --project-name <name> --output {}",
+                    index_path.display(),
+                    repo.display(),
+                    index_path.display(),
+                );
+            }
+            let resolver = ScipResolver::load(&index_path)?;
+            let policy = Policy::load(&repo)?;
+
+            let mut built = build::build_graph(&resolver);
+            effects::infer_effects(&mut built);
+            let mut findings = detect::run_all(&built, &policy);
+
+            if !all {
+                let output = Process::new("git")
+                    .args(["-C"])
+                    .arg(&repo)
+                    .args(["diff", "-U0", "--no-color", &base, "--", "*.py"])
+                    .output()
+                    .context("running git diff (use --all for a non-git tree)")?;
+                if !output.status.success() {
+                    bail!(
+                        "git diff failed: {} — use --all to judge the whole repo",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                let changed = diff::parse_unified_diff(&String::from_utf8_lossy(&output.stdout));
+                findings = diff::filter_to_changes(findings, &changed);
+            }
+
+            if policy.channels.is_empty() {
+                eprintln!(
+                    "note: {} has no slop.toml channel policy — infra-bypass checks are silent",
+                    repo.display()
+                );
+            }
+
+            if findings.is_empty() {
+                println!("no slop found");
+                return Ok(());
+            }
+            let blocking = findings
+                .iter()
+                .filter(|f| f.severity == slop_analyze::findings::Severity::Blocking)
+                .count();
+            for finding in &findings {
+                println!("{finding}\n");
+            }
+            println!(
+                "{} finding(s), {} blocking",
+                findings.len(),
+                blocking
+            );
+            if blocking > 0 {
+                std::process::exit(1);
+            }
+        }
         Command::IndexInfo { index } => {
             let resolver = ScipResolver::load(&index)?;
             println!("definitions: {}", resolver.definition_count());

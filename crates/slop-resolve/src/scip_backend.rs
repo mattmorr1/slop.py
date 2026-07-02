@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use protobuf::Message;
 
-use crate::{Definition, Occurrence, Range, Resolver};
+use crate::{Definition, Occurrence, Range, Resolver, SymbolKind};
 
 const SYMBOL_ROLE_DEFINITION: i32 = 0x1;
 
@@ -46,6 +46,8 @@ impl ScipResolver {
                     symbol: info.symbol.clone(),
                     file: None,
                     range: None,
+                    enclosing_range: None,
+                    kind: SymbolKind::from_symbol(&info.symbol),
                     display_name: display_name(&info.symbol, &info.display_name),
                     documentation: info.documentation.clone(),
                 });
@@ -66,12 +68,15 @@ impl ScipResolver {
                     continue;
                 };
                 let is_definition = occ.symbol_roles & SYMBOL_ROLE_DEFINITION != 0;
+                let enclosing_range = parse_range(&occ.enclosing_range);
                 if is_definition {
                     let info = doc_info.get(occ.symbol.as_str());
                     let def = Definition {
                         symbol: occ.symbol.clone(),
                         file: Some(file.clone()),
                         range: Some(range),
+                        enclosing_range,
+                        kind: SymbolKind::from_symbol(&occ.symbol),
                         display_name: display_name(
                             &occ.symbol,
                             info.map(|i| i.display_name.as_str()).unwrap_or(""),
@@ -90,6 +95,7 @@ impl ScipResolver {
                     symbol: occ.symbol.clone(),
                     range,
                     is_definition,
+                    enclosing_range,
                 });
             }
 
@@ -111,6 +117,8 @@ impl ScipResolver {
                             symbol: occ.symbol.clone(),
                             file: None,
                             range: None,
+                            enclosing_range: None,
+                            kind: SymbolKind::from_symbol(&occ.symbol),
                             display_name: display_name(&occ.symbol, ""),
                             documentation: Vec::new(),
                         },

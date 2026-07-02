@@ -29,6 +29,48 @@ impl Range {
     }
 }
 
+/// What kind of entity a symbol names. scip-python leaves the protobuf
+/// `kind` field unspecified, so this is derived from the SCIP symbol
+/// grammar's descriptor suffix (`Name#` type, `name().` function, `name:`
+/// namespace, `name.` term, `(name)` parameter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SymbolKind {
+    Module,
+    Class,
+    Function,
+    Parameter,
+    Term,
+    TypeParameter,
+    Macro,
+    Local,
+    Unknown,
+}
+
+impl SymbolKind {
+    pub fn from_symbol(symbol: &str) -> Self {
+        if symbol.starts_with("local ") {
+            return SymbolKind::Local;
+        }
+        if symbol.ends_with("().") {
+            SymbolKind::Function
+        } else if symbol.ends_with('#') {
+            SymbolKind::Class
+        } else if symbol.ends_with(':') {
+            SymbolKind::Module
+        } else if symbol.ends_with(')') {
+            SymbolKind::Parameter
+        } else if symbol.ends_with(']') {
+            SymbolKind::TypeParameter
+        } else if symbol.ends_with('!') {
+            SymbolKind::Macro
+        } else if symbol.ends_with('.') {
+            SymbolKind::Term
+        } else {
+            SymbolKind::Unknown
+        }
+    }
+}
+
 /// Where a symbol is defined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Definition {
@@ -41,6 +83,11 @@ pub struct Definition {
     /// (`requests.get` -> Net).
     pub file: Option<String>,
     pub range: Option<Range>,
+    /// Full span of the defined body (fn body, class body) when the indexer
+    /// emitted it — the anchor for attributing references to their enclosing
+    /// definition.
+    pub enclosing_range: Option<Range>,
+    pub kind: SymbolKind,
     /// Human-readable name, e.g. `HttpClient#get`.
     pub display_name: String,
     /// Documentation / signature text the indexer attached, when present.
@@ -59,6 +106,8 @@ pub struct Occurrence {
     pub symbol: String,
     pub range: Range,
     pub is_definition: bool,
+    /// Body span, present on class/function definition occurrences.
+    pub enclosing_range: Option<Range>,
 }
 
 /// The adapter interface (D5). Everything downstream — graph build, effect

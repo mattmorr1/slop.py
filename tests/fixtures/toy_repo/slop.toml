@@ -1,0 +1,2 @@
+[channels]
+net = ["core.http_client.HttpClient"]
