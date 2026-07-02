@@ -13,8 +13,15 @@ const SYMBOL_ROLE_DEFINITION: i32 = 0x1;
 
 pub struct ScipResolver {
     definitions: HashMap<String, Definition>,
+    /// SCIP `local N` symbols are document-scoped, so they live in a
+    /// per-file map — a global one would collide across files.
+    local_definitions: HashMap<(String, String), Definition>,
     occurrences_by_file: HashMap<String, Vec<Occurrence>>,
     empty: Vec<Occurrence>,
+}
+
+fn is_local(symbol: &str) -> bool {
+    symbol.starts_with("local ")
 }
 
 impl ScipResolver {
@@ -28,6 +35,7 @@ impl ScipResolver {
 
     fn from_index(index: scip::types::Index) -> Self {
         let mut definitions: HashMap<String, Definition> = HashMap::new();
+        let mut local_definitions: HashMap<(String, String), Definition> = HashMap::new();
         let mut occurrences_by_file: HashMap<String, Vec<Occurrence>> = HashMap::new();
 
         // External symbols (stdlib, site-packages): definitions with no file.
@@ -60,21 +68,23 @@ impl ScipResolver {
                 let is_definition = occ.symbol_roles & SYMBOL_ROLE_DEFINITION != 0;
                 if is_definition {
                     let info = doc_info.get(occ.symbol.as_str());
-                    definitions.insert(
-                        occ.symbol.clone(),
-                        Definition {
-                            symbol: occ.symbol.clone(),
-                            file: Some(file.clone()),
-                            range: Some(range),
-                            display_name: display_name(
-                                &occ.symbol,
-                                info.map(|i| i.display_name.as_str()).unwrap_or(""),
-                            ),
-                            documentation: info
-                                .map(|i| i.documentation.clone())
-                                .unwrap_or_default(),
-                        },
-                    );
+                    let def = Definition {
+                        symbol: occ.symbol.clone(),
+                        file: Some(file.clone()),
+                        range: Some(range),
+                        display_name: display_name(
+                            &occ.symbol,
+                            info.map(|i| i.display_name.as_str()).unwrap_or(""),
+                        ),
+                        documentation: info
+                            .map(|i| i.documentation.clone())
+                            .unwrap_or_default(),
+                    };
+                    if is_local(&occ.symbol) {
+                        local_definitions.insert((file.clone(), occ.symbol.clone()), def);
+                    } else {
+                        definitions.insert(occ.symbol.clone(), def);
+                    }
                 }
                 occs.push(Occurrence {
                     symbol: occ.symbol.clone(),
@@ -87,8 +97,31 @@ impl ScipResolver {
             occurrences_by_file.insert(file, occs);
         }
 
+        // scip-python references stdlib/module symbols (e.g.
+        // `python-stdlib 3.11 'urllib.request'/__init__:`) without listing
+        // them in external_symbols. Synthesize file-less definitions so
+        // references to them still resolve — the effect seed table keys off
+        // exactly these symbols.
+        for occs in occurrences_by_file.values() {
+            for occ in occs {
+                if !is_local(&occ.symbol) && !definitions.contains_key(&occ.symbol) {
+                    definitions.insert(
+                        occ.symbol.clone(),
+                        Definition {
+                            symbol: occ.symbol.clone(),
+                            file: None,
+                            range: None,
+                            display_name: display_name(&occ.symbol, ""),
+                            documentation: Vec::new(),
+                        },
+                    );
+                }
+            }
+        }
+
         Self {
             definitions,
+            local_definitions,
             occurrences_by_file,
             empty: Vec::new(),
         }
@@ -96,6 +129,12 @@ impl ScipResolver {
 
     pub fn definition_count(&self) -> usize {
         self.definitions.len()
+    }
+
+    /// Definition of a document-scoped `local N` symbol within `file`.
+    pub fn local_definition_of(&self, file: &str, symbol: &str) -> Option<&Definition> {
+        self.local_definitions
+            .get(&(file.to_string(), symbol.to_string()))
     }
 }
 
@@ -110,7 +149,12 @@ impl Resolver for ScipResolver {
             .min_by_key(|o| {
                 (o.range.end_line - o.range.start_line, o.range.end_col.wrapping_sub(o.range.start_col))
             })?;
-        self.definitions.get(&occ.symbol)
+        if is_local(&occ.symbol) {
+            self.local_definitions
+                .get(&(file.to_string(), occ.symbol.clone()))
+        } else {
+            self.definitions.get(&occ.symbol)
+        }
     }
 
     fn definition_of(&self, symbol: &str) -> Option<&Definition> {

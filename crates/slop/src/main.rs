@@ -18,6 +18,13 @@ enum Command {
         /// Path to index.scip
         index: PathBuf,
     },
+    /// Debug: list all occurrences recorded in a file.
+    Occurrences {
+        /// Path to index.scip
+        index: PathBuf,
+        /// Repo-relative file path as recorded in the index
+        file: String,
+    },
     /// Debug: resolve the reference at file:line:col (0-based) to its definition.
     Resolve {
         /// Path to index.scip
@@ -43,6 +50,23 @@ fn main() -> Result<()> {
                     occs.len(),
                     defs,
                     occs.len() - defs
+                );
+            }
+        }
+        Command::Occurrences { index, file } => {
+            let resolver = ScipResolver::load(&index)?;
+            for occ in resolver.occurrences_in(&file) {
+                let role = if occ.is_definition { "def" } else { "ref" };
+                let known = resolver.definition_of(&occ.symbol).is_some()
+                    || resolver.local_definition_of(&file, &occ.symbol).is_some();
+                let resolved = if known { "" } else { "  [no definition]" };
+                println!(
+                    "{}:{}-{}:{} {role} {}{resolved}",
+                    occ.range.start_line,
+                    occ.range.start_col,
+                    occ.range.end_line,
+                    occ.range.end_col,
+                    occ.symbol
                 );
             }
         }
