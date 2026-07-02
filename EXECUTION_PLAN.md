@@ -211,9 +211,9 @@ Baseline via `slop audit` on each; then validate `slop check` diff-mode against 
 - RepoHyper — Phan et al., FORGE 2025 (arXiv 2403.06095) — semantic graph, *not* a hypergraph.
 - CodePlan — Bairi et al., FSE 2024 (arXiv 2309.12499).
 - RepoCoder — Zhang et al., EMNLP 2023 (arXiv 2303.12570).
-- 
--  — Agrawal et al., NeurIPS 2023.
+- Monitor-Guided Decoding — Agrawal et al., NeurIPS 2023.
 - LongCodeZip / CodeCompressor — 2025 (closest published AST-skeleton compression; sharpen differentiation against it).
 - Agentless — Xia et al., FSE 2025 (arXiv 2407.01489).
 - Semantic (Type-4) clone detection — reusable for duplication detectors.
 
+long term: test on gemini flash 3.5 swe-bench lite.

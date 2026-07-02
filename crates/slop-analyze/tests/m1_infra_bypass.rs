@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use slop_analyze::findings::{Finding, Severity};
 use slop_analyze::{build, detect, effects, policy::Policy};
 use slop_graph::Effect;
-use slop_resolve::ScipResolver;
+use slop_resolve::{Resolver, ScipResolver};
 
 fn analyze(fixture: &str, with_policy: bool) -> (build::BuiltGraph, Vec<Finding>) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -20,7 +20,8 @@ fn analyze(fixture: &str, with_policy: bool) -> (build::BuiltGraph, Vec<Finding>
     };
     let mut built = build::build_graph(&resolver);
     effects::infer_effects(&mut built);
-    let findings = detect::run_all(&built, &policy);
+    let facts = slop_analyze::source::parse_repo(&root, &resolver.files());
+    let findings = detect::run_all(&built, &policy, &facts);
     (built, findings)
 }
 
@@ -80,9 +81,55 @@ fn dead_island_flags_unreferenced_functions_only() {
         vec![
             "services.alerts::send_alert",
             "services.notify::notify_with_report",
+            "services.routing::apply_discount",
+            "services.routing::route_event",
+            "utils.cleaning::clean_rows",
+            "utils.cleaning::normalize_rows",
+            "utils.cleaning::scale_rows",
             "utils.scoring::compute_risk_score"
         ]
     );
+}
+
+#[test]
+fn tier1_duplicate_pairs_exact_bodies() {
+    let (_, findings) = analyze("toy_repo_slopped", true);
+    assert_eq!(
+        entities_for(&findings, "duplicate-exact"),
+        vec![
+            "utils.cleaning::clean_rows",
+            "utils.cleaning::normalize_rows"
+        ]
+    );
+}
+
+#[test]
+fn tier2_flags_structural_twin_only() {
+    let (_, findings) = analyze("toy_repo_slopped", true);
+    // scale_rows shares shape with clean/normalize but not bytes; the
+    // exact-dup pair reports against scale_rows symmetrically.
+    let entities = entities_for(&findings, "duplicate-structural");
+    assert!(entities.contains(&"utils.cleaning::scale_rows"), "{entities:?}");
+}
+
+#[test]
+fn complexity_spike_fires_on_branchy_router() {
+    let (_, findings) = analyze("toy_repo_slopped", true);
+    assert_eq!(
+        entities_for(&findings, "complexity-spike"),
+        vec!["services.routing::route_event"]
+    );
+}
+
+#[test]
+fn over_commenting_fires_on_narrated_function() {
+    let (_, findings) = analyze("toy_repo_slopped", true);
+    assert_eq!(
+        entities_for(&findings, "over-commenting"),
+        vec!["services.routing::apply_discount"]
+    );
+    let f = findings.iter().find(|f| f.rule == "over-commenting").unwrap();
+    assert_eq!(f.severity, Severity::Advisory);
 }
 
 #[test]

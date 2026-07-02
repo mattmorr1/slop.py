@@ -82,7 +82,8 @@ fn main() -> Result<()> {
 
             let mut built = build::build_graph(&resolver);
             effects::infer_effects(&mut built);
-            let mut findings = detect::run_all(&built, &policy);
+            let facts = slop_analyze::source::parse_repo(&repo, &resolver.files());
+            let mut findings = detect::run_all(&built, &policy, &facts);
 
             if !all {
                 let output = Process::new("git")

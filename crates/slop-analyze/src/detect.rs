@@ -230,12 +230,177 @@ pub fn purity_lie(built: &BuiltGraph) -> Vec<Finding> {
     findings
 }
 
+const COMPLEXITY_THRESHOLD: u32 = 10;
+
+/// Entity label for a parsed function: the graph node's ID when the join
+/// succeeds, a file-derived fallback otherwise.
+fn label(
+    built: &BuiltGraph,
+    index: &std::collections::HashMap<(String, usize), petgraph::graph::NodeIndex>,
+    file: &str,
+    fact: &slop_parse::FunctionFacts,
+) -> String {
+    crate::source::entity_for(built, index, file, fact)
+        .map(|e| e.id.clone())
+        .unwrap_or_else(|| format!("{}::{}", file.trim_end_matches(".py").replace('/', "."), fact.name))
+}
+
+/// Tier-1 (exact) and Tier-2 (structural) duplication, complexity spikes,
+/// and over-commenting — the parser-backed deterministic detectors.
+pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) -> Vec<Finding> {
+    use std::collections::HashMap;
+    let index = crate::source::location_index(built);
+    let mut findings = Vec::new();
+
+    struct Member {
+        label: String,
+        file: String,
+        lines: (usize, usize),
+        body_hash: String,
+    }
+    let mut by_body: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut by_shape: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut members: Vec<Member> = Vec::new();
+
+    for ff in facts {
+        for fact in &ff.functions {
+            let entity_label = label(built, &index, &ff.file, fact);
+            let lines = (fact.start_line as usize, fact.end_line as usize);
+
+            if fact.complexity > COMPLEXITY_THRESHOLD {
+                findings.push(Finding {
+                    rule: "complexity-spike",
+                    severity: Severity::Warning,
+                    entity: entity_label.clone(),
+                    file: ff.file.clone(),
+                    lines,
+                    message: format!(
+                        "`{}` has cyclomatic complexity {} (threshold {COMPLEXITY_THRESHOLD})",
+                        fact.name, fact.complexity
+                    ),
+                    fix_guidance: "Split conditional branches into smaller functions".into(),
+                });
+            }
+
+            if fact.comment_lines >= 4 && fact.comment_lines * 2 >= fact.code_lines.max(1) {
+                findings.push(Finding {
+                    rule: "over-commenting",
+                    severity: Severity::Advisory,
+                    entity: entity_label.clone(),
+                    file: ff.file.clone(),
+                    lines,
+                    message: format!(
+                        "`{}` has {} comment lines against {} code lines",
+                        fact.name, fact.comment_lines, fact.code_lines
+                    ),
+                    fix_guidance:
+                        "Delete comments that restate the code; keep only constraints the code cannot express"
+                            .into(),
+                });
+            }
+
+            if !fact.body_hash.is_empty() {
+                members.push(Member {
+                    label: entity_label,
+                    file: ff.file.clone(),
+                    lines,
+                    body_hash: fact.body_hash.clone(),
+                });
+            }
+        }
+    }
+
+    // Hashable members are pushed in facts order, so this walk stays
+    // aligned with `members` by construction (both gated on body_hash).
+    let structural: Vec<&str> = facts
+        .iter()
+        .flat_map(|ff| ff.functions.iter())
+        .filter(|f| !f.body_hash.is_empty())
+        .map(|f| f.structural_hash.as_str())
+        .collect();
+    for (i, m) in members.iter().enumerate() {
+        by_body.entry(m.body_hash.as_str()).or_default().push(i);
+        by_shape.entry(structural[i]).or_default().push(i);
+    }
+
+    // Tier-1: identical bodies.
+    for group in by_body.values().filter(|g| g.len() > 1) {
+        for &i in group {
+            let others: Vec<&str> = group
+                .iter()
+                .filter(|&&j| j != i)
+                .map(|&j| members[j].label.as_str())
+                .collect();
+            findings.push(Finding {
+                rule: "duplicate-exact",
+                severity: Severity::Warning,
+                entity: members[i].label.clone(),
+                file: members[i].file.clone(),
+                lines: members[i].lines,
+                message: format!(
+                    "`{}` has a body identical to `{}` (modulo comments/whitespace)",
+                    members[i].label,
+                    others.join("`, `")
+                ),
+                fix_guidance: format!("Keep one implementation and delete or delegate the rest: `{}`", others.join("`, `")),
+            });
+        }
+    }
+
+    // Tier-2: same structure, different tokens — only for members whose
+    // exact body is NOT already in a Tier-1 group with the peer.
+    for group in by_shape.values().filter(|g| g.len() > 1) {
+        let distinct_bodies: std::collections::HashSet<&str> = group
+            .iter()
+            .map(|&i| members[i].body_hash.as_str())
+            .collect();
+        if distinct_bodies.len() < 2 {
+            continue; // fully covered by Tier-1
+        }
+        for &i in group {
+            // Report only members that are structurally-but-not-exactly
+            // duplicated against at least one peer.
+            let peers: Vec<&str> = group
+                .iter()
+                .filter(|&&j| j != i && members[j].body_hash != members[i].body_hash)
+                .map(|&j| members[j].label.as_str())
+                .collect();
+            if peers.is_empty() {
+                continue;
+            }
+            findings.push(Finding {
+                rule: "duplicate-structural",
+                severity: Severity::Warning,
+                entity: members[i].label.clone(),
+                file: members[i].file.clone(),
+                lines: members[i].lines,
+                message: format!(
+                    "`{}` is structurally identical to `{}` (same shape, renamed variables/literals)",
+                    members[i].label,
+                    peers.join("`, `")
+                ),
+                fix_guidance: format!(
+                    "Unify with `{}` behind one parameterized implementation",
+                    peers.join("`, `")
+                ),
+            });
+        }
+    }
+
+    findings
+}
+
 /// All detectors, sorted by severity then location.
-pub fn run_all(built: &BuiltGraph, policy: &Policy) -> Vec<Finding> {
+pub fn run_all(
+    built: &BuiltGraph,
+    policy: &Policy,
+    facts: &[crate::source::FileFacts],
+) -> Vec<Finding> {
     let mut findings = infra_bypass(built, policy);
     findings.extend(circular_import(built));
     findings.extend(dead_island(built, policy));
     findings.extend(purity_lie(built));
+    findings.extend(source_detectors(built, facts));
     findings.sort_by(|a, b| {
         b.severity
             .cmp(&a.severity)

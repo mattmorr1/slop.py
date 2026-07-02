@@ -4,6 +4,7 @@ members = [
     "crates/slop",
     "crates/slop-analyze",
     "crates/slop-graph",
+    "crates/slop-parse",
     "crates/slop-resolve",
 ]
 
@@ -23,7 +24,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
 toml = "0.8"
+ruff_python_parser = "0.0.3"
+ruff_python_ast = "0.0.3"
+ruff_text_size = "0.0.3"
 
 slop-graph = { path = "crates/slop-graph" }
+slop-parse = { path = "crates/slop-parse" }
 slop-resolve = { path = "crates/slop-resolve" }
 slop-analyze = { path = "crates/slop-analyze" }
