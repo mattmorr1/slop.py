@@ -40,6 +40,8 @@ pub const SEEDS: &[Seed] = &[
     // FS — open() is read-or-write depending on mode we can't see: both.
     Seed { prefix: "open", effect: Effect::FsRead },
     Seed { prefix: "open", effect: Effect::FsWrite },
+    Seed { prefix: "builtins.open", effect: Effect::FsRead },
+    Seed { prefix: "builtins.open", effect: Effect::FsWrite },
     Seed { prefix: "io.open", effect: Effect::FsRead },
     Seed { prefix: "io.open", effect: Effect::FsWrite },
     Seed { prefix: "pathlib.Path.read_text", effect: Effect::FsRead },

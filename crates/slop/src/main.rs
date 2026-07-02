@@ -3,7 +3,8 @@ use std::process::Command as Process;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use slop_analyze::{build, detect, diff, effects, policy::Policy};
+use slop_analyze::baseline::Baseline;
+use slop_analyze::{build, detect, diff, effects, health, infer, policy::Policy, source, suppress};
 use slop_resolve::{Resolver, ScipResolver};
 
 #[derive(Parser)]
@@ -31,6 +32,26 @@ enum Command {
         /// Git ref to diff against (default: HEAD)
         #[arg(long, default_value = "HEAD")]
         base: String,
+    },
+    /// Record current findings as the grandfathered baseline.
+    Baseline {
+        /// Repo root
+        repo: PathBuf,
+        /// Path to index.scip (default: <repo>/index.scip)
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
+    /// Infer sanctioned channels from dominant patterns; print (and
+    /// optionally write) a slop.toml.
+    Init {
+        /// Repo root
+        repo: PathBuf,
+        /// Path to index.scip (default: <repo>/index.scip)
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Write <repo>/slop.toml (refuses to overwrite an existing one)
+        #[arg(long)]
+        write: bool,
     },
     /// Debug: load a SCIP index and print what the resolver sees.
     IndexInfo {
@@ -82,10 +103,17 @@ fn main() -> Result<()> {
 
             let mut built = build::build_graph(&resolver);
             effects::infer_effects(&mut built);
-            let facts = slop_analyze::source::parse_repo(&repo, &resolver.files());
-            let mut findings = detect::run_all(&built, &policy, &facts);
+            let facts = source::parse_repo(&repo, &resolver.files());
+            let raw = detect::run_all(&built, &policy, &facts);
+            let suppressions = suppress::scan(&repo, &facts);
+            let unsuppressed = suppress::filter(raw, &suppressions);
+            let baseline = Baseline::load(&repo)?;
+            let effective = baseline.filter(unsuppressed);
 
-            if !all {
+            let (findings, health_line) = if all {
+                let s = health::score(&effective, &built);
+                (effective, format!("health: {s}/100"))
+            } else {
                 let output = Process::new("git")
                     .args(["-C"])
                     .arg(&repo)
@@ -99,18 +127,34 @@ fn main() -> Result<()> {
                     );
                 }
                 let changed = diff::parse_unified_diff(&String::from_utf8_lossy(&output.stdout));
-                findings = diff::filter_to_changes(findings, &changed);
-            }
+                let new = diff::filter_to_changes(effective.clone(), &changed);
+                let new_keys: std::collections::HashSet<(&str, String)> = new
+                    .iter()
+                    .map(|f| (f.rule, f.entity.clone()))
+                    .collect();
+                let before: Vec<_> = effective
+                    .iter()
+                    .filter(|f| !new_keys.contains(&(f.rule, f.entity.clone())))
+                    .cloned()
+                    .collect();
+                let line = format!(
+                    "health: {} -> {}",
+                    health::score(&before, &built),
+                    health::score(&effective, &built)
+                );
+                (new, line)
+            };
 
             if policy.channels.is_empty() {
                 eprintln!(
-                    "note: {} has no slop.toml channel policy — infra-bypass checks are silent",
+                    "note: {} has no slop.toml channel policy — infra-bypass checks are silent (run `slop init`)",
                     repo.display()
                 );
             }
 
             if findings.is_empty() {
                 println!("no slop found");
+                println!("{health_line}");
                 return Ok(());
             }
             let blocking = findings
@@ -120,13 +164,49 @@ fn main() -> Result<()> {
             for finding in &findings {
                 println!("{finding}\n");
             }
-            println!(
-                "{} finding(s), {} blocking",
-                findings.len(),
-                blocking
-            );
+            println!("{} finding(s), {} blocking", findings.len(), blocking);
+            println!("{health_line}");
             if blocking > 0 {
                 std::process::exit(1);
+            }
+        }
+        Command::Baseline { repo, index } => {
+            let index_path = index.unwrap_or_else(|| repo.join("index.scip"));
+            let resolver = ScipResolver::load(&index_path)?;
+            let policy = Policy::load(&repo)?;
+            let mut built = build::build_graph(&resolver);
+            effects::infer_effects(&mut built);
+            let facts = source::parse_repo(&repo, &resolver.files());
+            let raw = detect::run_all(&built, &policy, &facts);
+            let suppressions = suppress::scan(&repo, &facts);
+            let findings = suppress::filter(raw, &suppressions);
+            let baseline = Baseline::from_findings(&findings);
+            let count = baseline.findings.len();
+            baseline.save(&repo)?;
+            println!(
+                "baselined {count} finding(s) into {}",
+                repo.join(slop_analyze::baseline::BASELINE_FILE).display()
+            );
+        }
+        Command::Init { repo, index, write } => {
+            let index_path = index.unwrap_or_else(|| repo.join("index.scip"));
+            let resolver = ScipResolver::load(&index_path)?;
+            let mut built = build::build_graph(&resolver);
+            effects::infer_effects(&mut built);
+            let proposals = infer::infer_channels(&built);
+            if proposals.is_empty() {
+                println!("no dominant effect channels found — nothing to propose");
+                return Ok(());
+            }
+            let snippet = infer::to_toml(&proposals);
+            println!("proposed policy (confirm before enforcing):\n\n{snippet}");
+            if write {
+                let path = repo.join("slop.toml");
+                if path.exists() {
+                    bail!("{} already exists — merge manually", path.display());
+                }
+                std::fs::write(&path, &snippet)?;
+                println!("wrote {}", path.display());
             }
         }
         Command::IndexInfo { index } => {

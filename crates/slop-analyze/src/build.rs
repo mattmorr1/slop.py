@@ -126,17 +126,22 @@ pub fn build_graph(resolver: &dyn Resolver) -> BuiltGraph {
                     graph.add_edge(parent, node, EdgeKind::Contains);
                 }
             } else {
-                // References: only entities that can carry behavior matter
-                // for the effect graph.
+                // References: entities that can carry behavior. External
+                // Terms count too — module-level effect sources like
+                // `os.environ` are Terms; internal Terms (attributes) are
+                // data access, not behavior.
                 if !matches!(
                     kind,
-                    SymbolKind::Class | SymbolKind::Function | SymbolKind::Module
+                    SymbolKind::Class | SymbolKind::Function | SymbolKind::Module | SymbolKind::Term
                 ) {
                     continue;
                 }
                 let Some(def) = resolver.definition_of(&occ.symbol) else {
                     continue;
                 };
+                if kind == SymbolKind::Term && !def.is_external() {
+                    continue;
+                }
                 let from = match enclosing(occ.range.start_line, occ.range.start_col, None) {
                     Some(n) => n,
                     None => continue,

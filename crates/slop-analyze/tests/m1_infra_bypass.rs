@@ -86,7 +86,8 @@ fn dead_island_flags_unreferenced_functions_only() {
             "utils.cleaning::clean_rows",
             "utils.cleaning::normalize_rows",
             "utils.cleaning::scale_rows",
-            "utils.scoring::compute_risk_score"
+            "utils.scoring::compute_risk_score",
+            "utils.scoring::parse_config"
         ]
     );
 }
@@ -134,13 +135,72 @@ fn over_commenting_fires_on_narrated_function() {
 
 #[test]
 fn purity_lie_flags_compute_named_io() {
+    // Suppression is a delivery-layer filter; the raw detector still fires
+    // on both planted lies (compute_risk_score is Net, parse_config is FS
+    // through the builtin open seed).
     let (_, findings) = analyze("toy_repo_slopped", true);
     assert_eq!(
         entities_for(&findings, "purity-lie"),
-        vec!["utils.scoring::compute_risk_score"]
+        vec![
+            "utils.scoring::compute_risk_score",
+            "utils.scoring::parse_config"
+        ]
     );
     let f = findings.iter().find(|f| f.rule == "purity-lie").unwrap();
     assert_eq!(f.severity, Severity::Warning);
+}
+
+#[test]
+fn suppression_scan_silences_reasoned_allow_only() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/toy_repo_slopped");
+    let (_, findings) = analyze("toy_repo_slopped", true);
+    let resolver = ScipResolver::load(&root.join("index.scip")).unwrap();
+    let facts = slop_analyze::source::parse_repo(&root, &resolver.files());
+    let suppressions = slop_analyze::suppress::scan(&root, &facts);
+    assert_eq!(suppressions.len(), 1);
+    assert_eq!(suppressions[0].rule, "purity-lie");
+    let kept = slop_analyze::suppress::filter(findings, &suppressions);
+    assert_eq!(
+        entities_for(&kept, "purity-lie"),
+        vec!["utils.scoring::parse_config"]
+    );
+}
+
+#[test]
+fn baseline_grandfathers_everything() {
+    let (_, findings) = analyze("toy_repo_slopped", true);
+    let baseline = slop_analyze::baseline::Baseline::from_findings(&findings);
+    let kept = baseline.filter(findings);
+    assert!(kept.is_empty());
+}
+
+#[test]
+fn channel_inference_proposes_the_clean_repo_convention() {
+    let (built, _) = analyze("toy_repo", true);
+    let proposals = slop_analyze::infer::infer_channels(&built);
+    assert_eq!(
+        proposals.get("net").map(Vec::as_slice),
+        Some(&["core.http_client.HttpClient".to_string()][..])
+    );
+}
+
+#[test]
+fn channel_inference_stays_silent_without_dominance() {
+    // Three unrelated Net acquirers in the slopped repo: no 80% winner.
+    let (built, _) = analyze("toy_repo_slopped", true);
+    let proposals = slop_analyze::infer::infer_channels(&built);
+    assert!(proposals.get("net").is_none(), "{proposals:?}");
+}
+
+#[test]
+fn health_scores_clean_above_slopped() {
+    let (clean_built, _) = analyze("toy_repo", true);
+    let (slop_built, slop_findings) = analyze("toy_repo_slopped", true);
+    let clean_score = slop_analyze::health::score(&[], &clean_built);
+    let slop_score = slop_analyze::health::score(&slop_findings, &slop_built);
+    assert_eq!(clean_score, 100);
+    assert!(slop_score < 60, "slopped repo scored {slop_score}");
 }
 
 #[test]
