@@ -6,6 +6,7 @@ pub mod detect;
 pub mod diff;
 pub mod effects;
 pub mod entity_id;
+pub mod envelope;
 pub mod findings;
 pub mod health;
 pub mod infer;
