@@ -1,2 +1,7 @@
+entry_points = [
+    "services.weather.latest_forecast",
+    "utils.dates.format_date",
+]
+
 [channels]
 net = ["core.http_client.HttpClient"]

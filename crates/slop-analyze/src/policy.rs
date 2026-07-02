@@ -14,6 +14,10 @@ pub struct Policy {
     /// `net = ["core.http_client.HttpClient"]`
     #[serde(default)]
     pub channels: HashMap<String, Vec<String>>,
+    /// Dotted entity paths that are API entry points — exempt from
+    /// dead-island. Dunders, `main`, and `test_*` are exempt by default.
+    #[serde(default)]
+    pub entry_points: Vec<String>,
 }
 
 impl Policy {
@@ -46,6 +50,21 @@ impl Policy {
             .and_then(|k| self.channels.get(k))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Is this entity an API entry point (exempt from dead-island)?
+    pub fn is_entry_point(&self, entity_id: &str) -> bool {
+        let name = entity_id.rsplit("::").next().unwrap_or(entity_id);
+        if name == "main"
+            || name.starts_with("test_")
+            || (name.starts_with("__") && name.ends_with("__"))
+        {
+            return true;
+        }
+        let dotted = entity_id.replace("::", ".");
+        self.entry_points.iter().any(|ep| {
+            dotted == *ep || (dotted.starts_with(ep) && dotted[ep.len()..].starts_with('.'))
+        })
     }
 
     /// Is `entity_id` (`::`-separated) inside a sanctioned channel for

@@ -50,7 +50,18 @@ pub fn build_graph(resolver: &dyn Resolver) -> BuiltGraph {
             let def = resolver.definition_of(&occ.symbol);
             // Prefer the body span: diff-mode intersects findings with
             // changed lines, and changes land in bodies, not name tokens.
-            let span = occ.enclosing_range.unwrap_or(occ.range);
+            // A module's span is its whole file, so module-level findings
+            // (circular imports) survive the diff filter on any file change.
+            let span = if node_type == NodeType::Module {
+                slop_resolve::Range {
+                    start_line: 0,
+                    start_col: 0,
+                    end_line: u32::MAX,
+                    end_col: 0,
+                }
+            } else {
+                occ.enclosing_range.unwrap_or(occ.range)
+            };
             let idx = graph.add_entity(CodeEntity {
                 id,
                 entity_type: node_type,
@@ -152,9 +163,22 @@ pub fn build_graph(resolver: &dyn Resolver) -> BuiltGraph {
                         idx
                     }
                 };
-                if from != to {
-                    graph.add_edge(from, to, EdgeKind::Calls);
+                if from == to {
+                    continue;
                 }
+                // Internal module reference = an import dependency between
+                // files: Imports edge module->module (the SCC target).
+                // Everything else is a Calls/use edge from the enclosing
+                // scope, which carries effects.
+                if kind == SymbolKind::Module && !def.is_external() {
+                    if let Some(from_module) = module {
+                        if from_module != to {
+                            graph.add_edge(from_module, to, EdgeKind::Imports);
+                        }
+                        continue;
+                    }
+                }
+                graph.add_edge(from, to, EdgeKind::Calls);
             }
         }
     }
