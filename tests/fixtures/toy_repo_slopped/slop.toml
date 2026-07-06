@@ -5,3 +5,10 @@ entry_points = [
 
 [channels]
 net = ["core.http_client.HttpClient"]
+
+# Pure computation utilities must not do their own I/O — it belongs in a
+# service. `utils.scoring` violates this (raw net + file reads).
+[[layer]]
+name = "pure-utils"
+match = ["utils.scoring"]
+forbid = ["net", "fs"]

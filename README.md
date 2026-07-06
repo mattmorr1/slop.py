@@ -59,6 +59,7 @@ when anything is *Blocking*.
 | --- | --- | --- |
 | `infra-bypass` | Blocking | Acquiring a raw effect (net/fs/db/env) directly when the codebase routes that effect through a sanctioned channel |
 | `circular-import` | Blocking | Import cycles (Tarjan SCC over the import graph) |
+| `effect-layer-violation` | Warning | An entity in a declared layer directly does an effect that layer forbids (e.g. DB/net in a `pure-utils` or presentation layer) |
 | `duplicate-exact` | Warning | Functions with identical bodies (modulo comments/whitespace) |
 | `duplicate-structural` | Advisory → Warning | Same control-flow shape, renamed vars/literals — a *candidate*; `--tier3` promotes ones an LLM judge confirms |
 | `complexity-spike` | Warning | Genuinely tangled functions — deep nesting or many independent branches, not just a fat boolean guard |

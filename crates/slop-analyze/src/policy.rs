@@ -18,6 +18,58 @@ pub struct Policy {
     /// dead-island. Dunders, `main`, and `test_*` are exempt by default.
     #[serde(default)]
     pub entry_points: Vec<String>,
+    /// Architectural layers: modules matching `match` may not *directly*
+    /// perform the effects in `forbid` (generalizes "no DB in the view
+    /// layer"). Empty = silent (D8), like `channels`.
+    #[serde(default, rename = "layer")]
+    pub layers: Vec<LayerRule>,
+}
+
+/// One architectural-layer rule (a `[[layer]]` table in `slop.toml`).
+#[derive(Debug, Default, Deserialize)]
+pub struct LayerRule {
+    /// Human name for the layer, used in the finding message.
+    pub name: String,
+    /// Dotted module-path prefixes that belong to this layer.
+    #[serde(default, rename = "match")]
+    pub matches: Vec<String>,
+    /// Effect names this layer may not directly acquire.
+    #[serde(default)]
+    pub forbid: Vec<String>,
+}
+
+impl LayerRule {
+    /// Does `dotted` (a `.`-joined entity id) sit in this layer? Prefix match
+    /// on path boundaries, same discipline as channel/entry-point matching.
+    pub fn contains(&self, dotted: &str) -> bool {
+        self.matches.iter().any(|m| {
+            dotted == m || (dotted.starts_with(m) && dotted[m.len()..].starts_with('.'))
+        })
+    }
+
+    /// The effects this layer forbids, resolved from their names.
+    pub fn forbidden_effects(&self) -> Vec<Effect> {
+        let mut out: Vec<Effect> = self.forbid.iter().flat_map(|n| effects_from_name(n)).collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+/// Map a policy effect name to lattice effects. `fs` covers both directions.
+pub fn effects_from_name(name: &str) -> Vec<Effect> {
+    match name.trim().to_lowercase().as_str() {
+        "net" => vec![Effect::Net],
+        "db" => vec![Effect::Db],
+        "fs" => vec![Effect::FsRead, Effect::FsWrite],
+        "fs_read" => vec![Effect::FsRead],
+        "fs_write" => vec![Effect::FsWrite],
+        "env" => vec![Effect::Env],
+        "nondeterminism" | "time" | "random" => vec![Effect::Nondeterminism],
+        "concurrency" => vec![Effect::Concurrency],
+        "state" | "state_mutate" => vec![Effect::StateMutate],
+        _ => vec![],
+    }
 }
 
 impl Policy {

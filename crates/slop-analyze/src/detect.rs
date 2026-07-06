@@ -250,6 +250,68 @@ pub fn dead_island(
     findings
 }
 
+/// Effect-layer violation (D2, §3.4): an entity in a policy-declared layer
+/// *directly* acquires an effect that layer forbids — the generalization of
+/// "no DB in the presentation layer". Keyed on direct acquisition (`HasEffect`
+/// edges to raw seeds), not transitive effects, so a controller that reaches
+/// the DB *through* the service layer isn't flagged — only one that does the
+/// I/O itself. Silent without a `[[layer]]` policy (D8).
+pub fn effect_layer_violation(built: &BuiltGraph, policy: &Policy) -> Vec<Finding> {
+    if policy.layers.is_empty() {
+        return Vec::new();
+    }
+    let graph = &built.graph;
+    let mut findings = Vec::new();
+    for (idx, entity) in graph.entities() {
+        if !matches!(entity.entity_type, NodeType::Function | NodeType::Class) {
+            continue;
+        }
+        // Effects this entity acquires *directly* (raw seed references).
+        let mut direct: Vec<Effect> = Vec::new();
+        for edge in graph.graph.edges_directed(idx, Direction::Outgoing) {
+            if *edge.weight() == EdgeKind::HasEffect {
+                for &e in &graph.entity(edge.target()).effect_signature.0 {
+                    if !direct.contains(&e) {
+                        direct.push(e);
+                    }
+                }
+            }
+        }
+        if direct.is_empty() {
+            continue;
+        }
+        let dotted = entity.id.replace("::", ".");
+        for layer in &policy.layers {
+            if !layer.contains(&dotted) {
+                continue;
+            }
+            let forbidden = layer.forbidden_effects();
+            let mut violated: Vec<Effect> =
+                direct.iter().copied().filter(|e| forbidden.contains(e)).collect();
+            if violated.is_empty() {
+                continue;
+            }
+            violated.sort();
+            findings.push(Finding {
+                rule: "effect-layer-violation",
+                severity: Severity::Warning,
+                entity: entity.id.clone(),
+                file: entity.file.clone(),
+                lines: entity.source_range,
+                message: format!(
+                    "`{}` is in the `{}` layer but directly performs {:?} I/O",
+                    entity.id, layer.name, violated
+                ),
+                fix_guidance: format!(
+                    "Move the {:?} operation into a lower layer (a service/repository) and call it from `{}`",
+                    violated, entity.id
+                ),
+            });
+        }
+    }
+    findings
+}
+
 const PURE_NAME_PREFIXES: &[&str] = &[
     "calculate_", "compute_", "parse_", "format_", "validate_", "normalize_", "convert_",
     "is_", "to_", "as_",
@@ -590,6 +652,7 @@ pub fn run_all(
     findings.extend(circular_import(built));
     findings.extend(dead_island(built, policy, &decorated));
     findings.extend(purity_lie(built));
+    findings.extend(effect_layer_violation(built, policy));
     findings.extend(source_detectors(built, facts));
     findings.extend(crate::naming::naming_convention(built));
     findings.sort_by(|a, b| {

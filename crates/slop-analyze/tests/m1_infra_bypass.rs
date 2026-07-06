@@ -183,6 +183,33 @@ fn over_commenting_fires_on_narrated_function() {
 }
 
 #[test]
+fn effect_layer_violation_flags_io_in_the_pure_utils_layer() {
+    let (_, findings) = analyze("toy_repo_slopped", true);
+    // Both scoring utils directly do I/O the `pure-utils` layer forbids:
+    // compute_risk_score (net) and parse_config (fs).
+    assert_eq!(
+        entities_for(&findings, "effect-layer-violation"),
+        vec![
+            "utils.scoring::compute_risk_score",
+            "utils.scoring::parse_config"
+        ]
+    );
+    let f = findings
+        .iter()
+        .find(|f| f.rule == "effect-layer-violation")
+        .unwrap();
+    assert_eq!(f.severity, Severity::Warning);
+    assert!(f.message.contains("pure-utils"), "{}", f.message);
+}
+
+#[test]
+fn clean_repo_has_no_layer_violations() {
+    // toy_repo declares no layers -> the detector is silent (D8).
+    let (_, findings) = analyze("toy_repo", true);
+    assert!(findings.iter().all(|f| f.rule != "effect-layer-violation"));
+}
+
+#[test]
 fn purity_lie_flags_compute_named_io() {
     // Suppression is a delivery-layer filter; the raw detector still fires
     // on both planted lies (compute_risk_score is Net, parse_config is FS
