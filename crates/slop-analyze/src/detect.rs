@@ -324,6 +324,55 @@ const IO_EFFECTS: &[Effect] = &[
     Effect::Env,
 ];
 
+/// Effect-creep (D2, §3.4): a function that was **pure** at baseline now has
+/// an I/O effect signature — a purity *regression*, distinct from purity-lie
+/// (which is name-based and baseline-free). This is the "delta vs baseline"
+/// blocker: it fires only against a `slop baseline` that recorded effects, and
+/// only on entities that baseline knew as pure (empty signature). New
+/// functions (absent from the baseline) are left to the other rules.
+pub fn effect_creep(built: &BuiltGraph, baseline: &crate::baseline::Baseline) -> Vec<Finding> {
+    if baseline.effects.is_empty() {
+        return Vec::new(); // no effect baseline captured — silent
+    }
+    let graph = &built.graph;
+    let mut findings = Vec::new();
+    for (_, entity) in graph.entities() {
+        if entity.entity_type != NodeType::Function {
+            continue;
+        }
+        let Some(prior) = baseline.effects.get(&entity.id) else {
+            continue; // not in the baseline: new code, not a regression
+        };
+        if !prior.is_empty() {
+            continue; // wasn't pure at baseline — nothing to regress from
+        }
+        let io: Vec<Effect> = IO_EFFECTS
+            .iter()
+            .copied()
+            .filter(|&e| entity.effect_signature.contains(e))
+            .collect();
+        if io.is_empty() {
+            continue;
+        }
+        findings.push(Finding {
+            rule: "effect-creep",
+            severity: Severity::Blocking,
+            entity: entity.id.clone(),
+            file: entity.file.clone(),
+            lines: entity.source_range,
+            message: format!(
+                "`{}` was pure at baseline but now performs {io:?} I/O",
+                entity.id
+            ),
+            fix_guidance: format!(
+                "Restore `{}`'s purity — push the {io:?} out to a caller or an injected dependency; re-baseline only if the effect is intended",
+                entity.id
+            ),
+        });
+    }
+    findings
+}
+
 /// Purity-lie: the name promises a pure computation; the (transitive)
 /// effect signature says I/O.
 pub fn purity_lie(built: &BuiltGraph) -> Vec<Finding> {
@@ -663,4 +712,71 @@ pub fn run_all(
             .then_with(|| a.rule.cmp(b.rule))
     });
     findings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::baseline::Baseline;
+    use slop_graph::{CodeEntity, CodeGraph, EffectSet};
+    use std::collections::{BTreeMap, HashMap};
+
+    fn func(id: &str, effects: &[Effect]) -> CodeEntity {
+        let mut sig = EffectSet::pure();
+        for &e in effects {
+            sig.insert(e);
+        }
+        CodeEntity {
+            id: id.into(),
+            entity_type: NodeType::Function,
+            name: id.rsplit("::").next().unwrap().into(),
+            signature: String::new(),
+            docstring: None,
+            file: "m.py".into(),
+            source_range: (0, 1),
+            body_hash: String::new(),
+            effect_signature: sig,
+        }
+    }
+
+    fn built_with(entities: Vec<CodeEntity>) -> BuiltGraph {
+        let mut graph = CodeGraph::new();
+        for e in entities {
+            graph.add_entity(e);
+        }
+        BuiltGraph { graph, by_symbol: HashMap::new() }
+    }
+
+    fn baseline_effects(pairs: &[(&str, &[&str])]) -> Baseline {
+        let mut effects = BTreeMap::new();
+        for (id, es) in pairs {
+            effects.insert(id.to_string(), es.iter().map(|s| s.to_string()).collect());
+        }
+        Baseline { version: 1, findings: vec![], effects }
+    }
+
+    #[test]
+    fn effect_creep_fires_only_on_pure_to_io_regression() {
+        let built = built_with(vec![
+            func("m::was_pure", &[Effect::Net]),   // regressed
+            func("m::was_networked", &[Effect::Net]), // already effectful
+            func("m::new_fn", &[Effect::Db]),      // not in baseline
+            func("m::still_pure", &[]),            // pure, stays pure
+        ]);
+        let baseline = baseline_effects(&[
+            ("m::was_pure", &[]),
+            ("m::was_networked", &["Net"]),
+            ("m::still_pure", &[]),
+        ]);
+        let f = effect_creep(&built, &baseline);
+        assert_eq!(f.len(), 1, "{f:#?}");
+        assert_eq!(f[0].entity, "m::was_pure");
+        assert_eq!(f[0].severity, Severity::Blocking);
+    }
+
+    #[test]
+    fn effect_creep_silent_without_effect_baseline() {
+        let built = built_with(vec![func("m::f", &[Effect::Net])]);
+        assert!(effect_creep(&built, &Baseline::default()).is_empty());
+    }
 }

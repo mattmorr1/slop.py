@@ -2,12 +2,14 @@
 //! doesn't open with a 4000-finding storm (D7/D12). Fingerprint is
 //! (rule, entity) — stable across line shifts and message rewording.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use slop_graph::NodeType;
 
+use crate::build::BuiltGraph;
 use crate::findings::Finding;
 
 pub const BASELINE_FILE: &str = ".slop-baseline.json";
@@ -16,6 +18,12 @@ pub const BASELINE_FILE: &str = ".slop-baseline.json";
 pub struct Baseline {
     pub version: u32,
     pub findings: Vec<BaselineEntry>,
+    /// Per-function effect signature at baseline time (Debug effect names,
+    /// sorted). The empty list marks a function that was *pure*; `effect-creep`
+    /// fires when such a function later acquires I/O. `#[serde(default)]` keeps
+    /// pre-effects baselines loadable.
+    #[serde(default)]
+    pub effects: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,7 +46,22 @@ impl Baseline {
         Self {
             version: 1,
             findings: entries,
+            effects: BTreeMap::new(),
         }
+    }
+
+    /// Record every function's effect signature so `effect-creep` can detect a
+    /// later pure→effectful regression. Chainable off `from_findings`.
+    pub fn with_effects(mut self, built: &BuiltGraph) -> Self {
+        for (_, entity) in built.graph.entities() {
+            if entity.entity_type == NodeType::Function {
+                self.effects.insert(
+                    entity.id.clone(),
+                    entity.effect_signature.0.iter().map(|e| format!("{e:?}")).collect(),
+                );
+            }
+        }
+        self
     }
 
     pub fn load(repo_root: &Path) -> Result<Self> {

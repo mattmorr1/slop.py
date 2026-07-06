@@ -217,7 +217,12 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
     };
 
     let Analysis { built, facts } = load_analysis(&req.repo, req.index.as_deref())?;
+    let baseline = Baseline::load(&req.repo)?;
     let mut raw = crate::detect::run_all(&built, &policy, &facts);
+    // Baseline-relative regression: a function that was pure at baseline and
+    // now does I/O. Lives here, not in run_all, because it needs the baseline
+    // (run_all is the baseline-free set fix/baseline/tests share).
+    raw.extend(crate::detect::effect_creep(&built, &baseline));
     if req.tier3 {
         for (entity, redundant, reason) in tier3_structural_verdicts(&built, &facts, &req.repo)? {
             let Some(f) = raw.iter_mut().find(|f| f.rule == "duplicate-structural" && f.entity == entity)
@@ -240,7 +245,6 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
     }
     let suppressions = suppress::scan(&req.repo, &facts);
     let unsuppressed = suppress::filter(raw, &suppressions);
-    let baseline = Baseline::load(&req.repo)?;
     let effective = baseline.filter(unsuppressed);
 
     let (findings, health_line) = if req.all {

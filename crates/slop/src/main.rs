@@ -564,7 +564,7 @@ fn main() -> Result<()> {
             let raw = detect::run_all(&built, &policy, &facts);
             let suppressions = suppress::scan(&repo, &facts);
             let findings = suppress::filter(raw, &suppressions);
-            let baseline = Baseline::from_findings(&findings);
+            let baseline = Baseline::from_findings(&findings).with_effects(&built);
             let count = baseline.findings.len();
             baseline.save(&repo)?;
             println!(

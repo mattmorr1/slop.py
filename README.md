@@ -60,6 +60,7 @@ when anything is *Blocking*.
 | `infra-bypass` | Blocking | Acquiring a raw effect (net/fs/db/env) directly when the codebase routes that effect through a sanctioned channel |
 | `circular-import` | Blocking | Import cycles (Tarjan SCC over the import graph) |
 | `effect-layer-violation` | Warning | An entity in a declared layer directly does an effect that layer forbids (e.g. DB/net in a `pure-utils` or presentation layer) |
+| `effect-creep` | Blocking | A function that was **pure** at `slop baseline` time now performs I/O — a purity regression (delta vs baseline) |
 | `duplicate-exact` | Warning | Functions with identical bodies (modulo comments/whitespace) |
 | `duplicate-structural` | Advisory → Warning | Same control-flow shape, renamed vars/literals — a *candidate*; `--tier3` promotes ones an LLM judge confirms |
 | `complexity-spike` | Warning | Genuinely tangled functions — deep nesting or many independent branches, not just a fat boolean guard |
@@ -71,7 +72,9 @@ when anything is *Blocking*.
 
 Sanctioned channels come from a `slop.toml` policy. `slop init .` proposes one
 from your repo's dominant patterns; without it, `infra-bypass` stays silent.
-Grandfather existing findings with `slop baseline .`.
+Grandfather existing findings with `slop baseline .` — this also records each
+function's effect signature, so a later run can flag `effect-creep` (a function
+that was pure then, doing I/O now).
 
 ## Auto-fix
 
