@@ -68,12 +68,21 @@ fn estimate_tokens(text: &str) -> usize {
     text.len() / 4 + 1
 }
 
-fn bfs_distance(built: &BuiltGraph, start: NodeIndex) -> HashMap<NodeIndex, usize> {
+/// Multi-source BFS over proximity edges (Contains/Calls/Imports, undirected):
+/// distance from each node to its *nearest* start. Shared by the envelope
+/// (one start = the edit target) and `compress` (many starts = the edit zone).
+pub(crate) fn proximity_distances(
+    built: &BuiltGraph,
+    starts: &[NodeIndex],
+) -> HashMap<NodeIndex, usize> {
     let graph = &built.graph.graph;
     let mut dist = HashMap::new();
-    dist.insert(start, 0usize);
     let mut queue = VecDeque::new();
-    queue.push_back(start);
+    for &s in starts {
+        if dist.insert(s, 0usize).is_none() {
+            queue.push_back(s);
+        }
+    }
     while let Some(n) = queue.pop_front() {
         let d = dist[&n];
         let mut neighbors = Vec::new();
@@ -95,6 +104,10 @@ fn bfs_distance(built: &BuiltGraph, start: NodeIndex) -> HashMap<NodeIndex, usiz
         }
     }
     dist
+}
+
+fn bfs_distance(built: &BuiltGraph, start: NodeIndex) -> HashMap<NodeIndex, usize> {
+    proximity_distances(built, &[start])
 }
 
 /// The Contains-parent of `idx` (the class/module a function lives in), if any.

@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use slop_analyze::baseline::Baseline;
 use slop_analyze::check::{self, CheckRequest};
+use slop_analyze::compress::{self, CompressConfig};
 use slop_analyze::{detect, gate, harness, infer, policy::Policy, suppress};
 use slop_resolve::{Resolver, ScipResolver};
 
@@ -45,6 +46,27 @@ enum Command {
         /// Git ref to diff against (default: HEAD)
         #[arg(long, default_value = "HEAD")]
         base: String,
+    },
+    /// Zoned graph-distance compression of a file (D11): full fidelity within
+    /// --hops of the --edit loci, skeletons beyond. Prints the compressed
+    /// source; --stats reports the token win. Empty --edit = strip-noise only.
+    Compress {
+        /// Repo root
+        repo: PathBuf,
+        /// Repo-relative .py file to compress
+        file: String,
+        /// Path to index.scip (default: <repo>/index.scip)
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Edit-zone entity id (repeatable), e.g. `utils.dates::parse`
+        #[arg(long = "edit")]
+        edit: Vec<String>,
+        /// Graph hops from the edit zone kept full-fidelity
+        #[arg(long, default_value_t = 1)]
+        hops: usize,
+        /// Print compression stats to stderr
+        #[arg(long)]
+        stats: bool,
     },
     /// ANTHROPIC_BASE_URL reverse proxy (M5): steer + observe any Anthropic
     /// client. Set ANTHROPIC_BASE_URL=http://localhost:<port> to route through it.
@@ -191,6 +213,42 @@ fn main() -> Result<()> {
             println!("{}", result.health_line);
             if result.blocking > 0 {
                 std::process::exit(1);
+            }
+        }
+        Command::Compress {
+            repo,
+            file,
+            index,
+            edit,
+            hops,
+            stats,
+        } => {
+            let analysis = check::load_analysis(&repo, index.as_deref())?;
+            let source = std::fs::read_to_string(repo.join(&file))
+                .with_context(|| format!("reading {file}"))?;
+            let (out, st) = compress::compress_file(
+                &analysis.built,
+                &analysis.facts,
+                &source,
+                &file,
+                &edit,
+                &CompressConfig {
+                    edit_zone_hops: hops,
+                    min_lines: 0,
+                },
+                None,
+            );
+            print!("{out}");
+            if stats {
+                let pct = if st.original_chars > 0 {
+                    100 - (st.compressed_chars * 100 / st.original_chars)
+                } else {
+                    0
+                };
+                eprintln!(
+                    "compress: {}/{} functions skeletonized, {} -> {} chars (-{}%)",
+                    st.skeletonized, st.total_functions, st.original_chars, st.compressed_chars, pct
+                );
             }
         }
         Command::Proxy {
