@@ -646,6 +646,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// The slop Claude skill, embedded at build time so `slop install` can drop it
+/// into a target repo without needing the slop source tree at runtime.
+const SLOP_SKILL: &str = include_str!("../../../skills/slop/SKILL.md");
+
 /// Read a JSON config file into a `Value`, or `Value::Null` if it's absent.
 /// Refuses to proceed on an unparseable file (would clobber the user's config)
 /// unless `force` is set.
@@ -706,6 +710,17 @@ fn install_harness(repo: &Path, force: bool) -> Result<()> {
         "wrote {} (PostToolUse + UserPromptSubmit hooks)",
         settings_path.display()
     );
+
+    // .claude/skills/slop/SKILL.md — the agent playbook (embedded at build
+    // time so install is self-contained). Always refreshed so it tracks the
+    // binary; it's a generated doc, not user config.
+    let skill_dir = claude_dir.join("skills/slop");
+    std::fs::create_dir_all(&skill_dir)
+        .with_context(|| format!("creating {}", skill_dir.display()))?;
+    let skill_path = skill_dir.join("SKILL.md");
+    std::fs::write(&skill_path, SLOP_SKILL)
+        .with_context(|| format!("writing {}", skill_path.display()))?;
+    println!("wrote {} (slop skill)", skill_path.display());
 
     println!(
         "\nharness installed. next:\n  \

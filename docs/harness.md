@@ -19,8 +19,10 @@ slop install <repo-root>
 ```
 
 wires slop into a repo's agent host for you: it merges the MCP server into
-`<repo>/.mcp.json` and the read/prompt hooks into `<repo>/.claude/settings.json`,
-pointing every entry at the binary you invoked (absolute path). It is
+`<repo>/.mcp.json`, the read/prompt hooks into `<repo>/.claude/settings.json`,
+and drops the **slop skill** at `<repo>/.claude/skills/slop/SKILL.md` (an agent
+playbook for `/slop` — check, triage, fix, gate), pointing every entry at the
+binary you invoked (absolute path). It is
 **idempotent** — re-running updates slop's own entries (e.g. after a rebuild
 moves the binary) and preserves every other MCP server and hook you have. It
 refuses to touch a config file that isn't valid JSON unless you pass `--force`.

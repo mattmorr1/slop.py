@@ -101,6 +101,8 @@ Claude Code) drives. Wire them into a repo with one command:
 slop install /path/to/repo   # merges MCP server + hooks into the repo's config
 ```
 
+- **Claude skill** — `slop install` drops a `/slop` skill so the agent knows
+  when and how to check, triage, fix, and gate on its own.
 - **MCP tools** — `validate_change`, `get_context_envelope`, `query_subgraph`.
 - **Hooks** — read-path steering + zoned graph-distance compression (skeletonize
   code far from what you're editing; keep near context full-fidelity).
