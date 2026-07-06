@@ -1046,6 +1046,7 @@ dependencies = [
  "slop-graph",
  "slop-llm",
  "slop-mcp",
+ "slop-proxy",
  "slop-resolve",
 ]
 
@@ -1103,6 +1104,17 @@ dependencies = [
  "ruff_python_ast",
  "ruff_python_parser",
  "ruff_text_size",
+]
+
+[[package]]
+name = "slop-proxy"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "slop-analyze",
+ "ureq",
 ]
 
 [[package]]

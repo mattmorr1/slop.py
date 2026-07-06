@@ -7,6 +7,7 @@ members = [
     "crates/slop-llm",
     "crates/slop-mcp",
     "crates/slop-parse",
+    "crates/slop-proxy",
     "crates/slop-resolve",
 ]
 
@@ -35,5 +36,6 @@ slop-graph = { path = "crates/slop-graph" }
 slop-llm = { path = "crates/slop-llm" }
 slop-mcp = { path = "crates/slop-mcp" }
 slop-parse = { path = "crates/slop-parse" }
+slop-proxy = { path = "crates/slop-proxy" }
 slop-resolve = { path = "crates/slop-resolve" }
 slop-analyze = { path = "crates/slop-analyze" }

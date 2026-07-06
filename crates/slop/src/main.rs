@@ -46,6 +46,25 @@ enum Command {
         #[arg(long, default_value = "HEAD")]
         base: String,
     },
+    /// ANTHROPIC_BASE_URL reverse proxy (M5): steer + observe any Anthropic
+    /// client. Set ANTHROPIC_BASE_URL=http://localhost:<port> to route through it.
+    Proxy {
+        /// Port to listen on (localhost only)
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        /// Upstream Anthropic API base URL
+        #[arg(long, default_value = "https://api.anthropic.com")]
+        upstream: String,
+        /// Repo whose sanctioned-channel policy is injected when --steer is set
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Augment the request's system prompt with the repo's channel policy
+        #[arg(long)]
+        steer: bool,
+        /// Append per-request token usage to this JSONL log
+        #[arg(long)]
+        log: Option<PathBuf>,
+    },
     /// Validation gate (M5): run the check and exit non-zero if anything
     /// blocks, printing a JSON verdict a CI step or agent fix-loop consumes.
     Gate {
@@ -173,6 +192,21 @@ fn main() -> Result<()> {
             if result.blocking > 0 {
                 std::process::exit(1);
             }
+        }
+        Command::Proxy {
+            port,
+            upstream,
+            repo,
+            steer,
+            log,
+        } => {
+            slop_proxy::serve(slop_proxy::ProxyConfig {
+                port,
+                upstream,
+                repo,
+                steer,
+                log,
+            })?;
         }
         Command::Gate {
             repo,

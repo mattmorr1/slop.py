@@ -16,4 +16,5 @@ slop-analyze = { workspace = true }
 slop-graph = { workspace = true }
 slop-llm = { workspace = true }
 slop-mcp = { workspace = true }
+slop-proxy = { workspace = true }
 slop-resolve = { workspace = true }
