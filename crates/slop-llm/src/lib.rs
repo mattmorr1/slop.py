@@ -7,10 +7,22 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
+
+pub mod ollama;
 
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
+
+/// Select a judge backend from the environment: `SLOP_JUDGE=ollama` uses the
+/// local Ollama model (free, no key), anything else uses Claude. Lets Tier-3
+/// run offline.
+pub fn judge_from_env() -> Result<Box<dyn Judge>> {
+    match std::env::var("SLOP_JUDGE").as_deref() {
+        Ok("ollama") => Ok(Box::new(ollama::Ollama::from_env())),
+        _ => Ok(Box::new(ClaudeJudge::from_env()?)),
+    }
+}
 
 /// One pair for the judge. `context` is the rendered signature/docstring/body
 /// text for each side.
@@ -30,9 +42,12 @@ pub struct Verdict {
     pub reason: String,
 }
 
-/// Abstraction so tests can run without the network.
+/// Abstraction so tests can run without the network and backends (Claude /
+/// Ollama) are interchangeable.
 pub trait Judge {
     fn judge(&self, pairs: &[JudgeInput]) -> Result<Vec<Verdict>>;
+    /// Model identifier, for the "judging N pairs via <model>" log line.
+    fn model(&self) -> &str;
 }
 
 pub struct ClaudeJudge {
@@ -52,7 +67,33 @@ impl ClaudeJudge {
     }
 }
 
-fn render_prompt(pairs: &[JudgeInput]) -> String {
+/// JSON Schema for a `{verdicts: [...]}` payload — shared by the Claude
+/// (`output_config`) and Ollama (`format`) structured-output paths.
+pub(crate) fn verdict_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "redundant": {"type": "boolean"},
+                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "reason": {"type": "string"}
+                    },
+                    "required": ["index", "redundant", "confidence", "reason"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["verdicts"],
+        "additionalProperties": false
+    })
+}
+
+pub(crate) fn render_prompt(pairs: &[JudgeInput]) -> String {
     let mut prompt = String::from(
         "You are reviewing a Python codebase for semantic redundancy: pairs of functions that \
          serve the same purpose and should be unified, even if implemented differently. \
@@ -70,31 +111,15 @@ fn render_prompt(pairs: &[JudgeInput]) -> String {
 }
 
 impl Judge for ClaudeJudge {
+    fn model(&self) -> &str {
+        &self.model
+    }
+
     fn judge(&self, pairs: &[JudgeInput]) -> Result<Vec<Verdict>> {
         if pairs.is_empty() {
             return Ok(Vec::new());
         }
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "verdicts": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "index": {"type": "integer"},
-                            "redundant": {"type": "boolean"},
-                            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-                            "reason": {"type": "string"}
-                        },
-                        "required": ["index", "redundant", "confidence", "reason"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "required": ["verdicts"],
-            "additionalProperties": false
-        });
+        let schema = verdict_schema();
 
         let body = json!({
             "model": self.model,

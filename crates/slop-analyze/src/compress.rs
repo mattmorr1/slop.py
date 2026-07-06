@@ -38,10 +38,11 @@ pub struct CompressStats {
     pub compressed_chars: usize,
 }
 
-/// Optional per-skeleton enrichment: `densify(entity_id) -> one-line summary`.
-/// The read hook passes `None` (deterministic, hot path); an offline caller can
-/// pass an LLM-backed closure to add a `# summary:` line to each skeleton.
-pub type Densifier<'a> = dyn Fn(&str) -> Option<String> + 'a;
+/// Optional per-skeleton enrichment: given the entity, return a one-line
+/// summary to prepend as `# summary: ...`. The read hook passes `None`
+/// (deterministic, hot path); an offline caller (e.g. `slop compress
+/// --densify`) can pass an LLM-backed closure.
+pub type Densifier<'a> = dyn Fn(&slop_graph::CodeEntity) -> Option<String> + 'a;
 
 /// Compress `source` (the text of `file`) around `edit_loci` (entity ids in
 /// the edit zone). Returns the rewritten text and stats.
@@ -101,8 +102,11 @@ pub fn compress_file(
             if sk.is_empty() {
                 continue;
             }
-            if let Some(summary) = densify.and_then(|f| f(&entity.id)) {
-                sk = format!("# summary: {}\n{sk}", summary.trim());
+            if let Some(summary) = densify.and_then(|f| f(entity)) {
+                let summary = summary.trim();
+                if !summary.is_empty() {
+                    sk = format!("# summary: {summary}\n{sk}");
+                }
             }
             regions.push((fact.start_line as usize, fact.end_line as usize, sk));
         }
@@ -236,7 +240,7 @@ mod tests {
             .find(|(_, e)| e.file == file && e.entity_type == slop_graph::NodeType::Function)
             .map(|(_, e)| e.id.clone())
             .unwrap();
-        let densify = |_id: &str| Some("does a thing".to_string());
+        let densify = |_e: &slop_graph::CodeEntity| Some("does a thing".to_string());
         let (out, stats) = compress_file(
             &built,
             &facts,

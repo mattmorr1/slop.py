@@ -53,18 +53,18 @@ fn tier3_findings(
     facts: &[source::FileFacts],
     repo: &Path,
 ) -> Result<Vec<Finding>> {
-    use slop_llm::{ClaudeJudge, Judge, JudgeInput};
+    use slop_llm::{judge_from_env, JudgeInput};
 
     let candidates = crate::tier3::candidates(built, facts, repo);
     if candidates.is_empty() {
         eprintln!("tier3: no semantic-redundancy candidates");
         return Ok(Vec::new());
     }
-    let judge = ClaudeJudge::from_env()?;
+    let judge = judge_from_env()?;
     eprintln!(
         "tier3: judging {} semantic-redundancy pair(s) via {}",
         candidates.len(),
-        judge.model
+        judge.model()
     );
     let render = |c: &crate::tier3::CandidateFn| {
         format!(
@@ -124,17 +124,17 @@ fn tier3_structural_verdicts(
     facts: &[source::FileFacts],
     repo: &Path,
 ) -> Result<Vec<(String, bool, String)>> {
-    use slop_llm::{ClaudeJudge, Judge, JudgeInput};
+    use slop_llm::{judge_from_env, JudgeInput};
 
     let candidates = crate::tier3::structural_candidates(built, facts, repo);
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-    let judge = ClaudeJudge::from_env()?;
+    let judge = judge_from_env()?;
     eprintln!(
         "tier3: confirming {} duplicate-structural group(s) via {}",
         candidates.len(),
-        judge.model
+        judge.model()
     );
     let render = |c: &crate::tier3::CandidateFn| {
         format!(
