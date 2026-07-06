@@ -12,6 +12,21 @@ All of it reuses the same analysis engine `slop check` runs — no reimplementat
 
 Build the binary first: `cargo build --release` → `target/release/slop`.
 
+### One-command setup
+
+```
+slop install <repo-root>
+```
+
+wires slop into a repo's agent host for you: it merges the MCP server into
+`<repo>/.mcp.json` and the read/prompt hooks into `<repo>/.claude/settings.json`,
+pointing every entry at the binary you invoked (absolute path). It is
+**idempotent** — re-running updates slop's own entries (e.g. after a rebuild
+moves the binary) and preserves every other MCP server and hook you have. It
+refuses to touch a config file that isn't valid JSON unless you pass `--force`.
+Sections 1–2 below document the config it writes, if you'd rather do it by hand.
+Restart the agent host afterwards to load the server and hooks.
+
 ### Local LLM (Ollama)
 
 Anywhere slop needs an LLM it can use a local Ollama model instead of the
@@ -96,14 +111,16 @@ build) so they are cheap enough to run on every read/prompt.
 - `slop hook user-prompt-submit` — injects the repo's sanctioned-channel
   policy plus a pointer to `validate_change` as pre-hoc steering.
 
-Register in `.claude/settings.json`:
+Register in `.claude/settings.json` (or just run `slop install`, which writes
+exactly this). The matcher covers the write tools too, so the hook can record
+the session edit zone that read compression measures graph distance against:
 
 ```json
 {
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Read",
+        "matcher": "Read|Write|Edit|MultiEdit",
         "hooks": [
           { "type": "command", "command": "/abs/path/to/target/release/slop hook post-tool-use" }
         ]

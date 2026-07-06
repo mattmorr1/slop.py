@@ -150,6 +150,17 @@ enum Command {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Wire slop's harness into a repo's agent-host config: merge the MCP
+    /// server into `<repo>/.mcp.json` and the read/prompt hooks into
+    /// `<repo>/.claude/settings.json`, pointing at this binary. Idempotent —
+    /// re-running updates slop's own entries and leaves the rest untouched.
+    Install {
+        /// Repo root to install into
+        repo: PathBuf,
+        /// Overwrite even if an existing config file fails to parse as JSON
+        #[arg(long)]
+        force: bool,
+    },
     /// Record current findings as the grandfathered baseline.
     Baseline {
         /// Repo root
@@ -428,6 +439,9 @@ fn main() -> Result<()> {
         Command::Mcp { repo, index } => {
             slop_mcp::serve_stdio(repo, index)?;
         }
+        Command::Install { repo, force } => {
+            install_harness(&repo, force)?;
+        }
         Command::Baseline { repo, index } => {
             let policy = Policy::load(&repo)?;
             let check::Analysis { built, facts } = check::load_analysis(&repo, index.as_deref())?;
@@ -513,6 +527,78 @@ fn main() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Read a JSON config file into a `Value`, or `Value::Null` if it's absent.
+/// Refuses to proceed on an unparseable file (would clobber the user's config)
+/// unless `force` is set.
+fn read_json_config(path: &Path, force: bool) -> Result<serde_json::Value> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(serde_json::Value::Null);
+    };
+    if text.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    match serde_json::from_str(&text) {
+        Ok(v) => Ok(v),
+        Err(e) if force => {
+            eprintln!("warning: {} is not valid JSON ({e}); overwriting (--force)", path.display());
+            Ok(serde_json::Value::Null)
+        }
+        Err(e) => bail!(
+            "{} is not valid JSON ({e}) — fix it or pass --force to overwrite",
+            path.display()
+        ),
+    }
+}
+
+/// Wire slop's MCP server + hooks into `<repo>/.mcp.json` and
+/// `<repo>/.claude/settings.json`. Idempotent (see `install::merge_*`).
+fn install_harness(repo: &Path, force: bool) -> Result<()> {
+    use slop_analyze::install;
+
+    let repo = repo
+        .canonicalize()
+        .with_context(|| format!("resolving repo path {}", repo.display()))?;
+    let exe = std::env::current_exe()
+        .context("resolving the slop binary path")?
+        .to_string_lossy()
+        .into_owned();
+    let repo_str = repo.to_string_lossy().into_owned();
+
+    // .mcp.json — the MCP server (validate_change / get_context_envelope /
+    // query_subgraph).
+    let mcp_path = repo.join(".mcp.json");
+    let mcp = install::merge_mcp(read_json_config(&mcp_path, force)?, &exe, &repo_str);
+    std::fs::write(&mcp_path, format!("{}\n", serde_json::to_string_pretty(&mcp)?))
+        .with_context(|| format!("writing {}", mcp_path.display()))?;
+    println!("wrote {} (mcpServers.slop)", mcp_path.display());
+
+    // .claude/settings.json — the read-path + prompt hooks.
+    let claude_dir = repo.join(".claude");
+    std::fs::create_dir_all(&claude_dir)
+        .with_context(|| format!("creating {}", claude_dir.display()))?;
+    let settings_path = claude_dir.join("settings.json");
+    let settings = install::merge_hooks(read_json_config(&settings_path, force)?, &exe);
+    std::fs::write(
+        &settings_path,
+        format!("{}\n", serde_json::to_string_pretty(&settings)?),
+    )
+    .with_context(|| format!("writing {}", settings_path.display()))?;
+    println!(
+        "wrote {} (PostToolUse + UserPromptSubmit hooks)",
+        settings_path.display()
+    );
+
+    println!(
+        "\nharness installed. next:\n  \
+         - generate a SCIP index:  npx --yes @sourcegraph/scip-python index {repo_str} --project-name {} --output {repo_str}/index.scip\n  \
+         - optional policy:        slop init {repo_str} --write\n  \
+         - gate the fix-loop:      slop gate {repo_str} --reindex\n\
+         Restart the agent host to load the new MCP server and hooks.",
+        repo.file_name().map(|s| s.to_string_lossy()).unwrap_or_else(|| "repo".into()),
+    );
     Ok(())
 }
 

@@ -15,6 +15,7 @@ pub mod gate;
 pub mod harness;
 pub mod health;
 pub mod infer;
+pub mod install;
 pub mod naming;
 pub mod policy;
 pub mod query;
