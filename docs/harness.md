@@ -76,15 +76,23 @@ build) so they are cheap enough to run on every read/prompt.
   - On a `Read` of a `.py` file, skeletonizes functions that are more than
     `edit_zone_hops` (1) graph hops from the edit zone — full fidelity for the
     code you're working near, a signature + effect-signature + docstring
-    contract for everything else — and attaches sanctioned-channel steering
-    (`additionalContext`). Falls back to a plain comment/blank strip on a cold
-    read (empty edit zone), a small file, or when there's no SCIP index.
+    contract for the distant context — and attaches sanctioned-channel
+    steering (`additionalContext`).
+  - **Edit-invertibility guarantee:** a read is *only ever* remapped by that
+    zoned skeletonization of graph-distant code (which you're editing
+    elsewhere, so you won't string-edit against it). Every other read is served
+    **verbatim** — no strip, no skeleton — so an `Edit` can always match the
+    real file. A **re-read** is served verbatim too (the agent came back to it,
+    likely to edit): this self-corrects a first-read edit that missed against a
+    skeleton (fail → re-read → verbatim → succeeds). Set
+    `SLOP_COMPRESS_READS=0` to disable read compression entirely (steering
+    still applies).
   - Non-`Read`/`Write`/`Edit`, non-`.py` reads pass through untouched.
 
   > Cost: a read that triggers zoned compression builds the graph
   > (~0.1–0.5s depending on repo size, needs `<repo>/index.scip`). Small
-  > files and cold reads skip it. Preview/measure with `slop compress`:
-  > `slop compress <repo> <file> --edit <entity-id> --hops 1 --stats`.
+  > files, cold reads, and re-reads skip it. Preview/measure with `slop
+  > compress <repo> <file> --edit-file <other-file> --hops 1 --stats`.
 - `slop hook user-prompt-submit` — injects the repo's sanctioned-channel
   policy plus a pointer to `validate_change` as pre-hoc steering.
 

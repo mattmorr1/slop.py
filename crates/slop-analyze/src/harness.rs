@@ -20,7 +20,6 @@ use serde_json::{json, Value};
 
 use crate::compress::{self, CompressConfig};
 use crate::policy::Policy;
-use crate::skeleton::strip_noise;
 
 /// Only bother remapping when the strip saves at least this fraction of
 /// characters — otherwise pass the read through untouched.
@@ -114,34 +113,56 @@ fn zone_file(repo: &Path) -> PathBuf {
     std::env::temp_dir().join(format!("slop-editzone-{:x}.json", h.finish()))
 }
 
-/// Append a repo-relative path to the edit zone (most-recent last, capped,
-/// deduped). Best-effort — a write failure just means no zoning next read.
-fn record_edit(zone_path: &Path, rel: &str) {
-    let mut files = load_zone(zone_path);
-    files.retain(|f| f != rel);
-    files.push(rel.to_string());
-    let overflow = files.len().saturating_sub(MAX_ZONE_FILES);
-    files.drain(0..overflow);
+/// Session state: files recently edited (the edit zone reads compress
+/// against) and files already read (a re-read signals the agent needs the
+/// real content — probably to edit it — so it's served verbatim).
+#[derive(Default)]
+struct Zone {
+    edits: Vec<String>,
+    reads: Vec<String>,
+}
+
+fn arr(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+fn load_state(zone_path: &Path) -> Zone {
+    let Ok(text) = std::fs::read_to_string(zone_path) else {
+        return Zone::default();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return Zone::default();
+    };
+    Zone {
+        // `files` is the pre-read-tracking key name; keep reading it as edits.
+        edits: if v.get("edits").is_some() { arr(&v, "edits") } else { arr(&v, "files") },
+        reads: arr(&v, "reads"),
+    }
+}
+
+fn save_state(zone_path: &Path, zone: &Zone) {
     let _ = std::fs::write(
         zone_path,
-        serde_json::to_string(&json!({ "files": files })).unwrap_or_default(),
+        serde_json::to_string(&json!({ "edits": zone.edits, "reads": zone.reads }))
+            .unwrap_or_default(),
     );
 }
 
-fn load_zone(zone_path: &Path) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(zone_path) else {
-        return Vec::new();
-    };
-    serde_json::from_str::<Value>(&text)
-        .ok()
-        .and_then(|v| {
-            v.get("files").and_then(Value::as_array).map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(str::to_string))
-                    .collect()
-            })
-        })
-        .unwrap_or_default()
+/// Move `rel` to the most-recent end of `list`, deduped and capped.
+fn push_capped(list: &mut Vec<String>, rel: &str) {
+    list.retain(|f| f != rel);
+    list.push(rel.to_string());
+    let overflow = list.len().saturating_sub(MAX_ZONE_FILES);
+    list.drain(0..overflow);
+}
+
+fn record_edit(zone_path: &Path, rel: &str) {
+    let mut zone = load_state(zone_path);
+    push_capped(&mut zone.edits, rel);
+    save_state(zone_path, &zone);
 }
 
 /// Make `path` repo-relative (matching SCIP/graph `file` fields). Returns the
@@ -226,18 +247,36 @@ pub fn handle_post_tool_use(input: &Value) -> Value {
     let mut changed = false;
 
     if let Some(src) = read_output_text(input) {
-        // Prefer zoned graph-distance compression; fall back to noise-strip.
-        let zone = load_zone(&zone_file(&repo));
-        let compressed = if zone.is_empty() {
-            None
-        } else {
-            repo_relative(&repo, &file).and_then(|rel| compress_read(&repo, &rel, &src, &zone))
-        };
-        let remapped = compressed.unwrap_or_else(|| strip_noise(&src));
-        let gain = 1.0 - (remapped.len() as f64 / src.len().max(1) as f64);
-        if gain >= MIN_COMPRESSION_GAIN {
-            hook["updatedToolOutput"] = Value::String(remapped);
-            changed = true;
+        // Edit-invertibility: only ever remap a read by *zoned skeletonization
+        // of graph-distant context* (code you're editing elsewhere, so you
+        // won't string-edit against it). Everything else is served verbatim —
+        // no strip, no skeleton — so an edit can always match the real file.
+        // A re-read means the agent came back to the file (likely to edit it),
+        // so it's served verbatim too; this self-corrects a first-read edit
+        // that failed against a skeleton (fail -> re-read -> verbatim -> ok).
+        let compress_reads = std::env::var("SLOP_COMPRESS_READS")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let zone_path = zone_file(&repo);
+        let mut zone = load_state(&zone_path);
+        let rel = repo_relative(&repo, &file);
+        let is_reread = rel.as_deref().is_some_and(|r| zone.reads.iter().any(|x| x == r));
+        if let Some(r) = &rel {
+            push_capped(&mut zone.reads, r);
+            save_state(&zone_path, &zone);
+        }
+
+        if compress_reads && !is_reread {
+            if let Some(out) = rel
+                .as_deref()
+                .and_then(|r| compress_read(&repo, r, &src, &zone.edits))
+            {
+                let gain = 1.0 - (out.len() as f64 / src.len().max(1) as f64);
+                if gain >= MIN_COMPRESSION_GAIN {
+                    hook["updatedToolOutput"] = Value::String(out);
+                    changed = true;
+                }
+            }
         }
     }
     if let Some(s) = steering {
@@ -301,18 +340,16 @@ mod tests {
     }
 
     #[test]
-    fn python_read_strips_comment_noise() {
-        let src = "def f():\n    # a comment explaining nothing\n    # another one\n\n\n\n    return 1\n";
+    fn read_with_no_edit_zone_is_served_verbatim() {
+        // Edit-invertibility: with no edit zone (and no index), a read is never
+        // remapped — the agent must be able to string-edit against the real
+        // file. No updatedToolOutput.
+        let src = "def f():\n    # a comment\n    return 1\n";
         let out = handle_post_tool_use(&json!({
-            "tool_name": "Read", "tool_input": {"file_path": "/x/mod.py"},
-            "tool_output": src, "cwd": "/x"
+            "tool_name": "Read", "tool_input": {"file_path": "/nope/mod.py"},
+            "tool_output": src, "cwd": "/nope"
         }));
-        let remapped = out["hookSpecificOutput"]["updatedToolOutput"]
-            .as_str()
-            .expect("updatedToolOutput");
-        assert!(!remapped.contains("# a comment"));
-        assert!(remapped.contains("return 1"));
-        assert!(remapped.len() < src.len());
+        assert!(out.get("hookSpecificOutput").is_none() || out["hookSpecificOutput"].get("updatedToolOutput").is_none());
     }
 
     #[test]
@@ -345,12 +382,12 @@ mod tests {
         record_edit(&path, "a.py");
         record_edit(&path, "b.py");
         record_edit(&path, "a.py"); // dedup -> moves a.py to the end
-        assert_eq!(load_zone(&path), vec!["b.py".to_string(), "a.py".to_string()]);
+        assert_eq!(load_state(&path).edits, vec!["b.py".to_string(), "a.py".to_string()]);
 
         for i in 0..MAX_ZONE_FILES + 5 {
             record_edit(&path, &format!("f{i}.py"));
         }
-        assert_eq!(load_zone(&path).len(), MAX_ZONE_FILES);
+        assert_eq!(load_state(&path).edits.len(), MAX_ZONE_FILES);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -370,7 +407,7 @@ mod tests {
             "tool_input": { "file_path": file_path.to_string_lossy() }
         }));
         assert_eq!(out, json!({})); // edits are silent, side-effect only
-        assert_eq!(load_zone(&zone), vec!["mod.py".to_string()]);
+        assert_eq!(load_state(&zone).edits, vec!["mod.py".to_string()]);
         let _ = std::fs::remove_file(&zone);
     }
 
