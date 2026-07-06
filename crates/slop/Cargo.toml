@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+serde_json = { workspace = true }
 slop-analyze = { workspace = true }
 slop-graph = { workspace = true }
 slop-llm = { workspace = true }

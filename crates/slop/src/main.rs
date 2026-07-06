@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use slop_analyze::baseline::Baseline;
 use slop_analyze::check::{self, CheckRequest};
-use slop_analyze::{detect, infer, policy::Policy, suppress};
+use slop_analyze::{detect, harness, infer, policy::Policy, suppress};
 use slop_resolve::{Resolver, ScipResolver};
 
 #[derive(Parser)]
@@ -12,6 +12,14 @@ use slop_resolve::{Resolver, ScipResolver};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// Hook events slop can handle. Kebab-cased on the CLI by clap:
+/// `post-tool-use`, `user-prompt-submit`.
+#[derive(Clone, Copy, ValueEnum)]
+enum HookEvent {
+    PostToolUse,
+    UserPromptSubmit,
 }
 
 #[derive(Subcommand)]
@@ -36,6 +44,12 @@ enum Command {
         /// Git ref to diff against (default: HEAD)
         #[arg(long, default_value = "HEAD")]
         base: String,
+    },
+    /// Agent-host hook (M4d). Reads the hook JSON on stdin, writes the
+    /// response on stdout. Register in .claude/settings.json (see docs/harness.md).
+    Hook {
+        /// Which hook event this invocation handles
+        event: HookEvent,
     },
     /// Serve slop's MCP tools (validate_change, get_context_envelope,
     /// query_subgraph) over stdio. Launched per-project by an agent host
@@ -134,6 +148,21 @@ fn main() -> Result<()> {
             if result.blocking > 0 {
                 std::process::exit(1);
             }
+        }
+        Command::Hook { event } => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            let input: serde_json::Value = if buf.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(&buf)?
+            };
+            let output = match event {
+                HookEvent::PostToolUse => harness::handle_post_tool_use(&input),
+                HookEvent::UserPromptSubmit => harness::handle_user_prompt_submit(&input),
+            };
+            println!("{output}");
         }
         Command::Mcp { repo, index } => {
             slop_mcp::serve_stdio(repo, index)?;

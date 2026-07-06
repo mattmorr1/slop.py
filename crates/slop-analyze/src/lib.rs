@@ -9,6 +9,7 @@ pub mod effects;
 pub mod entity_id;
 pub mod envelope;
 pub mod findings;
+pub mod harness;
 pub mod health;
 pub mod infer;
 pub mod naming;
