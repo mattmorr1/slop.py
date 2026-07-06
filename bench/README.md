@@ -35,7 +35,34 @@ on disk are never touched. And the view stays *valid Python*: all 23 compressed
 files across the three repos parse with `ast.parse` (skeletons preserve their
 original indentation, decorators included).
 
-The other half of the thesis — fewer *introduced* slop findings when an agent
-edits with steering vs without — needs live agent runs (via `slop proxy --log`
-for tokens + `slop gate`/`validate_change` for findings) and isn't captured
-here.
+## `context_ab.py` — agent-output A/B (usage/additions)
+
+Tests whether compressed context preserves the ability to *use* existing code
+(the additions case). For each target function it asks a local model to write a
+call, given full-file context vs `slop compress`-skeletonized context, and
+grades arity. The claim under test is **A ≈ B at fewer tokens**, not high
+absolute accuracy.
+
+```
+cargo build --release
+python3 bench/context_ab.py [repo]     # OLLAMA_MODEL overridable
+```
+
+### Pilot (2026-07-06, geoguessrbot, qwen2.5:1.5b, N=10)
+
+| context | usage correct | ctx tokens |
+| --- | ---: | ---: |
+| full file | 10/10 | ~26,392 |
+| compressed | 10/10 | ~14,652 (**−45%**) |
+
+Compression cost nothing on usage while roughly halving tokens — consistent
+with the mechanism (skeletons keep the signature an addition needs; only the
+body, which a *caller* doesn't need, is dropped).
+
+**Caveats — this is a pilot, not proof.** N=10, a small model, lenient grading,
+one repo, and a ceiling effect (both perfect) that a harder task set would
+break. It tests *using* skeletonized code, **not modifying** it — modification
+needs the body, which is why edit targets are kept full-fidelity (see
+`docs/harness.md` edit-invertibility). The introduced-slop half (agent edits
+with vs without steering, via `slop proxy --log` + `gate`) still needs a
+capable model and a real task set.
