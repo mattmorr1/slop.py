@@ -19,6 +19,7 @@ pub mod install;
 pub mod naming;
 pub mod policy;
 pub mod query;
+pub mod rename;
 pub mod skeleton;
 pub mod source;
 pub mod suppress;

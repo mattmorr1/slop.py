@@ -8,7 +8,7 @@ use slop_analyze::check::{self, CheckRequest};
 use std::collections::HashMap;
 
 use slop_analyze::compress::{self, CompressConfig};
-use slop_analyze::{detect, fix, gate, harness, infer, policy::Policy, suppress};
+use slop_analyze::{detect, fix, gate, harness, infer, policy::Policy, rename, suppress};
 use slop_resolve::{Resolver, ScipResolver};
 
 #[derive(Parser)]
@@ -49,9 +49,12 @@ enum Command {
         #[arg(long, default_value = "HEAD")]
         base: String,
     },
-    /// Apply slop's safe mechanistic auto-fixes (D9 path a). Currently:
+    /// Apply slop's mechanistic auto-fixes (D9 path a). Two rules:
     /// over-commenting — delete comments that restate the adjacent code
-    /// (behaviour-safe: comments are inert). Dry-run unless --write.
+    /// (behaviour-safe: comments are inert); and naming-convention —
+    /// rename a camelCase free function to snake_case, rewriting every
+    /// SCIP-resolved reference and re-parsing each file (methods and
+    /// throwaway-marker names are left to a human). Dry-run unless --write.
     Fix {
         /// Repo root
         repo: PathBuf,
@@ -254,6 +257,37 @@ fn main() -> Result<()> {
             let policy = Policy::load(&repo).unwrap_or_default();
             let findings = detect::run_all(&analysis.built, &policy, &analysis.facts);
 
+            // Renames first: they only substitute name tokens (no line-count
+            // change), so the over-commenting pass below still sees valid line
+            // numbers. The resolver drives SCIP-verified reference rewriting.
+            let index_path = index
+                .clone()
+                .unwrap_or_else(|| repo.join("index.scip"));
+            let resolver = ScipResolver::load(&index_path)?;
+            let renames = rename::plan_renames(&analysis.built, &resolver, &repo, &findings);
+            let mut renamed = 0usize;
+            for outcome in &renames.outcomes {
+                match outcome {
+                    rename::RenameOutcome::Planned(p) => {
+                        renamed += 1;
+                        let verb = if write { "rename" } else { "would rename" };
+                        println!(
+                            "{verb} [{}] {} -> {} ({} occurrence(s) across {} file(s))",
+                            p.rule, p.entity, p.new_name, p.occurrences, p.file_count
+                        );
+                    }
+                    rename::RenameOutcome::Skipped { entity, reason } => {
+                        eprintln!("skip rename {entity}: {reason}");
+                    }
+                }
+            }
+            if write {
+                for (file, src) in &renames.files {
+                    std::fs::write(repo.join(file), src)
+                        .with_context(|| format!("writing {file}"))?;
+                }
+            }
+
             let mut by_file: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
             for f in findings.iter().filter(|f| f.rule == "over-commenting") {
                 by_file.entry(f.file.clone()).or_default().push(f.lines);
@@ -282,13 +316,21 @@ fn main() -> Result<()> {
                     println!("would fix {file}: {n} restating comment(s)");
                 }
             }
-            if total == 0 {
-                println!("no restating comments to remove");
+            if total == 0 && renamed == 0 {
+                println!("nothing to fix");
             } else if write {
-                println!("removed {total} comment(s) across {touched} file(s)");
+                println!(
+                    "applied {renamed} rename(s); removed {total} comment(s) across {touched} file(s)"
+                );
+                if renamed > 0 {
+                    println!(
+                        "note: renames changed references — re-index (e.g. `slop gate {} --reindex`) before the next check",
+                        repo.display()
+                    );
+                }
             } else {
                 println!(
-                    "dry-run: {total} comment(s) across {touched} file(s) — re-run with --write to apply"
+                    "dry-run: {renamed} rename(s) + {total} comment(s) across {touched} file(s) — re-run with --write to apply"
                 );
             }
         }
