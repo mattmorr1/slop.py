@@ -210,6 +210,85 @@ pub fn load_analysis(repo: &Path, index: Option<&Path>) -> Result<Analysis> {
     Ok(Analysis { built, facts })
 }
 
+/// One finding plus whether the baseline already grandfathers it. The
+/// interactive dashboard (and any "show me everything" view) needs the full
+/// set *with* the grandfathered ones marked, not silently dropped the way
+/// `run` drops them — that opacity is exactly what makes `slop baseline`
+/// confusing ("why is my repo suddenly clean?").
+pub struct AuditFinding {
+    pub finding: Finding,
+    pub grandfathered: bool,
+}
+
+/// A whole-repo audit: every finding, tagged, most-severe first, with health
+/// scored two ways — counting everything vs. counting only what isn't
+/// grandfathered (what `run` reports).
+pub struct AuditResult {
+    pub findings: Vec<AuditFinding>,
+    /// Health counting every finding (the honest state of the repo).
+    pub health_all: u32,
+    /// Health counting only un-grandfathered findings (what a gated loop acts on).
+    pub health_new: u32,
+    /// How many findings the baseline grandfathers.
+    pub grandfathered: usize,
+    pub policy_is_empty: bool,
+}
+
+/// Run the full detector set over the whole repo and return every finding,
+/// tagging each with whether the baseline grandfathers it. Unlike `run`, this
+/// never hides grandfathered findings — it marks them, so a UI can show the
+/// real state and let the user choose what to look at.
+pub fn audit(repo: &Path, index: Option<&Path>) -> Result<AuditResult> {
+    let policy = Policy::load(repo)?;
+    let Analysis { built, facts } = load_analysis(repo, index)?;
+    let baseline = Baseline::load(repo)?;
+
+    let mut raw = crate::detect::run_all(&built, &policy, &facts);
+    raw.extend(crate::detect::effect_creep(&built, &baseline));
+    let suppressions = suppress::scan(repo, &facts);
+    let all = suppress::filter(raw, &suppressions);
+
+    // (rule, entity) is the baseline fingerprint — see `Baseline::filter`.
+    let grandfathered_set: std::collections::HashSet<(&str, &str)> = baseline
+        .findings
+        .iter()
+        .map(|e| (e.rule.as_str(), e.entity.as_str()))
+        .collect();
+
+    let health_all = health::score(&all, &built);
+    let new_only: Vec<Finding> = all
+        .iter()
+        .filter(|f| !grandfathered_set.contains(&(f.rule, f.entity.as_str())))
+        .cloned()
+        .collect();
+    let health_new = health::score(&new_only, &built);
+
+    let mut findings: Vec<AuditFinding> = all
+        .into_iter()
+        .map(|f| {
+            let grandfathered = grandfathered_set.contains(&(f.rule, f.entity.as_str()));
+            AuditFinding { finding: f, grandfathered }
+        })
+        .collect();
+    // Most-severe first, then a stable (rule, entity) order within a severity.
+    findings.sort_by(|a, b| {
+        b.finding
+            .severity
+            .cmp(&a.finding.severity)
+            .then_with(|| a.finding.rule.cmp(b.finding.rule))
+            .then_with(|| a.finding.entity.cmp(&b.finding.entity))
+    });
+
+    let grandfathered = findings.iter().filter(|f| f.grandfathered).count();
+    Ok(AuditResult {
+        findings,
+        health_all,
+        health_new,
+        grandfathered,
+        policy_is_empty: policy.channels.is_empty(),
+    })
+}
+
 pub fn run(req: CheckRequest) -> Result<CheckResult> {
     let policy = match &req.policy {
         Some(path) => Policy::load_file(path)?,
@@ -287,4 +366,36 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
         blocking,
         policy_is_empty: policy.channels.is_empty(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn audit_reports_all_findings_severity_ordered_with_no_baseline() {
+        let out = audit(&fixture("toy_repo_slopped"), None).expect("audit");
+        assert!(!out.findings.is_empty(), "slopped repo should have findings");
+        // No baseline in the fixture -> nothing grandfathered, both healths equal.
+        assert_eq!(out.grandfathered, 0);
+        assert!(out.findings.iter().all(|f| !f.grandfathered));
+        assert_eq!(out.health_all, out.health_new);
+        // Most-severe first.
+        for pair in out.findings.windows(2) {
+            assert!(pair[0].finding.severity >= pair[1].finding.severity);
+        }
+    }
+
+    #[test]
+    fn audit_clean_repo_scores_full_health() {
+        let out = audit(&fixture("toy_repo"), None).expect("audit");
+        assert!(out.findings.is_empty());
+        assert_eq!(out.health_all, 100);
+    }
 }
