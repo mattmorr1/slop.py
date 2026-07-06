@@ -5,8 +5,10 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use slop_analyze::baseline::Baseline;
 use slop_analyze::check::{self, CheckRequest};
+use std::collections::HashMap;
+
 use slop_analyze::compress::{self, CompressConfig};
-use slop_analyze::{detect, gate, harness, infer, policy::Policy, suppress};
+use slop_analyze::{detect, fix, gate, harness, infer, policy::Policy, suppress};
 use slop_resolve::{Resolver, ScipResolver};
 
 #[derive(Parser)]
@@ -46,6 +48,19 @@ enum Command {
         /// Git ref to diff against (default: HEAD)
         #[arg(long, default_value = "HEAD")]
         base: String,
+    },
+    /// Apply slop's safe mechanistic auto-fixes (D9 path a). Currently:
+    /// over-commenting — delete comments that restate the adjacent code
+    /// (behaviour-safe: comments are inert). Dry-run unless --write.
+    Fix {
+        /// Repo root
+        repo: PathBuf,
+        /// Path to index.scip (default: <repo>/index.scip)
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Apply changes to disk (default: report only)
+        #[arg(long)]
+        write: bool,
     },
     /// Zoned graph-distance compression of a file (D11): full fidelity within
     /// --hops of the --edit loci, skeletons beyond. Prints the compressed
@@ -221,6 +236,49 @@ fn main() -> Result<()> {
             println!("{}", result.health_line);
             if result.blocking > 0 {
                 std::process::exit(1);
+            }
+        }
+        Command::Fix { repo, index, write } => {
+            let analysis = check::load_analysis(&repo, index.as_deref())?;
+            let policy = Policy::load(&repo).unwrap_or_default();
+            let findings = detect::run_all(&analysis.built, &policy, &analysis.facts);
+
+            let mut by_file: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+            for f in findings.iter().filter(|f| f.rule == "over-commenting") {
+                by_file.entry(f.file.clone()).or_default().push(f.lines);
+            }
+            let mut files: Vec<_> = by_file.into_iter().collect();
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut total = 0usize;
+            let mut touched = 0usize;
+            for (file, ranges) in files {
+                let path = repo.join(&file);
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let (new_src, n) = fix::fix_over_commenting(&src, &ranges);
+                if n == 0 {
+                    continue;
+                }
+                total += n;
+                touched += 1;
+                if write {
+                    std::fs::write(&path, &new_src)
+                        .with_context(|| format!("writing {file}"))?;
+                    println!("fixed {file}: removed {n} restating comment(s)");
+                } else {
+                    println!("would fix {file}: {n} restating comment(s)");
+                }
+            }
+            if total == 0 {
+                println!("no restating comments to remove");
+            } else if write {
+                println!("removed {total} comment(s) across {touched} file(s)");
+            } else {
+                println!(
+                    "dry-run: {total} comment(s) across {touched} file(s) — re-run with --write to apply"
+                );
             }
         }
         Command::Compress {

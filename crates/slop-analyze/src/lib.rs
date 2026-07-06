@@ -10,6 +10,7 @@ pub mod effects;
 pub mod entity_id;
 pub mod envelope;
 pub mod findings;
+pub mod fix;
 pub mod gate;
 pub mod harness;
 pub mod health;
