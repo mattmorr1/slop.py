@@ -43,6 +43,8 @@ Slop is defined **relative to the surrounding codebase**, not absolutely. That i
 | **D12** | **Severity = confidence × impact, collapsed onto the detector taxonomy.** Confidence is intrinsic to the detector (deterministic ⇒ can block; fuzzy ⇒ can only advise). Health = severity-weighted slop-density; **diff-delta is the headline number** (`82 → 79`), absolute repo score in audit mode. Baseline file + reasoned inline suppression (`# slop: allow <rule> — <reason>`). No tamagotchi.                             | Severity isn't a new axis to invent; it falls out of the detector confidence we already defined.                                                            |
 
 
+
+
 ---
 
 
@@ -102,7 +104,7 @@ Edge kinds: `Contains`, `Calls` (cyclic), `Imports` (cyclic — SCC target), `In
 
 `Pure`, `Net`, `FS(read|write)`, `DB`, `Env`, `Throws(T)`, `Time/Random` (nondeterminism), `State(mutate)`, `Concurrency`, `Unknown` (top).
 
-- **Seed table:** hand-curated map of primitive effect sources (`requests.`*/`socket.*` → `Net`, `open().write` → `FS(write)`, `os.environ` → `Env`, …) for stdlib + top-~20 libs.
+- **Seed table:** hand-curated map of primitive effect sources (`requests.`*/`socket.`* → `Net`, `open().write` → `FS(write)`, `os.environ` → `Env`, …) for stdlib + top-~20 libs.
 - **Propagation:** transitive up the `Calls` graph via fixpoint over SCCs. Unresolved call ⇒ `Unknown`, handled gracefully (never crashes, caps recall not precision).
 
 
@@ -217,3 +219,5 @@ Baseline via `slop audit` on each; then validate `slop check` diff-mode against 
 - Semantic (Type-4) clone detection — reusable for duplication detectors.
 
 long term: test on gemini flash 3.5 swe-bench lite.
+
+[https://libraries.io/pypi/mcp-tollbooth](https://libraries.io/pypi/mcp-tollbooth) ideas...

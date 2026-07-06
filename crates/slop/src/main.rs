@@ -1,10 +1,10 @@
 use std::path::PathBuf;
-use std::process::Command as Process;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use slop_analyze::baseline::Baseline;
-use slop_analyze::{build, detect, diff, effects, health, infer, policy::Policy, source, suppress};
+use slop_analyze::check::{self, CheckRequest};
+use slop_analyze::{build, detect, effects, infer, policy::Policy, source, suppress};
 use slop_resolve::{Resolver, ScipResolver};
 
 #[derive(Parser)]
@@ -80,74 +80,6 @@ enum Command {
     },
 }
 
-/// Tier-3: build effect-bucketed candidates, judge via the Claude API, map
-/// confirmed pairs to Advisory findings (never blocking — D4).
-fn tier3_findings(
-    built: &build::BuiltGraph,
-    facts: &[source::FileFacts],
-    repo: &std::path::Path,
-) -> Result<Vec<slop_analyze::findings::Finding>> {
-    use slop_analyze::findings::{Finding, Severity};
-    use slop_llm::{ClaudeJudge, Judge, JudgeInput};
-
-    let candidates = slop_analyze::tier3::candidates(built, facts, repo);
-    if candidates.is_empty() {
-        eprintln!("tier3: no semantic-redundancy candidates");
-        return Ok(Vec::new());
-    }
-    let judge = ClaudeJudge::from_env()?;
-    eprintln!(
-        "tier3: judging {} candidate pair(s) via {}",
-        candidates.len(),
-        judge.model
-    );
-    let render = |c: &slop_analyze::tier3::CandidateFn| {
-        format!(
-            "# {} ({}:{})\n# docstring: {}\n{}",
-            c.entity,
-            c.file,
-            c.lines.0 + 1,
-            c.docstring.as_deref().unwrap_or("<none>"),
-            c.snippet
-        )
-    };
-    let inputs: Vec<JudgeInput> = candidates
-        .iter()
-        .enumerate()
-        .map(|(i, pair)| JudgeInput {
-            index: i,
-            a_label: pair.a.entity.clone(),
-            a_context: render(&pair.a),
-            b_label: pair.b.entity.clone(),
-            b_context: render(&pair.b),
-        })
-        .collect();
-    let verdicts = judge.judge(&inputs)?;
-
-    let mut findings = Vec::new();
-    for verdict in verdicts.into_iter().filter(|v| v.redundant) {
-        let Some(pair) = candidates.get(verdict.index) else {
-            continue;
-        };
-        findings.push(Finding {
-            rule: "semantic-redundancy",
-            severity: Severity::Advisory,
-            entity: pair.a.entity.clone(),
-            file: pair.a.file.clone(),
-            lines: pair.a.lines,
-            message: format!(
-                "`{}` and `{}` appear to serve the same purpose ({} confidence): {}",
-                pair.a.entity, pair.b.entity, verdict.confidence, verdict.reason
-            ),
-            fix_guidance: format!(
-                "Unify `{}` and `{}` behind one implementation",
-                pair.a.entity, pair.b.entity
-            ),
-        });
-    }
-    Ok(findings)
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -159,90 +91,37 @@ fn main() -> Result<()> {
             tier3,
             base,
         } => {
-            let index_path = index.unwrap_or_else(|| repo.join("index.scip"));
-            if !index_path.exists() {
-                bail!(
-                    "no SCIP index at {} — generate one with:\n  npx --yes @sourcegraph/scip-python index {} --project-name <name> --output {}",
-                    index_path.display(),
-                    repo.display(),
-                    index_path.display(),
-                );
-            }
-            let resolver = ScipResolver::load(&index_path)?;
-            let policy = match policy {
-                Some(path) => Policy::load_file(&path)?,
-                None => Policy::load(&repo)?,
-            };
+            let result = check::run(CheckRequest {
+                repo: repo.clone(),
+                index,
+                policy,
+                all,
+                tier3,
+                base,
+            })?;
 
-            let mut built = build::build_graph(&resolver);
-            effects::infer_effects(&mut built);
-            let facts = source::parse_repo(&repo, &resolver.files());
-            let mut raw = detect::run_all(&built, &policy, &facts);
-            if tier3 {
-                raw.extend(tier3_findings(&built, &facts, &repo)?);
-            }
-            let suppressions = suppress::scan(&repo, &facts);
-            let unsuppressed = suppress::filter(raw, &suppressions);
-            let baseline = Baseline::load(&repo)?;
-            let effective = baseline.filter(unsuppressed);
-
-            let (findings, health_line) = if all {
-                let s = health::score(&effective, &built);
-                (effective, format!("health: {s}/100"))
-            } else {
-                let output = Process::new("git")
-                    .args(["-C"])
-                    .arg(&repo)
-                    .args(["diff", "-U0", "--no-color", &base, "--", "*.py"])
-                    .output()
-                    .context("running git diff (use --all for a non-git tree)")?;
-                if !output.status.success() {
-                    bail!(
-                        "git diff failed: {} — use --all to judge the whole repo",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
-                }
-                let changed = diff::parse_unified_diff(&String::from_utf8_lossy(&output.stdout));
-                let new = diff::filter_to_changes(effective.clone(), &changed);
-                let new_keys: std::collections::HashSet<(&str, String)> = new
-                    .iter()
-                    .map(|f| (f.rule, f.entity.clone()))
-                    .collect();
-                let before: Vec<_> = effective
-                    .iter()
-                    .filter(|f| !new_keys.contains(&(f.rule, f.entity.clone())))
-                    .cloned()
-                    .collect();
-                let line = format!(
-                    "health: {} -> {}",
-                    health::score(&before, &built),
-                    health::score(&effective, &built)
-                );
-                (new, line)
-            };
-
-            if policy.channels.is_empty() {
+            if result.policy_is_empty {
                 eprintln!(
                     "note: {} has no slop.toml channel policy — infra-bypass checks are silent (run `slop init`)",
                     repo.display()
                 );
             }
 
-            if findings.is_empty() {
+            if result.findings.is_empty() {
                 println!("no slop found");
-                println!("{health_line}");
+                println!("{}", result.health_line);
                 return Ok(());
             }
-            let blocking = findings
-                .iter()
-                .filter(|f| f.severity == slop_analyze::findings::Severity::Blocking)
-                .count();
-            for finding in &findings {
+            for finding in &result.findings {
                 println!("{finding}\n");
             }
-            println!("{} finding(s), {} blocking", findings.len(), blocking);
-            println!("{health_line}");
-            if blocking > 0 {
+            println!(
+                "{} finding(s), {} blocking",
+                result.findings.len(),
+                result.blocking
+            );
+            println!("{}", result.health_line);
+            if result.blocking > 0 {
                 std::process::exit(1);
             }
         }
