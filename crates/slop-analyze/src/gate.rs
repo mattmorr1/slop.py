@@ -9,31 +9,39 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::check::{self, CheckRequest};
+use crate::findings::Severity;
 
 pub struct GateOutcome {
     /// Pretty JSON verdict for the driving agent / CI log.
     pub json: String,
-    /// Number of Blocking findings — the process exits non-zero when > 0.
-    pub blocking: usize,
+    /// Findings at or above the fail threshold — the process exits non-zero
+    /// when > 0.
+    pub failing: usize,
 }
 
-/// Run the check and shape the gate verdict. Blocking findings mean the gate
-/// fails (caller exits non-zero); Warning/Advisory are reported but pass.
-pub fn evaluate(req: CheckRequest) -> Result<GateOutcome> {
+/// Run the check and shape the gate verdict. Findings at or above `fail_on`
+/// fail the gate (caller exits non-zero); everything else is reported but
+/// passes. `fail_on` defaults to `Blocking` at the CLI, but lowering it to
+/// `Warning` is what lets the fix-loop act on `duplicate-exact` /
+/// `complexity-spike` (both Warnings), not just the deterministic blockers.
+pub fn evaluate(req: CheckRequest, fail_on: Severity) -> Result<GateOutcome> {
     let result = check::run(req)?;
-    let passed = result.blocking == 0;
+    let failing = result
+        .findings
+        .iter()
+        .filter(|f| f.severity >= fail_on)
+        .count();
     let json = serde_json::to_string_pretty(&json!({
-        "passed": passed,
+        "passed": failing == 0,
+        "fail_on": fail_on.to_string(),
+        "failing": failing,
         "blocking": result.blocking,
         "total": result.findings.len(),
         "health": result.health_line,
         "policy_is_empty": result.policy_is_empty,
         "findings": result.findings,
     }))?;
-    Ok(GateOutcome {
-        json,
-        blocking: result.blocking,
-    })
+    Ok(GateOutcome { json, failing })
 }
 
 #[cfg(test)]
@@ -47,26 +55,45 @@ mod tests {
             .join(name)
     }
 
-    fn gate_all(name: &str) -> GateOutcome {
-        evaluate(CheckRequest {
-            repo: fixture(name),
-            all: true, // whole-repo, so the test doesn't depend on git diff
-            ..Default::default()
-        })
+    fn gate_all(name: &str, fail_on: Severity) -> GateOutcome {
+        evaluate(
+            CheckRequest {
+                repo: fixture(name),
+                all: true, // whole-repo, so the test doesn't depend on git diff
+                ..Default::default()
+            },
+            fail_on,
+        )
         .expect("gate")
     }
 
     #[test]
     fn slopped_repo_blocks() {
-        let out = gate_all("toy_repo_slopped");
-        assert!(out.blocking > 0, "{}", out.json);
+        let out = gate_all("toy_repo_slopped", Severity::Blocking);
+        assert!(out.failing > 0, "{}", out.json);
         assert!(out.json.contains("\"passed\": false"));
     }
 
     #[test]
     fn clean_repo_passes() {
-        let out = gate_all("toy_repo");
-        assert_eq!(out.blocking, 0, "{}", out.json);
+        let out = gate_all("toy_repo", Severity::Blocking);
+        assert_eq!(out.failing, 0, "{}", out.json);
         assert!(out.json.contains("\"passed\": true"));
+    }
+
+    #[test]
+    fn fail_on_warning_catches_non_blocking_slop() {
+        // The clean repo still passes at Blocking; the slopped repo, which has
+        // Warning-tier findings (duplicate/complexity/purity), fails once the
+        // threshold drops to Warning — this is what makes those rules drive
+        // the loop.
+        let blocking = gate_all("toy_repo_slopped", Severity::Blocking);
+        let warning = gate_all("toy_repo_slopped", Severity::Warning);
+        assert!(
+            warning.failing >= blocking.failing,
+            "warning threshold must catch at least as much"
+        );
+        assert!(warning.failing > 0);
+        assert!(warning.json.contains("\"fail_on\": \"WARNING\""));
     }
 }

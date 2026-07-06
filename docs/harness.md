@@ -147,14 +147,19 @@ the session edit zone that read compression measures graph distance against:
 ## 3. Gate
 
 `slop gate <repo>` is the validation gate for a CI step or an agent fix-loop.
-It runs the full check and **exits non-zero when any finding is Blocking**,
-printing machine-readable JSON (findings + `fix_guidance`) the driving agent
-loops on. slop reports; the agent edits.
+It runs the full check and **exits non-zero when any finding is at or above the
+`--fail-on` threshold** (default: Blocking), printing machine-readable JSON
+(findings + `fix_guidance`) the driving agent loops on. slop reports; the agent
+edits.
 
 ```
-slop gate <repo> [--base HEAD] [--all] [--tier3] [--reindex] [--worktree]
+slop gate <repo> [--base HEAD] [--all] [--tier3] [--fail-on blocking|warning|advisory] [--reindex] [--worktree]
 ```
 
+- `--fail-on warning` makes the gate fail on Warnings too — this is what lets
+  the loop act on `duplicate-exact`, `complexity-spike`, and `purity-lie`, not
+  just the deterministic blockers (`infra-bypass`, `circular-import`). The JSON
+  reports `fail_on`, `failing` (count at/above threshold), and `blocking`.
 - `--reindex` regenerates the SCIP index (via `scip-python`) before checking,
   so a re-run after edits sees the new graph.
 - `--worktree` runs inside an isolated `git worktree` of the repo.

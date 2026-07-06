@@ -26,6 +26,28 @@ enum HookEvent {
     UserPromptSubmit,
 }
 
+/// Severity threshold at which `slop gate` fails (exits non-zero).
+#[derive(Clone, Copy, ValueEnum)]
+enum FailOn {
+    /// Only deterministic blockers (infra-bypass, circular-import). Default.
+    Blocking,
+    /// ...also Warnings (duplicate-exact, complexity-spike, purity-lie).
+    Warning,
+    /// ...also Advisories (everything).
+    Advisory,
+}
+
+impl From<FailOn> for slop_analyze::findings::Severity {
+    fn from(f: FailOn) -> Self {
+        use slop_analyze::findings::Severity;
+        match f {
+            FailOn::Blocking => Severity::Blocking,
+            FailOn::Warning => Severity::Warning,
+            FailOn::Advisory => Severity::Advisory,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Analyze a repo. Default: judge only the working-tree diff (vs HEAD).
@@ -130,6 +152,10 @@ enum Command {
         /// Git ref to diff against (default: HEAD)
         #[arg(long, default_value = "HEAD")]
         base: String,
+        /// Severity at or above which the gate fails. Lower it to `warning` to
+        /// make the loop act on duplicate-exact / complexity-spike.
+        #[arg(long, value_enum, default_value_t = FailOn::Blocking)]
+        fail_on: FailOn,
         /// Regenerate the SCIP index (via scip-python) before checking
         #[arg(long)]
         reindex: bool,
@@ -433,6 +459,7 @@ fn main() -> Result<()> {
             all,
             tier3,
             base,
+            fail_on,
             reindex,
             worktree,
         } => {
@@ -458,14 +485,17 @@ fn main() -> Result<()> {
                 run_scip_index(&work_repo, index.as_deref())?;
             }
 
-            let outcome = gate::evaluate(CheckRequest {
-                repo: work_repo,
-                index,
-                policy: None,
-                all,
-                tier3,
-                base,
-            });
+            let outcome = gate::evaluate(
+                CheckRequest {
+                    repo: work_repo,
+                    index,
+                    policy: None,
+                    all,
+                    tier3,
+                    base,
+                },
+                fail_on.into(),
+            );
 
             if let Some(dir) = worktree_dir {
                 remove_worktree(&repo, &dir);
@@ -473,7 +503,7 @@ fn main() -> Result<()> {
 
             let outcome = outcome?;
             println!("{}", outcome.json);
-            if outcome.blocking > 0 {
+            if outcome.failing > 0 {
                 std::process::exit(1);
             }
         }
