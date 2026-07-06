@@ -1,10 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command as Process;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use slop_analyze::baseline::Baseline;
 use slop_analyze::check::{self, CheckRequest};
-use slop_analyze::{detect, harness, infer, policy::Policy, suppress};
+use slop_analyze::{detect, gate, harness, infer, policy::Policy, suppress};
 use slop_resolve::{Resolver, ScipResolver};
 
 #[derive(Parser)]
@@ -44,6 +45,30 @@ enum Command {
         /// Git ref to diff against (default: HEAD)
         #[arg(long, default_value = "HEAD")]
         base: String,
+    },
+    /// Validation gate (M5): run the check and exit non-zero if anything
+    /// blocks, printing a JSON verdict a CI step or agent fix-loop consumes.
+    Gate {
+        /// Repo root
+        repo: PathBuf,
+        /// Path to index.scip (default: <repo>/index.scip)
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Judge the whole repo instead of the diff
+        #[arg(long)]
+        all: bool,
+        /// Also run advisory Tier-3 semantic-redundancy judging
+        #[arg(long)]
+        tier3: bool,
+        /// Git ref to diff against (default: HEAD)
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        /// Regenerate the SCIP index (via scip-python) before checking
+        #[arg(long)]
+        reindex: bool,
+        /// Run inside an isolated `git worktree` of the repo
+        #[arg(long)]
+        worktree: bool,
     },
     /// Agent-host hook (M4d). Reads the hook JSON on stdin, writes the
     /// response on stdout. Register in .claude/settings.json (see docs/harness.md).
@@ -146,6 +171,56 @@ fn main() -> Result<()> {
             );
             println!("{}", result.health_line);
             if result.blocking > 0 {
+                std::process::exit(1);
+            }
+        }
+        Command::Gate {
+            repo,
+            index,
+            all,
+            tier3,
+            base,
+            reindex,
+            worktree,
+        } => {
+            // Optionally run against an isolated worktree of the repo so an
+            // agent's in-flight edits are evaluated without touching the tree.
+            let worktree_dir = if worktree {
+                Some(add_worktree(&repo)?)
+            } else {
+                None
+            };
+            let work_repo = worktree_dir.clone().unwrap_or_else(|| repo.clone());
+            let index = index.map(|i| {
+                if worktree {
+                    // A caller-supplied index refers to the original tree;
+                    // resolve it relative to the worktree copy instead.
+                    work_repo.join(i.file_name().unwrap_or_else(|| i.as_os_str()))
+                } else {
+                    i
+                }
+            });
+
+            if reindex {
+                run_scip_index(&work_repo, index.as_deref())?;
+            }
+
+            let outcome = gate::evaluate(CheckRequest {
+                repo: work_repo,
+                index,
+                policy: None,
+                all,
+                tier3,
+                base,
+            });
+
+            if let Some(dir) = worktree_dir {
+                remove_worktree(&repo, &dir);
+            }
+
+            let outcome = outcome?;
+            println!("{}", outcome.json);
+            if outcome.blocking > 0 {
                 std::process::exit(1);
             }
         }
@@ -253,4 +328,57 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Regenerate the SCIP index for `repo` via `scip-python`, writing to
+/// `index` (default `<repo>/index.scip`). Used by `slop gate --reindex` so a
+/// re-run after edits sees the new graph.
+fn run_scip_index(repo: &Path, index: Option<&Path>) -> Result<()> {
+    let out = index
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| repo.join("index.scip"));
+    let status = Process::new("npx")
+        .args(["--yes", "@sourcegraph/scip-python", "index"])
+        .arg(repo)
+        .args(["--project-name", "slop-gate", "--output"])
+        .arg(&out)
+        .status()
+        .context("running scip-python (is npx on PATH?)")?;
+    if !status.success() {
+        bail!("scip-python indexing failed for {}", repo.display());
+    }
+    Ok(())
+}
+
+/// Create a detached `git worktree` of `repo` in a temp dir and return its
+/// path. The gate evaluates this isolated copy.
+fn add_worktree(repo: &Path) -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("slop-gate-{}", std::process::id()));
+    let status = Process::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "add", "--detach"])
+        .arg(&dir)
+        .status()
+        .context("running git worktree add")?;
+    if !status.success() {
+        bail!("git worktree add failed for {}", repo.display());
+    }
+    Ok(dir)
+}
+
+/// Best-effort teardown of a gate worktree. Failures are reported but don't
+/// override the gate's own verdict/exit code.
+fn remove_worktree(repo: &Path, dir: &Path) {
+    let ok = Process::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "remove", "--force"])
+        .arg(dir)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("warning: could not remove worktree {}", dir.display());
+    }
 }
