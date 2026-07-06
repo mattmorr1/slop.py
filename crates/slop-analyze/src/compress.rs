@@ -13,6 +13,51 @@ use crate::envelope::proximity_distances;
 use crate::skeleton::{skeleton_for, strip_noise};
 use crate::source::{entity_for, location_index, FileFacts};
 
+/// The leading-whitespace prefix of `line` (spaces or tabs), verbatim.
+fn indent_prefix(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
+}
+
+/// Prefix every non-empty line of `block` with `pad`, so a skeleton (emitted
+/// at column 0) sits at the same column as the code it replaces. Preserves the
+/// trailing newline.
+fn indent_block(block: &str, pad: &str) -> String {
+    if pad.is_empty() {
+        return block.to_string();
+    }
+    let mut out: String = block
+        .lines()
+        .map(|l| {
+            if l.is_empty() {
+                "\n".to_string()
+            } else {
+                format!("{pad}{l}\n")
+            }
+        })
+        .collect();
+    if !block.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Drop up to `pad.len()` leading whitespace chars from each line, normalizing
+/// a signature (whose first line starts at column 0 but whose continuation
+/// lines carry absolute indentation) back to column 0 so `indent_block` can
+/// re-apply one consistent indent. Without this, a decorated/multi-line method
+/// signature double-indents and the compressed view stops parsing.
+fn dedent(text: &str, pad: &str) -> String {
+    if pad.is_empty() {
+        return text.to_string();
+    }
+    text.lines()
+        .map(|l| {
+            let strip = l.chars().take(pad.len()).take_while(|c| c.is_whitespace()).count();
+            format!("{}\n", &l[strip..])
+        })
+        .collect()
+}
+
 pub struct CompressConfig {
     /// Graph hops from the edit zone that stay full-fidelity.
     pub edit_zone_hops: usize,
@@ -98,7 +143,13 @@ pub fn compress_file(
             if in_zone {
                 continue;
             }
-            let mut sk = skeleton_for(entity, Some(&fact.signature));
+            // The function's own indentation (its `def`/decorator column).
+            let start = fact.start_line as usize;
+            let pad = lines.get(start).map(|l| indent_prefix(l)).unwrap_or("");
+            // Normalize the signature to column 0 (its continuation lines carry
+            // absolute indent), skeletonize, then re-indent uniformly.
+            let sig = dedent(&fact.signature, pad);
+            let mut sk = skeleton_for(entity, Some(&sig));
             if sk.is_empty() {
                 continue;
             }
@@ -108,7 +159,7 @@ pub fn compress_file(
                     sk = format!("# summary: {summary}\n{sk}");
                 }
             }
-            regions.push((fact.start_line as usize, fact.end_line as usize, sk));
+            regions.push((start, fact.end_line as usize, indent_block(&sk, pad)));
         }
     }
 
@@ -174,6 +225,23 @@ mod tests {
     }
 
     #[test]
+    fn dedent_then_indent_roundtrips_a_method_signature() {
+        // A method's signature: first line at col 0 (slice start), the def line
+        // carrying absolute indent. Normalizing then re-indenting must restore
+        // consistent 4-space indentation, not double it.
+        let sig = "@deco\n    def m(self,\n            x):";
+        let norm = dedent(sig, "    ");
+        assert_eq!(norm, "@deco\ndef m(self,\n        x):\n");
+        let back = indent_block(&norm, "    ");
+        assert_eq!(back, "    @deco\n    def m(self,\n            x):\n");
+    }
+
+    #[test]
+    fn indent_block_leaves_blank_lines_empty() {
+        assert_eq!(indent_block("a\n\nb\n", "  "), "  a\n\n  b\n");
+    }
+
+    #[test]
     fn empty_edit_zone_falls_back_to_strip_noise() {
         let (built, facts, root) = analysis("toy_repo_slopped");
         let file = "utils/cleaning.py";
@@ -226,6 +294,54 @@ mod tests {
         assert!(
             stats.compressed_chars <= stats.original_chars,
             "compression should not grow the file"
+        );
+    }
+
+    #[test]
+    fn skeletonized_methods_keep_class_indentation() {
+        // A method skeletonized inside a class must stay indented, or the
+        // compressed view is invalid Python. Regression for the col-0 bug.
+        let (built, facts, root) = analysis("toy_repo_slopped");
+        // Find a file that has an indented (method-level) function.
+        let candidate = facts.iter().find_map(|ff| {
+            let src = std::fs::read_to_string(root.join(&ff.file)).ok()?;
+            let lines: Vec<&str> = src.lines().collect();
+            let has_method = ff.functions.iter().any(|f| {
+                lines
+                    .get(f.start_line as usize)
+                    .is_some_and(|l| l.starts_with(' ') || l.starts_with('\t'))
+            });
+            has_method.then_some((ff.file.clone(), src))
+        });
+        let Some((file, src)) = candidate else {
+            return; // fixture has no methods; nothing to assert
+        };
+
+        // Edit locus far away so the methods skeletonize.
+        let locus = built
+            .graph
+            .entities()
+            .find(|(_, e)| e.file != file && e.entity_type == slop_graph::NodeType::Function)
+            .map(|(_, e)| e.id.clone());
+        let Some(locus) = locus else { return };
+
+        let (out, stats) = compress_file(
+            &built,
+            &facts,
+            &src,
+            &file,
+            &[locus],
+            &CompressConfig { edit_zone_hops: 0, min_lines: 0 },
+            None,
+        );
+        if stats.skeletonized == 0 {
+            return;
+        }
+        // The real integrity check: the compressed view must still parse as
+        // Python (a col-0 method skeleton would break the class body).
+        assert!(
+            slop_parse::analyze_file(&out).is_ok(),
+            "compressed view must be parseable Python:\n{out}"
         );
     }
 
