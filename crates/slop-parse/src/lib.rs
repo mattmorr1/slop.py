@@ -23,8 +23,21 @@ pub struct FunctionFacts {
     /// Raw source from the `def` (or leading decorator) through the `:` —
     /// the type-annotated header used verbatim in skeletons.
     pub signature: String,
-    /// Token-based cyclomatic complexity: 1 + branch keywords.
+    /// Token-based cyclomatic complexity: 1 + branch keywords (includes the
+    /// `and`/`or` boolean operators McCabe counts).
     pub complexity: u32,
+    /// Structural control-flow decision points only — `if`/`elif`/`for`/
+    /// `while`/`except`/`case`, *excluding* boolean operators. This is the
+    /// "how many independent branches" signal, uninflated by a single fat
+    /// boolean guard (which drives most of the low-end complexity noise).
+    pub branch_points: u32,
+    /// Deepest nesting of branching constructs in the body (function body
+    /// statements are depth 1). The "how tangled" signal an agent refactor
+    /// actually keys off.
+    pub max_nesting_depth: u32,
+    /// 0-based line of the statement that first reaches `max_nesting_depth` —
+    /// the concrete locus fix guidance points at. 0 when nothing nests.
+    pub deepest_line: u32,
     /// Blake3, hex. Empty when the body is below the significance floor.
     pub body_hash: String,
     pub structural_hash: String,
@@ -154,6 +167,87 @@ fn body_range(func: &ast::StmtFunctionDef) -> TextRange {
     }
 }
 
+/// Structural control-flow shape of a function body, computed from the AST
+/// (not tokens) so nesting is exact. Decision points and nesting are counted
+/// only for genuine branching constructs — `if`/`elif`/`for`/`while`/`except`/
+/// `case` — while `with`/`try`-body wrappers pass depth through unchanged
+/// (they nest visually but branch nothing). Nested `def`/`class` are their own
+/// scope and are not descended into.
+#[derive(Default)]
+struct ControlFlow {
+    branch_points: u32,
+    max_depth: u32,
+    deepest_line: u32,
+}
+
+impl ControlFlow {
+    /// Record that a branching statement sits at `depth`; remember the line of
+    /// the first statement to reach a new maximum.
+    fn reached(&mut self, depth: u32, line: u32) {
+        if depth > self.max_depth {
+            self.max_depth = depth;
+            self.deepest_line = line;
+        }
+    }
+}
+
+fn control_flow(stmts: &[Stmt], depth: u32, lines: &LineIndex, cf: &mut ControlFlow) {
+    for stmt in stmts {
+        let line = |s: &dyn Ranged| lines.line(s.range().start());
+        match stmt {
+            Stmt::If(s) => {
+                cf.branch_points += 1;
+                cf.reached(depth, line(s));
+                control_flow(&s.body, depth + 1, lines, cf);
+                for clause in &s.elif_else_clauses {
+                    // `elif` is a decision point; a bare `else` is not.
+                    if clause.test.is_some() {
+                        cf.branch_points += 1;
+                    }
+                    control_flow(&clause.body, depth + 1, lines, cf);
+                }
+            }
+            Stmt::For(s) => {
+                cf.branch_points += 1;
+                cf.reached(depth, line(s));
+                control_flow(&s.body, depth + 1, lines, cf);
+                control_flow(&s.orelse, depth + 1, lines, cf);
+            }
+            Stmt::While(s) => {
+                cf.branch_points += 1;
+                cf.reached(depth, line(s));
+                control_flow(&s.body, depth + 1, lines, cf);
+                control_flow(&s.orelse, depth + 1, lines, cf);
+            }
+            Stmt::Match(s) => {
+                cf.reached(depth, line(s));
+                for case in &s.cases {
+                    cf.branch_points += 1;
+                    control_flow(&case.body, depth + 1, lines, cf);
+                }
+            }
+            Stmt::Try(s) => {
+                // The wrapper doesn't branch; each `except` does.
+                control_flow(&s.body, depth, lines, cf);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    cf.branch_points += 1;
+                    cf.reached(depth, lines.line(h.range().start()));
+                    control_flow(&h.body, depth + 1, lines, cf);
+                }
+                control_flow(&s.orelse, depth, lines, cf);
+                control_flow(&s.finalbody, depth, lines, cf);
+            }
+            // `with` nests visually but introduces no branch — pass through.
+            Stmt::With(s) => control_flow(&s.body, depth, lines, cf),
+            // Nested defs/classes are separate scopes; their complexity is
+            // attributed to them, not the enclosing function.
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+            _ => {}
+        }
+    }
+}
+
 const MIN_SIGNIFICANT_TOKENS: u32 = 20;
 
 fn function_facts(
@@ -234,6 +328,9 @@ fn function_facts(
         .trim_end()
         .to_string();
 
+    let mut cf = ControlFlow::default();
+    control_flow(&func.body, 1, lines, &mut cf);
+
     FunctionFacts {
         name: func.name.to_string(),
         name_line: lines.line(func.name.range().start()),
@@ -241,6 +338,9 @@ fn function_facts(
         end_line: lines.line(full.end()),
         signature,
         complexity,
+        branch_points: cf.branch_points,
+        max_nesting_depth: cf.max_depth,
+        deepest_line: cf.deepest_line,
         body_hash,
         structural_hash,
         significant_tokens: significant,
@@ -348,6 +448,29 @@ def branchy(x):
         let facts = analyze_file(src).unwrap();
         // 1 + if + and + for + if + elif + or + while = 8
         assert_eq!(facts[0].complexity, 8);
+    }
+
+    #[test]
+    fn control_flow_shape_separates_nesting_from_boolean_density() {
+        // A single fat boolean guard: high cyclomatic, but flat and few
+        // branch points — the noise class we no longer want to flag hard.
+        let flat = analyze_file(
+            "def guard(a, b, c, d):\n    if a and b and c and d and a or b:\n        return 1\n    return 0\n",
+        )
+        .unwrap();
+        assert!(flat[0].complexity >= 6, "boolean ops inflate cyclomatic");
+        assert_eq!(flat[0].branch_points, 1, "one structural decision point");
+        assert_eq!(flat[0].max_nesting_depth, 1);
+
+        // Genuinely tangled: three levels of nested branching.
+        let tangled = analyze_file(
+            "def deep(xs):\n    for x in xs:\n        if x:\n            while x:\n                x -= 1\n    return xs\n",
+        )
+        .unwrap();
+        assert_eq!(tangled[0].branch_points, 3); // for + if + while
+        assert_eq!(tangled[0].max_nesting_depth, 3);
+        // deepest_line points at the `while` (0-based line 3).
+        assert_eq!(tangled[0].deepest_line, 3);
     }
 
     #[test]

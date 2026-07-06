@@ -158,12 +158,17 @@ fn tier2_flags_structural_twin_only() {
 }
 
 #[test]
-fn complexity_spike_fires_on_branchy_router() {
+fn complexity_spike_fires_on_deeply_nested_router() {
     let (_, findings) = analyze("toy_repo_slopped", true);
     assert_eq!(
         entities_for(&findings, "complexity-spike"),
         vec!["services.routing::route_event"]
     );
+    // The recalibrated detector reports the real tangle shape and anchors
+    // guidance on the deepest block's line, not a generic "split branches".
+    let f = findings.iter().find(|f| f.rule == "complexity-spike").unwrap();
+    assert!(f.message.contains("nested 5 deep"), "{}", f.message);
+    assert!(f.fix_guidance.contains("deepest block"), "{}", f.fix_guidance);
 }
 
 #[test]

@@ -300,7 +300,15 @@ pub fn purity_lie(built: &BuiltGraph) -> Vec<Finding> {
     findings
 }
 
+// Cyclomatic complexity (McCabe, incl. boolean operators) is the entry gate,
+// but on its own it flags a wall of barely-over-threshold functions whose
+// score comes from one fat boolean guard, not real tangle (368 Warnings on
+// vigil, median 15). An agent can't drive a useful refactor from those. So a
+// spike must *also* show genuine structure: deep nesting or many independent
+// control-flow branches. This keeps the flagged set the ones worth splitting.
 const COMPLEXITY_THRESHOLD: u32 = 10;
+const NESTING_THRESHOLD: u32 = 4;
+const BRANCH_THRESHOLD: u32 = 12;
 
 /// Entity label for a parsed function: the graph node's ID when the join
 /// succeeds, a file-derived fallback otherwise.
@@ -442,7 +450,12 @@ pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) 
             let entity_label = label(built, &index, &ff.file, fact);
             let lines = (fact.start_line as usize, fact.end_line as usize);
 
-            if fact.complexity > COMPLEXITY_THRESHOLD {
+            let tangled = fact.max_nesting_depth >= NESTING_THRESHOLD
+                || fact.branch_points >= BRANCH_THRESHOLD;
+            if fact.complexity > COMPLEXITY_THRESHOLD && tangled {
+                // Anchor guidance on the concrete locus: the deepest-nested
+                // block (1-based) is what to lift out first.
+                let deep_line = fact.deepest_line as usize + 1;
                 findings.push(Finding {
                     rule: "complexity-spike",
                     severity: Severity::Warning,
@@ -450,10 +463,20 @@ pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) 
                     file: ff.file.clone(),
                     lines,
                     message: format!(
-                        "`{}` has cyclomatic complexity {} (threshold {COMPLEXITY_THRESHOLD})",
-                        fact.name, fact.complexity
+                        "`{}` is tangled: {} control-flow branches nested {} deep (cyclomatic {})",
+                        fact.name, fact.branch_points, fact.max_nesting_depth, fact.complexity
                     ),
-                    fix_guidance: "Split conditional branches into smaller functions".into(),
+                    fix_guidance: if fact.max_nesting_depth >= NESTING_THRESHOLD {
+                        format!(
+                            "Extract the deepest block (around line {deep_line}, nested {} deep) into a named helper, or flatten it with early-return guard clauses",
+                            fact.max_nesting_depth
+                        )
+                    } else {
+                        format!(
+                            "Split the {} branches into smaller functions — group the ones that share a purpose behind one call",
+                            fact.branch_points
+                        )
+                    },
                 });
             }
 

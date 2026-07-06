@@ -11,7 +11,9 @@ def route_event(event: dict) -> str:
     elif kind == "metric":
         for tag in event.get("tags", []):
             if tag == "slow":
-                return "perf"
+                for sample in event.get("samples", []):
+                    if sample > event.get("threshold", 0):
+                        return "perf"
         while event.get("retry", 0) > 0:
             event["retry"] -= 1
         return "metrics"
