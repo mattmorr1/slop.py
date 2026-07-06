@@ -179,6 +179,52 @@ pub fn candidates(
         .collect()
 }
 
+/// Confirmation candidates for Tier-2's `duplicate-structural` groups: is a
+/// shape match a real duplicate worth unifying, or a coincidental one (a
+/// thin REST wrapper repeated per resource, say)? That's a semantic call
+/// Tier-2 can't make on tokens alone (see `detect::shape_groups`), so each
+/// group's canonical member is paired with its first peer and handed to the
+/// same judge used for effect-bucket candidates above. `check::tier3_findings`
+/// uses the verdict to confirm or demote the matching `duplicate-structural`
+/// finding rather than to mint a new one.
+pub fn structural_candidates(
+    built: &BuiltGraph,
+    facts: &[FileFacts],
+    repo_root: &Path,
+) -> Vec<CandidatePair> {
+    let groups = crate::detect::structural_duplicate_groups(built, facts);
+
+    let to_fn = |d: &crate::detect::DupEntity| -> CandidateFn {
+        let snippet = std::fs::read_to_string(repo_root.join(&d.file))
+            .ok()
+            .map(|text| {
+                text.lines()
+                    .skip(d.lines.0)
+                    .take((d.lines.1 - d.lines.0 + 1).min(MAX_SNIPPET_LINES))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        CandidateFn {
+            entity: d.entity.clone(),
+            file: d.file.clone(),
+            lines: d.lines,
+            name: d.entity.rsplit("::").next().unwrap_or(&d.entity).to_string(),
+            docstring: d.docstring.clone(),
+            snippet,
+        }
+    };
+
+    groups
+        .iter()
+        .take(MAX_PAIRS)
+        .filter_map(|g| {
+            let peer = g.peers.first()?;
+            Some(CandidatePair { a: to_fn(&g.canonical), b: to_fn(peer), score: 1.0 })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

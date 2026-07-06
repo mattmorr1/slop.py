@@ -288,22 +288,127 @@ fn label(
         .unwrap_or_else(|| format!("{}::{}", file.trim_end_matches(".py").replace('/', "."), fact.name))
 }
 
+struct Member {
+    label: String,
+    file: String,
+    lines: (usize, usize),
+    body_hash: String,
+    structural_hash: String,
+    docstring: Option<String>,
+}
+
+fn collect_members(built: &BuiltGraph, facts: &[crate::source::FileFacts]) -> Vec<Member> {
+    let index = crate::source::location_index(built);
+    let mut members = Vec::new();
+    for ff in facts {
+        for fact in &ff.functions {
+            if fact.body_hash.is_empty() {
+                continue;
+            }
+            let entity = crate::source::entity_for(built, &index, &ff.file, fact);
+            members.push(Member {
+                label: entity.map(|e| e.id.clone()).unwrap_or_else(|| {
+                    format!("{}::{}", ff.file.trim_end_matches(".py").replace('/', "."), fact.name)
+                }),
+                file: ff.file.clone(),
+                lines: (fact.start_line as usize, fact.end_line as usize),
+                body_hash: fact.body_hash.clone(),
+                structural_hash: fact.structural_hash.clone(),
+                docstring: entity.and_then(|e| e.docstring.clone()),
+            });
+        }
+    }
+    members
+}
+
+// One finding per group, not one per member — a group of N duplicates
+// triple-reports (or worse) the same fact if every member gets its own
+// finding. Pick a stable representative (earliest in the file) and list
+// the rest as peers, same principle as infra_bypass's per-entity
+// aggregation above.
+fn canonical(members: &[Member], group: &[usize]) -> usize {
+    *group
+        .iter()
+        .min_by(|&&a, &&b| {
+            (members[a].file.as_str(), members[a].lines.0)
+                .cmp(&(members[b].file.as_str(), members[b].lines.0))
+        })
+        .expect("group is non-empty")
+}
+
+/// One member of a duplication group, identified for Tier-3 confirmation
+/// (`check::tier3_findings`) as well as finding output.
+pub struct DupEntity {
+    pub entity: String,
+    pub file: String,
+    pub lines: (usize, usize),
+    pub docstring: Option<String>,
+}
+
+pub struct StructuralGroup {
+    pub canonical: DupEntity,
+    pub peers: Vec<DupEntity>,
+}
+
+fn dup_entity(m: &Member) -> DupEntity {
+    DupEntity {
+        entity: m.label.clone(),
+        file: m.file.clone(),
+        lines: m.lines,
+        docstring: m.docstring.clone(),
+    }
+}
+
+fn shape_groups(members: &[Member]) -> Vec<StructuralGroup> {
+    use std::collections::HashMap;
+    let mut by_shape: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, m) in members.iter().enumerate() {
+        by_shape.entry(m.structural_hash.as_str()).or_default().push(i);
+    }
+    let mut groups = Vec::new();
+    for group in by_shape.values().filter(|g| g.len() > 1) {
+        let distinct_bodies: std::collections::HashSet<&str> =
+            group.iter().map(|&i| members[i].body_hash.as_str()).collect();
+        if distinct_bodies.len() < 2 {
+            continue; // fully covered by Tier-1
+        }
+        let rep = canonical(members, group);
+        let peers: Vec<DupEntity> = group
+            .iter()
+            .filter(|&&j| j != rep && members[j].body_hash != members[rep].body_hash)
+            .map(|&j| dup_entity(&members[j]))
+            .collect();
+        if peers.is_empty() {
+            continue;
+        }
+        groups.push(StructuralGroup { canonical: dup_entity(&members[rep]), peers });
+    }
+    // HashMap iteration order is random per process; sort by canonical
+    // location so output order — and which groups survive the judge-pair
+    // cap in `tier3::structural_candidates` — is deterministic (D4).
+    groups.sort_by(|a, b| {
+        (a.canonical.file.as_str(), a.canonical.lines.0)
+            .cmp(&(b.canonical.file.as_str(), b.canonical.lines.0))
+    });
+    groups
+}
+
+/// Tier-2 shape-duplicate groups (same control flow, different names and
+/// literals), independent of finding output — `check::tier3_findings` uses
+/// this to ask the LLM judge whether each group is a real duplicate worth
+/// unifying or a coincidental shape match (see the comment on
+/// `duplicate-structural` below for why that call can't be made on tokens
+/// alone).
+pub fn structural_duplicate_groups(built: &BuiltGraph, facts: &[crate::source::FileFacts]) -> Vec<StructuralGroup> {
+    shape_groups(&collect_members(built, facts))
+}
+
 /// Tier-1 (exact) and Tier-2 (structural) duplication, complexity spikes,
 /// and over-commenting — the parser-backed deterministic detectors.
 pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) -> Vec<Finding> {
     use std::collections::HashMap;
     let index = crate::source::location_index(built);
     let mut findings = Vec::new();
-
-    struct Member {
-        label: String,
-        file: String,
-        lines: (usize, usize),
-        body_hash: String,
-    }
-    let mut by_body: HashMap<&str, Vec<usize>> = HashMap::new();
-    let mut by_shape: HashMap<&str, Vec<usize>> = HashMap::new();
-    let mut members: Vec<Member> = Vec::new();
 
     for ff in facts {
         for fact in &ff.functions {
@@ -341,93 +446,69 @@ pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) 
                             .into(),
                 });
             }
-
-            if !fact.body_hash.is_empty() {
-                members.push(Member {
-                    label: entity_label,
-                    file: ff.file.clone(),
-                    lines,
-                    body_hash: fact.body_hash.clone(),
-                });
-            }
         }
     }
 
-    // Hashable members are pushed in facts order, so this walk stays
-    // aligned with `members` by construction (both gated on body_hash).
-    let structural: Vec<&str> = facts
-        .iter()
-        .flat_map(|ff| ff.functions.iter())
-        .filter(|f| !f.body_hash.is_empty())
-        .map(|f| f.structural_hash.as_str())
-        .collect();
+    let members = collect_members(built, facts);
+
+    // Tier-1: identical bodies. One finding per exact-duplicate set.
+    let mut by_body: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, m) in members.iter().enumerate() {
         by_body.entry(m.body_hash.as_str()).or_default().push(i);
-        by_shape.entry(structural[i]).or_default().push(i);
     }
-
-    // Tier-1: identical bodies.
     for group in by_body.values().filter(|g| g.len() > 1) {
-        for &i in group {
-            let others: Vec<&str> = group
-                .iter()
-                .filter(|&&j| j != i)
-                .map(|&j| members[j].label.as_str())
-                .collect();
-            findings.push(Finding {
-                rule: "duplicate-exact",
-                severity: Severity::Warning,
-                entity: members[i].label.clone(),
-                file: members[i].file.clone(),
-                lines: members[i].lines,
-                message: format!(
-                    "`{}` has a body identical to `{}` (modulo comments/whitespace)",
-                    members[i].label,
-                    others.join("`, `")
-                ),
-                fix_guidance: format!("Keep one implementation and delete or delegate the rest: `{}`", others.join("`, `")),
-            });
-        }
+        let rep = canonical(&members, group);
+        let others: Vec<&str> = group
+            .iter()
+            .filter(|&&j| j != rep)
+            .map(|&j| members[j].label.as_str())
+            .collect();
+        findings.push(Finding {
+            rule: "duplicate-exact",
+            severity: Severity::Warning,
+            entity: members[rep].label.clone(),
+            file: members[rep].file.clone(),
+            lines: members[rep].lines,
+            message: format!(
+                "`{}` has a body identical to `{}` (modulo comments/whitespace)",
+                members[rep].label,
+                others.join("`, `")
+            ),
+            fix_guidance: format!("Keep one implementation and delete or delegate the rest: `{}`", others.join("`, `")),
+        });
     }
 
-    // Tier-2: same structure, different tokens — only for members whose
-    // exact body is NOT already in a Tier-1 group with the peer.
-    for group in by_shape.values().filter(|g| g.len() > 1) {
-        let distinct_bodies: std::collections::HashSet<&str> = group
-            .iter()
-            .map(|&i| members[i].body_hash.as_str())
-            .collect();
-        if distinct_bodies.len() < 2 {
-            continue; // fully covered by Tier-1
-        }
-        for &i in group {
-            // Report only members that are structurally-but-not-exactly
-            // duplicated against at least one peer.
-            let peers: Vec<&str> = group
-                .iter()
-                .filter(|&&j| j != i && members[j].body_hash != members[i].body_hash)
-                .map(|&j| members[j].label.as_str())
-                .collect();
-            if peers.is_empty() {
-                continue;
-            }
-            findings.push(Finding {
-                rule: "duplicate-structural",
-                severity: Severity::Warning,
-                entity: members[i].label.clone(),
-                file: members[i].file.clone(),
-                lines: members[i].lines,
-                message: format!(
-                    "`{}` is structurally identical to `{}` (same shape, renamed variables/literals)",
-                    members[i].label,
-                    peers.join("`, `")
-                ),
-                fix_guidance: format!(
-                    "Unify with `{}` behind one parameterized implementation",
-                    peers.join("`, `")
-                ),
-            });
-        }
+    // Tier-2: same structure, different tokens. One finding per group (see
+    // comment above `canonical`).
+    //
+    // Whether a shape match is worth unifying is a semantic question this
+    // detector can't answer on tokens alone (see slop-check dogfooding on
+    // vigil: `get_case`/`get_finding`-style thin REST wrappers converge on
+    // identical control flow by construction, not because anyone
+    // copy-pasted logic worth extracting — while a renamed-copy-paste like
+    // this crate's own `clean_rows`/`scale_rows` toy fixture is exactly the
+    // real duplicate this tier exists to catch, even though it *also*
+    // renames every local variable). Confidence lives in Tier-3's LLM
+    // judge, wired in by `check::tier3_findings`, which corroborates or
+    // demotes these when `--tier3` is on.
+    for group in shape_groups(&members) {
+        let peer_labels: Vec<&str> = group.peers.iter().map(|p| p.entity.as_str()).collect();
+        findings.push(Finding {
+            rule: "duplicate-structural",
+            severity: Severity::Warning,
+            entity: group.canonical.entity.clone(),
+            file: group.canonical.file.clone(),
+            lines: group.canonical.lines,
+            message: format!(
+                "`{}` is structurally identical to `{}` (same shape, renamed variables/literals)",
+                group.canonical.entity,
+                peer_labels.join("`, `")
+            ),
+            fix_guidance: format!(
+                "Unify with `{}` behind one parameterized implementation",
+                peer_labels.join("`, `")
+            ),
+        });
     }
 
     findings

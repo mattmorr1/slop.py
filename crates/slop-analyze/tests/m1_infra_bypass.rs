@@ -132,22 +132,29 @@ fn tier3_buckets_produce_the_planted_semantic_pair() {
 #[test]
 fn tier1_duplicate_pairs_exact_bodies() {
     let (_, findings) = analyze("toy_repo_slopped", true);
+    // One finding per exact-duplicate set, not one per member — the
+    // representative is whichever comes first in the file, with the peer
+    // named in the message/fix guidance instead of getting its own finding.
     assert_eq!(
         entities_for(&findings, "duplicate-exact"),
-        vec![
-            "utils.cleaning::clean_rows",
-            "utils.cleaning::normalize_rows"
-        ]
+        vec!["utils.cleaning::clean_rows"]
     );
+    let f = findings.iter().find(|f| f.rule == "duplicate-exact").unwrap();
+    assert!(f.message.contains("utils.cleaning::normalize_rows"), "{}", f.message);
 }
 
 #[test]
 fn tier2_flags_structural_twin_only() {
     let (_, findings) = analyze("toy_repo_slopped", true);
-    // scale_rows shares shape with clean/normalize but not bytes; the
-    // exact-dup pair reports against scale_rows symmetrically.
-    let entities = entities_for(&findings, "duplicate-structural");
-    assert!(entities.contains(&"utils.cleaning::scale_rows"), "{entities:?}");
+    // scale_rows shares shape with clean/normalize but not bytes. One
+    // finding for the group, naming scale_rows as the structural peer
+    // (normalize_rows is already covered by the Tier-1 finding above).
+    assert_eq!(
+        entities_for(&findings, "duplicate-structural"),
+        vec!["utils.cleaning::clean_rows"]
+    );
+    let f = findings.iter().find(|f| f.rule == "duplicate-structural").unwrap();
+    assert!(f.message.contains("utils.cleaning::scale_rows"), "{}", f.message);
 }
 
 #[test]
