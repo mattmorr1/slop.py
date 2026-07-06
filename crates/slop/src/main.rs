@@ -153,6 +153,20 @@ enum Command {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Generate (or regenerate) the SCIP index slop reads, via scip-python.
+    /// Wraps the `npx @sourcegraph/scip-python` invocation and verifies the
+    /// result actually has definitions — scip-python can crash mid-walk and
+    /// still write a near-empty index that makes every check silently pass.
+    Index {
+        /// Repo root to index
+        repo: PathBuf,
+        /// Output path (default: <repo>/index.scip)
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// scip-python project name (default: the repo directory name)
+        #[arg(long)]
+        project_name: Option<String>,
+    },
     /// Wire slop's harness into a repo's agent-host config: merge the MCP
     /// server into `<repo>/.mcp.json` and the read/prompt hooks into
     /// `<repo>/.claude/settings.json`, pointing at this binary. Idempotent —
@@ -481,6 +495,36 @@ fn main() -> Result<()> {
         Command::Mcp { repo, index } => {
             slop_mcp::serve_stdio(repo, index)?;
         }
+        Command::Index {
+            repo,
+            output,
+            project_name,
+        } => {
+            let out = output.unwrap_or_else(|| repo.join("index.scip"));
+            let project = project_name.unwrap_or_else(|| {
+                repo.file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "repo".to_string())
+            });
+            run_scip_index_named(&repo, &out, &project)?;
+            // Verify it's usable, not just present (scip-python can exit 0 with
+            // a broken, definition-less index).
+            let resolver = ScipResolver::load(&out)?;
+            let defs = resolver.definition_count();
+            if defs == 0 {
+                bail!(
+                    "indexed {} but the result has no definitions — scip-python likely failed. Check its output above.",
+                    repo.display()
+                );
+            }
+            println!(
+                "indexed {} -> {} ({} definitions across {} file(s))",
+                repo.display(),
+                out.display(),
+                defs,
+                resolver.files().len()
+            );
+        }
         Command::Install { repo, force } => {
             install_harness(&repo, force)?;
         }
@@ -651,11 +695,16 @@ fn run_scip_index(repo: &Path, index: Option<&Path>) -> Result<()> {
     let out = index
         .map(Path::to_path_buf)
         .unwrap_or_else(|| repo.join("index.scip"));
+    run_scip_index_named(repo, &out, "slop-gate")
+}
+
+/// Run `scip-python index` for `repo`, writing to `out` under `project`.
+fn run_scip_index_named(repo: &Path, out: &Path, project: &str) -> Result<()> {
     let status = Process::new("npx")
         .args(["--yes", "@sourcegraph/scip-python", "index"])
         .arg(repo)
-        .args(["--project-name", "slop-gate", "--output"])
-        .arg(&out)
+        .args(["--project-name", project, "--output"])
+        .arg(out)
         .status()
         .context("running scip-python (is npx on PATH?)")?;
     if !status.success() {

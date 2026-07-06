@@ -193,6 +193,17 @@ pub fn load_analysis(repo: &Path, index: Option<&Path>) -> Result<Analysis> {
         );
     }
     let resolver = ScipResolver::load(&index_path)?;
+    // A syntactically valid but *empty* index (scip-python can crash mid-walk
+    // and still write a near-empty file — see the 61-byte artifacts) makes
+    // every check silently pass. Fail loudly instead: no definitions means the
+    // index is broken, not that the repo is clean.
+    if resolver.definition_count() == 0 {
+        bail!(
+            "SCIP index at {} has no definitions — it's empty or the indexer failed. Regenerate it:\n  slop index {}",
+            index_path.display(),
+            repo.display(),
+        );
+    }
     let mut built = build::build_graph(&resolver);
     effects::infer_effects(&mut built);
     let facts = source::parse_repo(repo, &resolver.files());

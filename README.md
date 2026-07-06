@@ -32,10 +32,13 @@ cargo build --release                # -> target/release/slop
 Generate one, then check:
 
 ```sh
-npx --yes @sourcegraph/scip-python index . --project-name myrepo --output index.scip
+slop index .            # runs scip-python and verifies the index isn't empty
 slop check .            # judges the working-tree diff vs HEAD
 slop check . --all      # audits the whole repo
 ```
+
+(`slop index` wraps `npx @sourcegraph/scip-python`; run that directly if you
+prefer. A broken/empty index fails loudly rather than silently passing.)
 
 ```
 WARNING [complexity-spike] api.claude::chat (backend/api/claude.py:318)
