@@ -52,7 +52,9 @@ impl From<FailOn> for slop_analyze::findings::Severity {
 enum Command {
     /// Analyze a repo. Default: judge only the working-tree diff (vs HEAD).
     Check {
-        /// Repo root (must contain slop.toml for policy-gated checks)
+        /// Repo root (default: current directory; must contain slop.toml for
+        /// policy-gated checks)
+        #[arg(default_value = ".")]
         repo: PathBuf,
         /// Path to index.scip (default: <repo>/index.scip)
         #[arg(long)]
@@ -78,7 +80,8 @@ enum Command {
     /// SCIP-resolved reference and re-parsing each file (methods and
     /// throwaway-marker names are left to a human). Dry-run unless --write.
     Fix {
-        /// Repo root
+        /// Repo root (default: current directory)
+        #[arg(default_value = ".")]
         repo: PathBuf,
         /// Path to index.scip (default: <repo>/index.scip)
         #[arg(long)]
@@ -138,7 +141,8 @@ enum Command {
     /// Validation gate (M5): run the check and exit non-zero if anything
     /// blocks, printing a JSON verdict a CI step or agent fix-loop consumes.
     Gate {
-        /// Repo root
+        /// Repo root (default: current directory)
+        #[arg(default_value = ".")]
         repo: PathBuf,
         /// Path to index.scip (default: <repo>/index.scip)
         #[arg(long)]
@@ -173,7 +177,8 @@ enum Command {
     /// query_subgraph) over stdio. Launched per-project by an agent host
     /// (e.g. Claude Code); speaks newline-delimited JSON-RPC 2.0.
     Mcp {
-        /// Repo root the tools default to
+        /// Repo root the tools default to (default: current directory)
+        #[arg(default_value = ".")]
         repo: PathBuf,
         /// Path to index.scip (default: <repo>/index.scip)
         #[arg(long)]
@@ -184,7 +189,8 @@ enum Command {
     /// result actually has definitions — scip-python can crash mid-walk and
     /// still write a near-empty index that makes every check silently pass.
     Index {
-        /// Repo root to index
+        /// Repo root to index (default: current directory)
+        #[arg(default_value = ".")]
         repo: PathBuf,
         /// Output path (default: <repo>/index.scip)
         #[arg(long)]
@@ -201,7 +207,8 @@ enum Command {
     /// `<repo>/.claude/settings.json`, pointing at this binary. Idempotent —
     /// re-running updates slop's own entries and leaves the rest untouched.
     Install {
-        /// Repo root to install into
+        /// Repo root to install into (default: current directory)
+        #[arg(default_value = ".")]
         repo: PathBuf,
         /// Overwrite even if an existing config file fails to parse as JSON
         #[arg(long)]
@@ -209,7 +216,8 @@ enum Command {
     },
     /// Record current findings as the grandfathered baseline.
     Baseline {
-        /// Repo root
+        /// Repo root (default: current directory)
+        #[arg(default_value = ".")]
         repo: PathBuf,
         /// Path to index.scip (default: <repo>/index.scip)
         #[arg(long)]
@@ -218,7 +226,8 @@ enum Command {
     /// Infer sanctioned channels from dominant patterns; print (and
     /// optionally write) a slop.toml.
     Init {
-        /// Repo root
+        /// Repo root (default: current directory)
+        #[arg(default_value = ".")]
         repo: PathBuf,
         /// Path to index.scip (default: <repo>/index.scip)
         #[arg(long)]
@@ -227,19 +236,28 @@ enum Command {
         #[arg(long)]
         write: bool,
     },
-    /// Debug: load a SCIP index and print what the resolver sees.
+    /// Low-level SCIP index introspection (index-info / occurrences / resolve).
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugCommand {
+    /// Load a SCIP index and print what the resolver sees.
     IndexInfo {
         /// Path to index.scip
         index: PathBuf,
     },
-    /// Debug: list all occurrences recorded in a file.
+    /// List all occurrences recorded in a file.
     Occurrences {
         /// Path to index.scip
         index: PathBuf,
         /// Repo-relative file path as recorded in the index
         file: String,
     },
-    /// Debug: resolve the reference at file:line:col (0-based) to its definition.
+    /// Resolve the reference at file:line:col (0-based) to its definition.
     Resolve {
         /// Path to index.scip
         index: PathBuf,
@@ -594,7 +612,16 @@ fn main() -> Result<()> {
                 println!("wrote {}", path.display());
             }
         }
-        Command::IndexInfo { index } => {
+        Command::Debug { command } => run_debug(command)?,
+    }
+    Ok(())
+}
+
+/// Low-level SCIP introspection behind `slop debug`. Kept off the top-level
+/// help so the everyday surface (check / fix / gate / …) stays legible.
+fn run_debug(command: DebugCommand) -> Result<()> {
+    match command {
+        DebugCommand::IndexInfo { index } => {
             let resolver = ScipResolver::load(&index)?;
             println!("definitions: {}", resolver.definition_count());
             for file in resolver.files() {
@@ -608,7 +635,7 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Command::Occurrences { index, file } => {
+        DebugCommand::Occurrences { index, file } => {
             let resolver = ScipResolver::load(&index)?;
             for occ in resolver.occurrences_in(&file) {
                 let role = if occ.is_definition { "def" } else { "ref" };
@@ -625,7 +652,7 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Command::Resolve {
+        DebugCommand::Resolve {
             index,
             file,
             line,
