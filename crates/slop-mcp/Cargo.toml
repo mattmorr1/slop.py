@@ -1,18 +1,12 @@
 [package]
-name = "slop"
+name = "slop-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "slop"
-path = "src/main.rs"
-
 [dependencies]
 anyhow = { workspace = true }
-clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 slop-analyze = { workspace = true }
 slop-graph = { workspace = true }
-slop-llm = { workspace = true }
-slop-mcp = { workspace = true }
-slop-resolve = { workspace = true }

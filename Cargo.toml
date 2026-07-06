@@ -5,6 +5,7 @@ members = [
     "crates/slop-analyze",
     "crates/slop-graph",
     "crates/slop-llm",
+    "crates/slop-mcp",
     "crates/slop-parse",
     "crates/slop-resolve",
 ]
@@ -32,6 +33,7 @@ ureq = { version = "2", features = ["json"] }
 
 slop-graph = { path = "crates/slop-graph" }
 slop-llm = { path = "crates/slop-llm" }
+slop-mcp = { path = "crates/slop-mcp" }
 slop-parse = { path = "crates/slop-parse" }
 slop-resolve = { path = "crates/slop-resolve" }
 slop-analyze = { path = "crates/slop-analyze" }

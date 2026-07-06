@@ -168,25 +168,44 @@ fn tier3_structural_verdicts(
         .collect())
 }
 
-pub fn run(req: CheckRequest) -> Result<CheckResult> {
-    let index_path = req.index.clone().unwrap_or_else(|| req.repo.join("index.scip"));
+/// The graph + parsed source facts every consumer starts from: the
+/// `SCIP load → build → infer effects → parse` sequence, in one place.
+/// `check::run`, the MCP tools, `slop baseline`, and `slop init` all share
+/// it rather than re-deriving the graph three slightly different ways.
+pub struct Analysis {
+    pub built: build::BuiltGraph,
+    pub facts: Vec<source::FileFacts>,
+}
+
+/// Resolve `index` (default `<repo>/index.scip`), build the effect graph, and
+/// parse the repo's source facts. Errors with the `scip-python` hint when the
+/// index is missing.
+pub fn load_analysis(repo: &Path, index: Option<&Path>) -> Result<Analysis> {
+    let index_path = index
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| repo.join("index.scip"));
     if !index_path.exists() {
         bail!(
             "no SCIP index at {} — generate one with:\n  npx --yes @sourcegraph/scip-python index {} --project-name <name> --output {}",
             index_path.display(),
-            req.repo.display(),
+            repo.display(),
             index_path.display(),
         );
     }
     let resolver = ScipResolver::load(&index_path)?;
+    let mut built = build::build_graph(&resolver);
+    effects::infer_effects(&mut built);
+    let facts = source::parse_repo(repo, &resolver.files());
+    Ok(Analysis { built, facts })
+}
+
+pub fn run(req: CheckRequest) -> Result<CheckResult> {
     let policy = match &req.policy {
         Some(path) => Policy::load_file(path)?,
         None => Policy::load(&req.repo)?,
     };
 
-    let mut built = build::build_graph(&resolver);
-    effects::infer_effects(&mut built);
-    let facts = source::parse_repo(&req.repo, &resolver.files());
+    let Analysis { built, facts } = load_analysis(&req.repo, req.index.as_deref())?;
     let mut raw = crate::detect::run_all(&built, &policy, &facts);
     if req.tier3 {
         for (entity, redundant, reason) in tier3_structural_verdicts(&built, &facts, &req.repo)? {

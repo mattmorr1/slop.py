@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use slop_analyze::baseline::Baseline;
 use slop_analyze::check::{self, CheckRequest};
-use slop_analyze::{build, detect, effects, infer, policy::Policy, source, suppress};
+use slop_analyze::{detect, infer, policy::Policy, suppress};
 use slop_resolve::{Resolver, ScipResolver};
 
 #[derive(Parser)]
@@ -36,6 +36,16 @@ enum Command {
         /// Git ref to diff against (default: HEAD)
         #[arg(long, default_value = "HEAD")]
         base: String,
+    },
+    /// Serve slop's MCP tools (validate_change, get_context_envelope,
+    /// query_subgraph) over stdio. Launched per-project by an agent host
+    /// (e.g. Claude Code); speaks newline-delimited JSON-RPC 2.0.
+    Mcp {
+        /// Repo root the tools default to
+        repo: PathBuf,
+        /// Path to index.scip (default: <repo>/index.scip)
+        #[arg(long)]
+        index: Option<PathBuf>,
     },
     /// Record current findings as the grandfathered baseline.
     Baseline {
@@ -125,13 +135,12 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Mcp { repo, index } => {
+            slop_mcp::serve_stdio(repo, index)?;
+        }
         Command::Baseline { repo, index } => {
-            let index_path = index.unwrap_or_else(|| repo.join("index.scip"));
-            let resolver = ScipResolver::load(&index_path)?;
             let policy = Policy::load(&repo)?;
-            let mut built = build::build_graph(&resolver);
-            effects::infer_effects(&mut built);
-            let facts = source::parse_repo(&repo, &resolver.files());
+            let check::Analysis { built, facts } = check::load_analysis(&repo, index.as_deref())?;
             let raw = detect::run_all(&built, &policy, &facts);
             let suppressions = suppress::scan(&repo, &facts);
             let findings = suppress::filter(raw, &suppressions);
@@ -144,10 +153,7 @@ fn main() -> Result<()> {
             );
         }
         Command::Init { repo, index, write } => {
-            let index_path = index.unwrap_or_else(|| repo.join("index.scip"));
-            let resolver = ScipResolver::load(&index_path)?;
-            let mut built = build::build_graph(&resolver);
-            effects::infer_effects(&mut built);
+            let check::Analysis { built, .. } = check::load_analysis(&repo, index.as_deref())?;
             let proposals = infer::infer_channels(&built);
             if proposals.is_empty() {
                 println!("no dominant effect channels found — nothing to propose");

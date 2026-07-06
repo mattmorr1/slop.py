@@ -1044,6 +1044,7 @@ dependencies = [
  "slop-analyze",
  "slop-graph",
  "slop-llm",
+ "slop-mcp",
  "slop-resolve",
 ]
 
@@ -1079,6 +1080,17 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+]
+
+[[package]]
+name = "slop-mcp"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "slop-analyze",
+ "slop-graph",
 ]
 
 [[package]]

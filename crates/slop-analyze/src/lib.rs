@@ -13,6 +13,7 @@ pub mod health;
 pub mod infer;
 pub mod naming;
 pub mod policy;
+pub mod query;
 pub mod skeleton;
 pub mod source;
 pub mod suppress;

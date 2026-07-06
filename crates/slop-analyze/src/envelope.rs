@@ -32,13 +32,14 @@ const EXEMPLAR_WEIGHT: f64 = 1.0;
 /// neighborhood" for BFS proximity.
 const PROXIMITY_EDGES: [EdgeKind; 3] = [EdgeKind::Contains, EdgeKind::Calls, EdgeKind::Imports];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Fidelity {
     Full,
     Skeleton,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EnvelopeItem {
     pub entity: String,
     pub file: String,
