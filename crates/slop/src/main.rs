@@ -78,6 +78,10 @@ enum Command {
         /// the human report.
         #[arg(long)]
         json: bool,
+        /// Regenerate the SCIP index before checking (via the auto-detected
+        /// indexer). Without it, a stale index only earns a warning.
+        #[arg(long)]
+        reindex: bool,
     },
     /// Apply slop's mechanistic auto-fixes (D9 path a). Two rules:
     /// over-commenting — delete comments that restate the adjacent code
@@ -285,7 +289,15 @@ fn main() -> Result<()> {
             tier3,
             base,
             json,
+            reindex,
         } => {
+            let index_path = index.clone().unwrap_or_else(|| repo.join("index.scip"));
+            if reindex {
+                run_scip_index(&repo, index.as_deref())?;
+            } else if let Some(msg) = index_staleness(&repo, &index_path) {
+                // Advisory only — the check still runs against the old index.
+                eprintln!("warning: {msg}\n  regenerate with `slop check {} --reindex`", repo.display());
+            }
             let result = check::run(CheckRequest {
                 repo: repo.clone(),
                 index,
@@ -903,6 +915,63 @@ fn has_top_level_ext(repo: &Path, ext: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// Source-file extensions slop indexes — the staleness check watches these.
+const SOURCE_EXTS: &[&str] = &["py", "js", "jsx", "ts", "tsx", "mjs", "cjs"];
+
+/// Directories never worth walking for source-file mtimes.
+const SKIP_DIRS: &[&str] = &[".git", "node_modules", ".venv", "venv", "target", "__pycache__"];
+
+/// A human-readable reason the index at `index_path` is out of date, or `None`
+/// if it looks current. "Stale" means a tracked source file has been modified
+/// more recently than the index — the check would then judge yesterday's graph.
+/// Best-effort: any I/O hiccup yields `None` (never block a check on a mtime we
+/// couldn't read).
+fn index_staleness(repo: &Path, index_path: &Path) -> Option<String> {
+    let index_mtime = std::fs::metadata(index_path).ok()?.modified().ok()?;
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    newest_source_mtime(repo, &mut newest);
+    let (src_mtime, src_path) = newest?;
+    if src_mtime > index_mtime {
+        let rel = src_path.strip_prefix(repo).unwrap_or(&src_path);
+        Some(format!(
+            "SCIP index {} is older than {} — findings may be out of date",
+            index_path.display(),
+            rel.display()
+        ))
+    } else {
+        None
+    }
+}
+
+/// Recursively track the newest-modified source file under `dir`, skipping
+/// vendored/build directories. Best-effort — unreadable entries are ignored.
+fn newest_source_mtime(dir: &Path, newest: &mut Option<(std::time::SystemTime, PathBuf)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            let name = entry.file_name();
+            if SKIP_DIRS.iter().any(|d| name == *d) {
+                continue;
+            }
+            newest_source_mtime(&path, newest);
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| SOURCE_EXTS.contains(&e))
+        {
+            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+                    *newest = Some((mtime, path));
+                }
+            }
+        }
+    }
 }
 
 /// Regenerate the SCIP index for `repo`, writing to `index` (default
