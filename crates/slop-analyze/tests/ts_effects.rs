@@ -6,9 +6,11 @@
 
 use std::path::PathBuf;
 
-use slop_analyze::{build, effects};
+use slop_analyze::findings::Finding;
+use slop_analyze::policy::Policy;
+use slop_analyze::{build, detect, effects, source};
 use slop_graph::{Effect, NodeType};
-use slop_resolve::ScipResolver;
+use slop_resolve::{Resolver, ScipResolver};
 
 fn effect_sig(built: &build::BuiltGraph, name: &str) -> Vec<Effect> {
     built
@@ -46,5 +48,42 @@ fn typescript_effects_propagate_through_external_seeds() {
     assert!(
         run.contains(&Effect::Env),
         "process.env should seed Env into runCmd, got {run:?}"
+    );
+}
+
+#[test]
+fn parser_based_detectors_fire_on_typescript() {
+    // The tree-sitter JS/TS parser feeds the same duplication/complexity
+    // detectors as Python — and the facts join back to the scip-typescript
+    // graph entities by line.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/ts_probe");
+    let resolver = ScipResolver::load(&root.join("index.scip")).expect("ts_probe index");
+    let mut built = build::build_graph(&resolver);
+    effects::infer_effects(&mut built);
+    let facts = source::parse_repo(&root, &resolver.files());
+
+    // The TS file was parsed into per-function facts (not skipped).
+    assert!(
+        facts.iter().any(|f| f.file.ends_with(".ts") && !f.functions.is_empty()),
+        "the .ts file should yield parsed function facts"
+    );
+
+    let findings: Vec<Finding> = detect::run_all(&built, &Policy::default(), &facts);
+    let has = |rule: &str, needle: &str| {
+        findings
+            .iter()
+            .any(|f| f.rule == rule && f.entity.contains(needle))
+    };
+
+    // sumA/sumB have identical bodies -> duplicate-exact, joined to a named entity.
+    assert!(
+        has("duplicate-exact", "sum"),
+        "duplicate-exact should fire on sumA/sumB: {:#?}",
+        findings.iter().map(|f| (f.rule, &f.entity)).collect::<Vec<_>>()
+    );
+    // `tangled` nests for->for->if->while = depth 4 -> complexity-spike.
+    assert!(
+        has("complexity-spike", "tangled"),
+        "complexity-spike should fire on `tangled`"
     );
 }

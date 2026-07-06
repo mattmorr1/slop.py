@@ -121,10 +121,11 @@ Full details, config, and the fix-loop shape: **[docs/harness.md](docs/harness.m
   language — `slop index` auto-selects `scip-python` or `scip-typescript`, and
   the effect seed table has a JavaScript/Node set validated against a real
   `scip-typescript` index (`axios`, `fs`, `child_process`, `process.env` all
-  resolve; see the `ts_probe` fixture). The parser-based
-  rules (duplication, complexity, over-commenting) are Python-only for now (see
-  the `Language` seam in `slop-parse`). Resolution is only as good as the SCIP
-  index (dynamic dispatch, `getattr`, duck typing can be missed).
+  resolve; see the `ts_probe` fixture). The parser-based rules (duplication,
+  complexity, over-commenting) work on **Python and JavaScript/TypeScript** —
+  Python via ruff, JS/TS via tree-sitter (the `Language` seam in `slop-parse`).
+  Resolution is only as good as the SCIP index (dynamic dispatch, `getattr`,
+  duck typing can be missed).
 - The read-path harness's **token wins are measured** (~−61% on dogfood repos);
   whether it preserves *output quality* is not yet rigorously proven.
 - `slop fix` renames are SCIP-*verified*, not behaviour-inert — dry-run and

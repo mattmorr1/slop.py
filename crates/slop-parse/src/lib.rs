@@ -12,6 +12,8 @@ use ruff_python_ast::{self as ast, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
+mod js;
+
 /// A source language slop can produce per-function facts for. The parser-based
 /// detectors (duplication, complexity, over-commenting) need a language-aware
 /// parser; the graph/effect detectors work over SCIP for *any* indexed
@@ -22,6 +24,8 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 #[non_exhaustive]
 pub enum Language {
     Python,
+    JavaScript,
+    TypeScript,
 }
 
 impl Language {
@@ -31,6 +35,8 @@ impl Language {
     pub fn from_path(path: &str) -> Option<Language> {
         match path.rsplit('.').next() {
             Some("py" | "pyi") => Some(Language::Python),
+            Some("js" | "jsx" | "mjs" | "cjs") => Some(Language::JavaScript),
+            Some("ts" | "tsx" | "mts" | "cts") => Some(Language::TypeScript),
             _ => None,
         }
     }
@@ -39,6 +45,8 @@ impl Language {
     pub fn parse(self, source: &str) -> Result<Vec<FunctionFacts>> {
         match self {
             Language::Python => analyze_file(source),
+            Language::JavaScript => js::analyze_js(source, false),
+            Language::TypeScript => js::analyze_js(source, true),
         }
     }
 }
@@ -279,7 +287,7 @@ fn control_flow(stmts: &[Stmt], depth: u32, lines: &LineIndex, cf: &mut ControlF
     }
 }
 
-const MIN_SIGNIFICANT_TOKENS: u32 = 20;
+pub(crate) const MIN_SIGNIFICANT_TOKENS: u32 = 20;
 
 fn function_facts(
     func: &ast::StmtFunctionDef,

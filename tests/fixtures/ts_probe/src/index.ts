@@ -22,3 +22,35 @@ export function runCmd(): void {
   const home = process.env.HOME;
   console.log(home);
 }
+
+export function sumA(xs: number[]): number {
+  let total = 0;
+  for (const x of xs) {
+    if (x > 0) { total += x * 2; }
+  }
+  return total;
+}
+
+export function sumB(xs: number[]): number {
+  let total = 0;
+  for (const x of xs) {
+    if (x > 0) { total += x * 2; }
+  }
+  return total;
+}
+
+export function tangled(m: number[][], cfg: any): number {
+  let n = 0;
+  for (const row of m) {
+    for (const v of row) {
+      if (v > 0 && v < 100) {
+        while (n < v) {
+          if (n % 2 === 0 || n % 3 === 0) { n++; }
+          else if (n > cfg.max && cfg.on) { break; }
+        }
+      }
+    }
+  }
+  if (n > 10 || n < -10) { return -1; }
+  return n;
+}
