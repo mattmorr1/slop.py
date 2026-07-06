@@ -63,6 +63,46 @@ body, which a *caller* doesn't need, is dropped).
 one repo, and a ceiling effect (both perfect) that a harder task set would
 break. It tests *using* skeletonized code, **not modifying** it — modification
 needs the body, which is why edit targets are kept full-fidelity (see
-`docs/harness.md` edit-invertibility). The introduced-slop half (agent edits
-with vs without steering, via `slop proxy --log` + `gate`) still needs a
-capable model and a real task set.
+`docs/harness.md` edit-invertibility).
+
+## `steering_ab.py` — the steering value A/B (introduced-slop)
+
+Tests the *other* half of the thesis, the one the compression benches don't
+touch: does injecting the repo's sanctioned-channel policy (what `slop hook
+user-prompt-submit` does) make a model **reuse infrastructure instead of
+introducing infra-bypass slop**? Designed around the last pilot's ceiling-effect
+failure: a *new-file* task with neutral context, so the sanctioned channel is
+invisible unless the harness surfaces it.
+
+- **A (off):** bare task.
+- **B (on):** real harness steering + the channel interface `query_subgraph` /
+  `get_context_envelope` would surface (inlined, since a one-shot `generate`
+  can't call tools). Without the harness the agent has no way to know the
+  channel exists — that asymmetry *is* the harness's value, not extra hinting.
+- **Metric:** does the new code use the sanctioned `HttpClient` (adherent) or
+  reach for raw net — `urllib`/`requests`/`httpx`/… (slop)?
+
+```
+cargo build --release          # steering string comes from the real binary
+python3 bench/steering_ab.py [N] [model]
+```
+
+### Result (2026-07-06, toy_repo fixture, qwen2.5:1.5b, N=20/condition)
+
+| | A (off) | B (on) |
+| --- | ---: | ---: |
+| sanctioned-channel adherence | 0% | **30%** |
+| raw-net slop | 100% | 70% |
+| mean output tokens | 62 | 108 |
+
+**0/20 → 6/20** sanctioned, one-sided Fisher exact **p = 0.010** — a real
+effect, not the last pilot's null. The baseline *never* reuses the channel (it
+can't; it doesn't know it exists); the harness makes reuse happen. This is the
+first statistically-significant evidence for the steering claim.
+
+**Caveats.** One task, one tiny model, N=20. A 1.5B still reaches for raw net
+70% of the time even handed the interface — so the harness *shifts* behaviour
+but a weak model caps the ceiling low; the effect should grow with model
+capability. Adherence is scored by a syntactic proxy (which import/type the new
+code uses), not a full `slop check` reindex of the output. A capable model and
+more tasks would sharpen the estimate.
