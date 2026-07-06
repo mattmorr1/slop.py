@@ -119,7 +119,9 @@ Full details, config, and the fix-loop shape: **[docs/harness.md](docs/harness.m
   (`infra-bypass`, `circular-import`, `dead-island`, `purity-lie`,
   `effect-layer-violation`, `effect-creep`) work over *any* SCIP-indexed
   language — `slop index` auto-selects `scip-python` or `scip-typescript`, and
-  the effect seed table has a JavaScript/Node starter set. The parser-based
+  the effect seed table has a JavaScript/Node set validated against a real
+  `scip-typescript` index (`axios`, `fs`, `child_process`, `process.env` all
+  resolve; see the `ts_probe` fixture). The parser-based
   rules (duplication, complexity, over-commenting) are Python-only for now (see
   the `Language` seam in `slop-parse`). Resolution is only as good as the SCIP
   index (dynamic dispatch, `getattr`, duck typing can be missed).

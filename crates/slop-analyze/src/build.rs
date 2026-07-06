@@ -8,7 +8,7 @@ use petgraph::graph::NodeIndex;
 use slop_graph::{CodeEntity, CodeGraph, EdgeKind, EffectSet, NodeType};
 use slop_resolve::{Range, Resolver, SymbolKind};
 
-use crate::entity_id::entity_id;
+use crate::entity_id::{entity_id, external_effect_id};
 
 pub struct BuiltGraph {
     pub graph: CodeGraph,
@@ -150,7 +150,10 @@ pub fn build_graph(resolver: &dyn Resolver) -> BuiltGraph {
                     Some(&idx) => idx,
                     None => {
                         // External (stdlib / third-party): materialize once.
-                        let Some(id) = entity_id(&occ.symbol) else {
+                        // Use the import-identity form so effect seeds match
+                        // across languages (scip-typescript hides the module in
+                        // the package field / a quoted specifier).
+                        let Some(id) = external_effect_id(&occ.symbol) else {
                             continue;
                         };
                         let idx = graph.add_entity(CodeEntity {

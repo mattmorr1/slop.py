@@ -99,19 +99,19 @@ pub const SEEDS: &[Seed] = &[
     Seed { prefix: "concurrent.futures", effect: Effect::Concurrency },
     Seed { prefix: "subprocess", effect: Effect::Concurrency },
 
-    // --- JavaScript / Node (multi-language groundwork) ---
-    // The graph/effect detectors run over any SCIP-indexed language; these
-    // seed the JS/TS ecosystem. Prefixes are the expected scip-typescript
-    // entity-id forms (module/package name first); validate against a real
-    // `scip-typescript` index before relying on them in anger. No collisions
-    // with the Python seeds above map to a *different* effect.
+    // --- JavaScript / Node ---
+    // Matched against `external_effect_id` (entity_id.rs), which normalizes a
+    // scip-typescript symbol to its *import identity* — the npm package name
+    // (`axios`) or the node module specifier (`"node:fs"` -> `fs`), plus the
+    // member. Validated against a real scip-typescript index (see the
+    // `ts_probe` fixture): `axios.get`, `fs.readFileSync`, `process.env`, and
+    // `child_process.exec` all resolve.
     // Net
+    Seed { prefix: "http", effect: Effect::Net },
     Seed { prefix: "https", effect: Effect::Net },
-    Seed { prefix: "node:https", effect: Effect::Net },
-    Seed { prefix: "node:http", effect: Effect::Net },
-    Seed { prefix: "node:net", effect: Effect::Net },
-    Seed { prefix: "node:dns", effect: Effect::Net },
-    Seed { prefix: "node:tls", effect: Effect::Net },
+    Seed { prefix: "net", effect: Effect::Net },
+    Seed { prefix: "dns", effect: Effect::Net },
+    Seed { prefix: "tls", effect: Effect::Net },
     Seed { prefix: "axios", effect: Effect::Net },
     Seed { prefix: "node-fetch", effect: Effect::Net },
     Seed { prefix: "undici", effect: Effect::Net },
@@ -121,10 +121,8 @@ pub const SEEDS: &[Seed] = &[
     // FS — the `fs` module and its promises API do both directions.
     Seed { prefix: "fs", effect: Effect::FsRead },
     Seed { prefix: "fs", effect: Effect::FsWrite },
-    Seed { prefix: "node:fs", effect: Effect::FsRead },
-    Seed { prefix: "node:fs", effect: Effect::FsWrite },
     Seed { prefix: "fs-extra", effect: Effect::FsWrite },
-    // DB
+    // DB (need the package's @types to resolve, e.g. @types/pg)
     Seed { prefix: "pg", effect: Effect::Db },
     Seed { prefix: "mysql", effect: Effect::Db },
     Seed { prefix: "mysql2", effect: Effect::Db },
@@ -133,16 +131,13 @@ pub const SEEDS: &[Seed] = &[
     Seed { prefix: "ioredis", effect: Effect::Db },
     Seed { prefix: "knex", effect: Effect::Db },
     Seed { prefix: "sequelize", effect: Effect::Db },
-    Seed { prefix: "prisma", effect: Effect::Db },
     Seed { prefix: "@prisma/client", effect: Effect::Db },
     // Env
     Seed { prefix: "process.env", effect: Effect::Env },
     Seed { prefix: "dotenv", effect: Effect::Env },
     // Concurrency
     Seed { prefix: "child_process", effect: Effect::Concurrency },
-    Seed { prefix: "node:child_process", effect: Effect::Concurrency },
     Seed { prefix: "worker_threads", effect: Effect::Concurrency },
-    Seed { prefix: "node:worker_threads", effect: Effect::Concurrency },
     Seed { prefix: "cluster", effect: Effect::Concurrency },
 ];
 
@@ -252,17 +247,16 @@ mod tests {
 
     #[test]
     fn node_js_seeds_resolve() {
+        // Inputs are the normalized `external_effect_id` forms (see the
+        // ts_probe integration test for the real end-to-end path).
         assert_eq!(seed_effects_for("axios.get"), vec![Effect::Net]);
-        assert_eq!(seed_effects_for("pg.Client.query"), vec![Effect::Db]);
-        assert_eq!(seed_effects_for("process.env.HOME"), vec![Effect::Env]);
+        assert_eq!(seed_effects_for("pg.query"), vec![Effect::Db]);
+        assert_eq!(seed_effects_for("process.env"), vec![Effect::Env]);
         assert_eq!(
             seed_effects_for("fs.readFileSync"),
             vec![Effect::FsRead, Effect::FsWrite]
         );
-        assert_eq!(
-            seed_effects_for("node:child_process.exec"),
-            vec![Effect::Concurrency]
-        );
+        assert_eq!(seed_effects_for("child_process.exec"), vec![Effect::Concurrency]);
         // Boundary: a package that merely starts with a seed name doesn't match.
         assert!(seed_effects_for("axioms.thing").is_empty());
     }

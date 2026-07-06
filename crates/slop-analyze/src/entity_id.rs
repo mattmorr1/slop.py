@@ -47,6 +47,53 @@ pub fn entity_id(symbol: &str) -> Option<String> {
     }
 }
 
+/// Importable-module identity of an **external** symbol, for effect-seed
+/// matching. scip-python encodes the module in the descriptor (so `entity_id`
+/// already yields `requests.api.post`); scip-typescript instead puts the
+/// importable name in the *package* field (`axios`, `pg`) or a quoted
+/// module-specifier descriptor (`"node:fs"`) for builtins, leaving the useless
+/// `.d.ts` filename as the descriptor's "module". This derives a clean
+/// `<module>.<member>` (e.g. `axios.get`, `fs.readFileSync`, `process.env`) so
+/// the seed table matches on the name you'd actually `import`.
+pub fn external_effect_id(symbol: &str) -> Option<String> {
+    let mut fields = symbol.splitn(5, ' ');
+    let scheme = fields.next()?;
+    let _manager = fields.next()?;
+    let package = fields.next()?;
+    let _version = fields.next()?;
+    let descriptors = fields.next()?;
+
+    if scheme != "scip-typescript" {
+        return entity_id(symbol); // python (and anything descriptor-encoded)
+    }
+
+    let segments = split_descriptors(descriptors);
+    // Module: a quoted specifier (`"node:fs"` -> `fs`) wins; else the npm
+    // package, unless it's a type-only / stdlib package with no import identity.
+    let specifier = segments.iter().find_map(|s| {
+        let inner = s.trim_matches('`');
+        let unquoted = inner.strip_prefix('"').and_then(|x| x.strip_suffix('"'))?;
+        Some(unquoted.strip_prefix("node:").unwrap_or(unquoted).to_string())
+    });
+    let module = specifier.or_else(|| {
+        (!package.starts_with("@types/") && package != "typescript")
+            .then(|| package.to_string())
+    })?;
+    // Member: the last real descriptor (method/property), skipping the `.d.ts`
+    // file segment and the quoted specifier.
+    let member = segments.iter().rev().find_map(|s| {
+        let c = s
+            .trim_matches('`')
+            .trim_end_matches("().")
+            .trim_end_matches(['#', ':', '.', '!']);
+        (!c.is_empty() && !c.ends_with(".d.ts") && !c.starts_with('"')).then(|| c.to_string())
+    });
+    Some(match member {
+        Some(m) if m != module => format!("{module}::{m}"),
+        _ => module,
+    })
+}
+
 /// The descriptor tail of a SCIP symbol: everything after the 4
 /// space-separated header fields (scheme, manager, package name, version).
 fn descriptors_of(symbol: &str) -> Option<&str> {
@@ -115,5 +162,34 @@ mod tests {
     fn locals_have_no_id() {
         assert_eq!(entity_id("local 3"), None);
         assert_eq!(module_of("local 3"), None);
+    }
+
+    #[test]
+    fn external_effect_id_normalizes_typescript() {
+        // npm package: identity is the package name + member, not the .d.ts file.
+        assert_eq!(
+            external_effect_id("scip-typescript npm axios 1.18.1 `index.d.ts`/Axios#get().").as_deref(),
+            Some("axios::get")
+        );
+        // node builtin: identity is the module specifier, not `fs.d.ts`.
+        assert_eq!(
+            external_effect_id("scip-typescript npm @types/node 26.1.0 `fs.d.ts`/`\"node:fs\"`/readFileSync().").as_deref(),
+            Some("fs::readFileSync")
+        );
+        // process.env — the case that motivated the member-tail rule.
+        assert_eq!(
+            external_effect_id("scip-typescript npm @types/node 26.1.0 `process.d.ts`/`\"node:process\"`/global/NodeJS/Process#env.").as_deref(),
+            Some("process::env")
+        );
+        // type-only / stdlib packages carry no import identity.
+        assert_eq!(
+            external_effect_id("scip-typescript npm typescript 5.9.3 lib/`lib.es5.d.ts`/Promise#"),
+            None
+        );
+        // Python is unchanged (descriptor-encoded module).
+        assert_eq!(
+            external_effect_id("scip-python python requests 2.0 `requests.api`/post().").as_deref(),
+            Some("requests.api::post")
+        );
     }
 }
