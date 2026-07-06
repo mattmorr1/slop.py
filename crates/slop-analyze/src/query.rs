@@ -63,7 +63,7 @@ pub fn subgraph(
 ) -> Option<Subgraph> {
     let start = built.graph.node(entity)?;
     let graph = &built.graph.graph;
-    let allowed = |k: EdgeKind| kinds.map_or(true, |ks| ks.contains(&k));
+    let allowed = |k: EdgeKind| kinds.is_none_or(|ks| ks.contains(&k));
 
     let mut seen: std::collections::HashSet<NodeIndex> = std::collections::HashSet::new();
     seen.insert(start);

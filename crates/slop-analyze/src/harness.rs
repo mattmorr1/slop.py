@@ -107,7 +107,7 @@ pub fn handle_post_tool_use(input: &Value) -> Value {
         return json!({});
     }
     let (file, cwd) = read_target(input);
-    let is_python = file.as_deref().map_or(false, |f| f.ends_with(".py"));
+    let is_python = file.as_deref().is_some_and(|f| f.ends_with(".py"));
     if !is_python {
         return json!({});
     }
