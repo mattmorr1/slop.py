@@ -1,10 +1,12 @@
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use slop_analyze::baseline::Baseline;
-use slop_analyze::check::{self, CheckRequest};
+use slop_analyze::check::{self, CheckRequest, CheckResult};
+use slop_analyze::findings::Severity;
 use std::collections::HashMap;
 
 use slop_analyze::compress::{self, CompressConfig};
@@ -72,6 +74,10 @@ enum Command {
         /// Git ref to diff against (default: HEAD)
         #[arg(long, default_value = "HEAD")]
         base: String,
+        /// Emit findings as a JSON object (for editors / tooling) instead of
+        /// the human report.
+        #[arg(long)]
+        json: bool,
     },
     /// Apply slop's mechanistic auto-fixes (D9 path a). Two rules:
     /// over-commenting — delete comments that restate the adjacent code
@@ -278,6 +284,7 @@ fn main() -> Result<()> {
             policy,
             tier3,
             base,
+            json,
         } => {
             let result = check::run(CheckRequest {
                 repo: repo.clone(),
@@ -288,27 +295,11 @@ fn main() -> Result<()> {
                 base,
             })?;
 
-            if result.policy_is_empty {
-                eprintln!(
-                    "note: {} has no slop.toml channel policy — infra-bypass checks are silent (run `slop init`)",
-                    repo.display()
-                );
+            if json {
+                print_check_json(&result)?;
+            } else {
+                print_check_human(&repo, &result);
             }
-
-            if result.findings.is_empty() {
-                println!("no slop found");
-                println!("{}", result.health_line);
-                return Ok(());
-            }
-            for finding in &result.findings {
-                println!("{finding}\n");
-            }
-            println!(
-                "{} finding(s), {} blocking",
-                result.findings.len(),
-                result.blocking
-            );
-            println!("{}", result.health_line);
             if result.blocking > 0 {
                 std::process::exit(1);
             }
@@ -674,6 +665,112 @@ fn run_debug(command: DebugCommand) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// ANSI colors, but only when stdout is a real terminal and `NO_COLOR` is
+/// unset (https://no-color.org). Piping `slop check` into a file or another
+/// program yields clean, uncolored text.
+fn use_color() -> bool {
+    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+}
+
+/// Wrap `s` in an ANSI SGR code when `color` is on; otherwise return it plain.
+fn paint(s: &str, code: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+/// The color a severity renders in: blocking = red, warning = yellow,
+/// advisory = dim. Shared by the header and the summary line.
+fn severity_code(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Blocking => "1;31", // bold red
+        Severity::Warning => "1;33",  // bold yellow
+        Severity::Advisory => "2",    // dim
+    }
+}
+
+/// The human report for `slop check`: findings grouped by severity
+/// (blocking → advisory), colorized when writing to a terminal, then a one-line
+/// summary and the health delta.
+fn print_check_human(repo: &Path, result: &CheckResult) {
+    let color = use_color();
+
+    if result.policy_is_empty {
+        eprintln!(
+            "note: {} has no slop.toml channel policy — infra-bypass checks are silent (run `slop init`)",
+            repo.display()
+        );
+    }
+
+    if result.findings.is_empty() {
+        println!("{}", paint("no slop found", "1;32", color)); // bold green
+        println!("{}", result.health_line);
+        return;
+    }
+
+    // Group by severity, most severe first, stable within a group.
+    let mut counts = [0usize; 3]; // [advisory, warning, blocking] by Severity ordinal
+    for sev in [Severity::Blocking, Severity::Warning, Severity::Advisory] {
+        let group: Vec<_> = result.findings.iter().filter(|f| f.severity == sev).collect();
+        if group.is_empty() {
+            continue;
+        }
+        counts[sev as usize] = group.len();
+        let header = format!("{} ({})", sev, group.len());
+        println!("{}", paint(&header, severity_code(sev), color));
+        for f in group {
+            let loc = format!("{}:{}", f.file, f.lines.0 + 1);
+            println!(
+                "  {} {}  {}",
+                paint(&format!("[{}]", f.rule), "1", color), // bold rule
+                f.entity,
+                paint(&loc, "2", color), // dim location
+            );
+            println!("    {}", f.message);
+            println!("    {} {}", paint("fix:", "2", color), f.fix_guidance);
+        }
+        println!();
+    }
+
+    let summary = format!(
+        "{} finding(s) — {} blocking, {} warning, {} advisory",
+        result.findings.len(),
+        counts[Severity::Blocking as usize],
+        counts[Severity::Warning as usize],
+        counts[Severity::Advisory as usize],
+    );
+    println!("{summary}");
+    println!("{}", result.health_line);
+}
+
+/// The `--json` report for `slop check`: the same verdict shape `slop gate`
+/// emits, so an editor or CI step can consume either interchangeably.
+fn print_check_json(result: &CheckResult) -> Result<()> {
+    let warning = result
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Warning)
+        .count();
+    let advisory = result
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Advisory)
+        .count();
+    let out = serde_json::json!({
+        "blocking": result.blocking,
+        "warning": warning,
+        "advisory": advisory,
+        "total": result.findings.len(),
+        "health": result.health_line,
+        "policy_is_empty": result.policy_is_empty,
+        "findings": result.findings,
+    });
+    println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }
 
