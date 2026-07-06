@@ -1,0 +1,44 @@
+{
+  "name": "slop",
+  "displayName": "slop",
+  "description": "Codebase-relative AI-slop diagnostics, powered by the `slop lsp` language server.",
+  "version": "0.0.1",
+  "license": "MIT",
+  "publisher": "matthewmorris",
+  "repository": { "type": "git", "url": "https://github.com/matthewmorris/slop.py" },
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Linters", "Programming Languages"],
+  "activationEvents": [
+    "onLanguage:python",
+    "onLanguage:javascript",
+    "onLanguage:typescript",
+    "workspaceContains:index.scip"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "slop",
+      "properties": {
+        "slop.path": {
+          "type": "string",
+          "default": "slop",
+          "description": "Path to the slop binary. Defaults to `slop` on PATH."
+        },
+        "slop.indexPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to index.scip. Empty = <workspace>/index.scip (the slop default)."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "slop.restart",
+        "title": "slop: Restart language server"
+      }
+    ]
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

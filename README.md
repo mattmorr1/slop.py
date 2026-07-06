@@ -32,26 +32,31 @@ cargo build --release                # -> target/release/slop
 Generate one, then check:
 
 ```sh
-slop index .            # runs scip-python and verifies the index isn't empty
-slop check .            # judges the working-tree diff vs HEAD
-slop check . --all      # audits the whole repo
+slop index              # runs scip-python and verifies the index isn't empty
+slop check              # judges the working-tree diff vs HEAD (cwd)
+slop check --all        # audits the whole repo
+slop check --reindex    # regenerate the index first (else a stale one warns)
+slop check --json       # machine-readable output for editors / CI
 ```
 
-(`slop index` wraps `npx @sourcegraph/scip-python`; run that directly if you
-prefer. A broken/empty index fails loudly rather than silently passing.)
+Every command defaults its repo argument to the current directory. (`slop index`
+wraps `npx @sourcegraph/scip-python`; run that directly if you prefer. A
+broken/empty index fails loudly rather than silently passing.)
 
 ```
-WARNING [complexity-spike] api.claude::chat (backend/api/claude.py:318)
-  `chat` is tangled: 31 control-flow branches nested 4 deep (cyclomatic 55)
-  fix: Extract the deepest block (around line 428, nested 4 deep) into a named
-       helper, or flatten it with early-return guard clauses
+WARNING (1)
+  [complexity-spike] api.claude::chat  backend/api/claude.py:318
+    `chat` is tangled: 31 control-flow branches nested 4 deep (cyclomatic 55)
+    fix: Extract the deepest block (around line 428, nested 4 deep) into a
+         named helper, or flatten it with early-return guard clauses
 
-12 finding(s), 1 blocking
+1 finding(s) — 0 blocking, 1 warning, 0 advisory
 health: 84/100
 ```
 
-Every run ends with a **health score** (0–100). `slop check` exits non-zero
-when anything is *Blocking*.
+Findings are grouped by severity and colorized on a terminal (piping stays
+plain; `NO_COLOR` is honored). Every run ends with a **health score** (0–100),
+and `slop check` exits non-zero when anything is *Blocking*.
 
 ## What it flags
 
@@ -113,6 +118,18 @@ slop install /path/to/repo   # merges MCP server + hooks into the repo's config
 
 Full details, config, and the fix-loop shape: **[docs/harness.md](docs/harness.md)**.
 
+## Editor integration
+
+`slop lsp` is a language server that publishes findings as inline diagnostics on
+open/save — Blocking → Error, Warning → Warning, Advisory → Information, each
+with its fix guidance. It's editor-agnostic (VS Code, Cursor, Neovim, Zed,
+JetBrains all speak LSP); point your editor's LSP client at `slop lsp`. A ready
+VS Code / Cursor shim lives in **[editors/vscode](editors/vscode)**.
+
+```sh
+slop lsp                # serve over stdio for the cwd (what an editor launches)
+```
+
 ## Limitations
 
 - **Python is the fully-supported language.** The graph/effect detectors
@@ -130,6 +147,9 @@ Full details, config, and the fix-loop shape: **[docs/harness.md](docs/harness.m
   whether it preserves *output quality* is not yet rigorously proven.
 - `slop fix` renames are SCIP-*verified*, not behaviour-inert — dry-run and
   review before `--write`.
+- The **LSP server** (`slop lsp`) is covered by headless tests; the **VS Code
+  shim** in `editors/vscode` is not — exercising it needs a running extension
+  host. It's kept to a thin launcher so the untested surface stays minimal.
 
 ## Development
 
