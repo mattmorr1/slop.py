@@ -57,10 +57,22 @@ npx --yes @sourcegraph/scip-python index <repo> --project-name <name> --output <
 Both hooks derive steering from `slop.toml` alone (no SCIP index, no graph
 build) so they are cheap enough to run on every read/prompt.
 
-- `slop hook post-tool-use` — for a `Read` of a `.py` file: strips
-  comment/blank-line noise from the returned text (`updatedToolOutput`) and
-  attaches sanctioned-channel steering (`additionalContext`). Non-`Read` /
-  non-`.py` / policy-less reads pass through untouched.
+- `slop hook post-tool-use` — maintains a **session edit zone** and does
+  **zoned graph-distance compression** on reads:
+  - On a `Write`/`Edit`/`MultiEdit` of a `.py` file, records it in the edit
+    zone (a small state file in the system temp dir, keyed by repo).
+  - On a `Read` of a `.py` file, skeletonizes functions that are more than
+    `edit_zone_hops` (1) graph hops from the edit zone — full fidelity for the
+    code you're working near, a signature + effect-signature + docstring
+    contract for everything else — and attaches sanctioned-channel steering
+    (`additionalContext`). Falls back to a plain comment/blank strip on a cold
+    read (empty edit zone), a small file, or when there's no SCIP index.
+  - Non-`Read`/`Write`/`Edit`, non-`.py` reads pass through untouched.
+
+  > Cost: a read that triggers zoned compression builds the graph
+  > (~0.1–0.5s depending on repo size, needs `<repo>/index.scip`). Small
+  > files and cold reads skip it. Preview/measure with `slop compress`:
+  > `slop compress <repo> <file> --edit <entity-id> --hops 1 --stats`.
 - `slop hook user-prompt-submit` — injects the repo's sanctioned-channel
   policy plus a pointer to `validate_change` as pre-hoc steering.
 
@@ -92,10 +104,6 @@ Register in `.claude/settings.json`:
 > `tool_response` (string, or `{content|file|text}` object). If your Claude
 > Code version names it differently, the hook passes the read through
 > unchanged rather than corrupting it. Steering still applies.
->
-> Zoned graph-distance skeletonization (full fidelity in the edit zone,
-> skeletons beyond) is a planned refinement; the first cut is the
-> deterministic strip above plus policy steering.
 
 ---
 

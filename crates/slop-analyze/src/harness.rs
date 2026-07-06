@@ -14,14 +14,20 @@
 
 use std::path::{Path, PathBuf};
 
+use std::hash::{Hash, Hasher};
+
 use serde_json::{json, Value};
 
+use crate::compress::{self, CompressConfig};
 use crate::policy::Policy;
 use crate::skeleton::strip_noise;
 
 /// Only bother remapping when the strip saves at least this fraction of
 /// characters — otherwise pass the read through untouched.
 const MIN_COMPRESSION_GAIN: f64 = 0.10;
+
+/// How many recently-edited files the session edit zone remembers.
+const MAX_ZONE_FILES: usize = 12;
 
 /// Nearest ancestor of `start` (inclusive) containing `slop.toml`, else the
 /// nearest `.git` root, else `start` itself. Hooks are launched from the
@@ -99,30 +105,138 @@ fn read_target(input: &Value) -> (Option<String>, PathBuf) {
     (file, cwd)
 }
 
+/// Session edit-zone state file for `repo`, keyed by its path (in the system
+/// temp dir — hooks are separate short-lived processes, so the zone has to
+/// persist across invocations somewhere).
+fn zone_file(repo: &Path) -> PathBuf {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    repo.hash(&mut h);
+    std::env::temp_dir().join(format!("slop-editzone-{:x}.json", h.finish()))
+}
+
+/// Append a repo-relative path to the edit zone (most-recent last, capped,
+/// deduped). Best-effort — a write failure just means no zoning next read.
+fn record_edit(zone_path: &Path, rel: &str) {
+    let mut files = load_zone(zone_path);
+    files.retain(|f| f != rel);
+    files.push(rel.to_string());
+    let overflow = files.len().saturating_sub(MAX_ZONE_FILES);
+    files.drain(0..overflow);
+    let _ = std::fs::write(
+        zone_path,
+        serde_json::to_string(&json!({ "files": files })).unwrap_or_default(),
+    );
+}
+
+fn load_zone(zone_path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(zone_path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|v| {
+            v.get("files").and_then(Value::as_array).map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Make `path` repo-relative (matching SCIP/graph `file` fields). Returns the
+/// path unchanged if it's already relative, `None` if it's outside `repo`.
+fn repo_relative(repo: &Path, path: &str) -> Option<String> {
+    let p = Path::new(path);
+    if let Ok(rel) = p.strip_prefix(repo) {
+        return Some(rel.to_string_lossy().replace('\\', "/"));
+    }
+    p.is_relative().then(|| path.to_string())
+}
+
+/// Zoned graph-distance compression of a read (task's core token-efficiency
+/// win): skeletonize entities beyond the edit zone. Returns `None` — so the
+/// caller falls back to a plain noise-strip — when it isn't worth it (small
+/// file, no graph/index, edited files not in the graph, nothing skeletonized).
+pub fn compress_read(
+    repo: &Path,
+    rel_file: &str,
+    source: &str,
+    edit_files: &[String],
+) -> Option<String> {
+    let config = CompressConfig::default();
+    if source.lines().count() < config.min_lines {
+        return None;
+    }
+    let analysis = crate::check::load_analysis(repo, None).ok()?;
+    let loci: Vec<String> = analysis
+        .built
+        .graph
+        .entities()
+        .filter(|(_, e)| edit_files.contains(&e.file))
+        .map(|(_, e)| e.id.clone())
+        .collect();
+    if loci.is_empty() {
+        return None;
+    }
+    let (out, stats) = compress::compress_file(
+        &analysis.built,
+        &analysis.facts,
+        source,
+        rel_file,
+        &loci,
+        &config,
+        None,
+    );
+    (stats.skeletonized > 0).then_some(out)
+}
+
 /// PostToolUse handler. Returns the JSON to print to stdout: either a
 /// `hookSpecificOutput` with `updatedToolOutput`/`additionalContext`, or an
 /// empty object (no-op passthrough).
 pub fn handle_post_tool_use(input: &Value) -> Value {
-    if as_str(input, "tool_name") != Some("Read") {
-        return json!({});
-    }
-    let (file, cwd) = read_target(input);
-    let is_python = file.as_deref().is_some_and(|f| f.ends_with(".py"));
-    if !is_python {
+    let tool = as_str(input, "tool_name").unwrap_or("");
+
+    // Writes/edits define the edit zone that later reads compress against.
+    if matches!(tool, "Write" | "Edit" | "MultiEdit") {
+        if let Some(path) = input
+            .get("tool_input")
+            .and_then(|t| as_str(t, "file_path"))
+            .filter(|p| p.ends_with(".py"))
+        {
+            let repo = find_repo_root(&read_target(input).1);
+            if let Some(rel) = repo_relative(&repo, path) {
+                record_edit(&zone_file(&repo), &rel);
+            }
+        }
         return json!({});
     }
 
-    let policy = Policy::load(&find_repo_root(&cwd)).unwrap_or_default();
-    let steering = channel_steering(&policy);
+    if tool != "Read" {
+        return json!({});
+    }
+    let (file, cwd) = read_target(input);
+    let Some(file) = file.filter(|f| f.ends_with(".py")) else {
+        return json!({});
+    };
+    let repo = find_repo_root(&cwd);
+    let steering = channel_steering(&Policy::load(&repo).unwrap_or_default());
 
     let mut hook = json!({ "hookEventName": "PostToolUse" });
     let mut changed = false;
 
     if let Some(src) = read_output_text(input) {
-        let stripped = strip_noise(&src);
-        let gain = 1.0 - (stripped.len() as f64 / src.len().max(1) as f64);
+        // Prefer zoned graph-distance compression; fall back to noise-strip.
+        let zone = load_zone(&zone_file(&repo));
+        let compressed = if zone.is_empty() {
+            None
+        } else {
+            repo_relative(&repo, &file).and_then(|rel| compress_read(&repo, &rel, &src, &zone))
+        };
+        let remapped = compressed.unwrap_or_else(|| strip_noise(&src));
+        let gain = 1.0 - (remapped.len() as f64 / src.len().max(1) as f64);
         if gain >= MIN_COMPRESSION_GAIN {
-            hook["updatedToolOutput"] = Value::String(stripped);
+            hook["updatedToolOutput"] = Value::String(remapped);
             changed = true;
         }
     }
@@ -219,5 +333,55 @@ mod tests {
         // ...and UserPromptSubmit stays silent.
         let out = handle_user_prompt_submit(&input_in_dir_without_policy());
         assert_eq!(out, json!({}));
+    }
+
+    #[test]
+    fn edit_zone_roundtrips_deduped_and_capped() {
+        let dir = std::env::temp_dir().join(format!("slop-zone-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("zone.json");
+        let _ = std::fs::remove_file(&path);
+
+        record_edit(&path, "a.py");
+        record_edit(&path, "b.py");
+        record_edit(&path, "a.py"); // dedup -> moves a.py to the end
+        assert_eq!(load_zone(&path), vec!["b.py".to_string(), "a.py".to_string()]);
+
+        for i in 0..MAX_ZONE_FILES + 5 {
+            record_edit(&path, &format!("f{i}.py"));
+        }
+        assert_eq!(load_zone(&path).len(), MAX_ZONE_FILES);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_records_edit_zone() {
+        // A .py Write records the edited file (repo root falls back to cwd when
+        // there's no slop.toml/.git).
+        let dir = std::env::temp_dir().join(format!("slop-write-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let zone = zone_file(&dir);
+        let _ = std::fs::remove_file(&zone);
+        let file_path = dir.join("mod.py");
+
+        let out = handle_post_tool_use(&json!({
+            "tool_name": "Edit",
+            "cwd": dir.to_string_lossy(),
+            "tool_input": { "file_path": file_path.to_string_lossy() }
+        }));
+        assert_eq!(out, json!({})); // edits are silent, side-effect only
+        assert_eq!(load_zone(&zone), vec!["mod.py".to_string()]);
+        let _ = std::fs::remove_file(&zone);
+    }
+
+    #[test]
+    fn compress_read_skips_small_files() {
+        // Below min_lines it declines (caller noise-strips instead) rather than
+        // paying for a graph build.
+        let tiny = "def f():\n    return 1\n";
+        assert_eq!(
+            compress_read(Path::new("/nope"), "m.py", tiny, &["x.py".to_string()]),
+            None
+        );
     }
 }
