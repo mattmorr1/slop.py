@@ -192,6 +192,9 @@ enum Command {
         /// scip-python project name (default: the repo directory name)
         #[arg(long)]
         project_name: Option<String>,
+        /// Which SCIP indexer to run (default: auto-detect from project markers)
+        #[arg(long, value_enum, default_value_t = Indexer::Auto)]
+        indexer: Indexer,
     },
     /// Wire slop's harness into a repo's agent-host config: merge the MCP
     /// server into `<repo>/.mcp.json` and the read/prompt hooks into
@@ -529,6 +532,7 @@ fn main() -> Result<()> {
             repo,
             output,
             project_name,
+            indexer,
         } => {
             let out = output.unwrap_or_else(|| repo.join("index.scip"));
             let project = project_name.unwrap_or_else(|| {
@@ -536,7 +540,7 @@ fn main() -> Result<()> {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "repo".to_string())
             });
-            run_scip_index_named(&repo, &out, &project)?;
+            run_indexer(indexer, &repo, &out, &project)?;
             // Verify it's usable, not just present (scip-python can exit 0 with
             // a broken, definition-less index).
             let resolver = ScipResolver::load(&out)?;
@@ -733,27 +737,89 @@ fn install_harness(repo: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Regenerate the SCIP index for `repo` via `scip-python`, writing to
-/// `index` (default `<repo>/index.scip`). Used by `slop gate --reindex` so a
-/// re-run after edits sees the new graph.
+/// The SCIP indexer for a language. slop's graph/effect detectors consume any
+/// SCIP index; picking the right indexer per repo is all the multi-language
+/// index path needs.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Indexer {
+    /// Detect from project markers (pyproject/setup/*.py vs package.json/tsconfig).
+    Auto,
+    /// `scip-python` (Python).
+    Python,
+    /// `scip-typescript` (JavaScript / TypeScript).
+    Typescript,
+}
+
+impl Indexer {
+    /// Resolve `Auto` against the repo's project markers.
+    fn resolve(self, repo: &Path) -> Indexer {
+        if self != Indexer::Auto {
+            return self;
+        }
+        let has = |f: &str| repo.join(f).exists();
+        // Python markers win when both ecosystems are present — slop's
+        // parser-based rules are Python-only, so it's the richer target.
+        if has("pyproject.toml") || has("setup.py") || has("requirements.txt") || has_top_level_ext(repo, "py") {
+            Indexer::Python
+        } else if has("tsconfig.json") || has("package.json") {
+            Indexer::Typescript
+        } else {
+            Indexer::Python
+        }
+    }
+}
+
+/// Is there a top-level file with extension `ext` in `repo`? A cheap language
+/// signal for repos without config-file markers.
+fn has_top_level_ext(repo: &Path, ext: &str) -> bool {
+    std::fs::read_dir(repo)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                e.path().extension().and_then(|s| s.to_str()) == Some(ext)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Regenerate the SCIP index for `repo`, writing to `index` (default
+/// `<repo>/index.scip`). Used by `slop gate --reindex`; auto-detects the
+/// indexer.
 fn run_scip_index(repo: &Path, index: Option<&Path>) -> Result<()> {
     let out = index
         .map(Path::to_path_buf)
         .unwrap_or_else(|| repo.join("index.scip"));
-    run_scip_index_named(repo, &out, "slop-gate")
+    run_indexer(Indexer::Auto, repo, &out, "slop-gate")
 }
 
-/// Run `scip-python index` for `repo`, writing to `out` under `project`.
-fn run_scip_index_named(repo: &Path, out: &Path, project: &str) -> Result<()> {
-    let status = Process::new("npx")
-        .args(["--yes", "@sourcegraph/scip-python", "index"])
-        .arg(repo)
-        .args(["--project-name", project, "--output"])
-        .arg(out)
+/// Run the resolved SCIP indexer for `repo`, writing to `out`.
+fn run_indexer(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> Result<()> {
+    let indexer = indexer.resolve(repo);
+    let mut cmd = Process::new("npx");
+    cmd.arg("--yes");
+    match indexer {
+        Indexer::Python | Indexer::Auto => {
+            cmd.args(["@sourcegraph/scip-python", "index"])
+                .arg(repo)
+                .args(["--project-name", project, "--output"])
+                .arg(out);
+        }
+        Indexer::Typescript => {
+            // scip-typescript reads the project's tsconfig from its cwd and
+            // takes just an output path.
+            cmd.args(["@sourcegraph/scip-typescript", "index", "--output"])
+                .arg(out)
+                .current_dir(repo);
+        }
+    }
+    let tool = match indexer {
+        Indexer::Typescript => "scip-typescript",
+        _ => "scip-python",
+    };
+    let status = cmd
         .status()
-        .context("running scip-python (is npx on PATH?)")?;
+        .with_context(|| format!("running {tool} (is npx on PATH?)"))?;
     if !status.success() {
-        bail!("scip-python indexing failed for {}", repo.display());
+        bail!("{tool} indexing failed for {}", repo.display());
     }
     Ok(())
 }

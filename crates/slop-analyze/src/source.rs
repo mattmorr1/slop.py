@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use petgraph::graph::NodeIndex;
-use slop_parse::FunctionFacts;
+use slop_parse::{FunctionFacts, Language};
 
 use crate::build::BuiltGraph;
 
@@ -20,13 +20,15 @@ pub struct FileFacts {
 pub fn parse_repo(repo_root: &Path, files: &[&str]) -> Vec<FileFacts> {
     let mut all = Vec::new();
     for &file in files {
-        if !file.ends_with(".py") {
+        // No parser for this language => no parser-based facts (graph/effect
+        // detectors still cover the file via SCIP).
+        let Some(lang) = Language::from_path(file) else {
             continue;
-        }
+        };
         let Ok(source) = std::fs::read_to_string(repo_root.join(file)) else {
             continue;
         };
-        let Ok(functions) = slop_parse::analyze_file(&source) else {
+        let Ok(functions) = lang.parse(&source) else {
             continue;
         };
         all.push(FileFacts {

@@ -115,9 +115,14 @@ Full details, config, and the fix-loop shape: **[docs/harness.md](docs/harness.m
 
 ## Limitations
 
-- **Python only**, and dependent on a `scip-python` index — resolution is only
-  as good as the index (dynamic dispatch, `getattr`, duck typing can be missed).
-  The `Resolver` seam is designed so a native resolver can replace it later.
+- **Python is the fully-supported language.** The graph/effect detectors
+  (`infra-bypass`, `circular-import`, `dead-island`, `purity-lie`,
+  `effect-layer-violation`, `effect-creep`) work over *any* SCIP-indexed
+  language — `slop index` auto-selects `scip-python` or `scip-typescript`, and
+  the effect seed table has a JavaScript/Node starter set. The parser-based
+  rules (duplication, complexity, over-commenting) are Python-only for now (see
+  the `Language` seam in `slop-parse`). Resolution is only as good as the SCIP
+  index (dynamic dispatch, `getattr`, duck typing can be missed).
 - The read-path harness's **token wins are measured** (~−61% on dogfood repos);
   whether it preserves *output quality* is not yet rigorously proven.
 - `slop fix` renames are SCIP-*verified*, not behaviour-inert — dry-run and

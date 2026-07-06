@@ -12,6 +12,37 @@ use ruff_python_ast::{self as ast, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
+/// A source language slop can produce per-function facts for. The parser-based
+/// detectors (duplication, complexity, over-commenting) need a language-aware
+/// parser; the graph/effect detectors work over SCIP for *any* indexed
+/// language regardless of what's here. Adding a language = a new variant, an
+/// extension in [`Language::from_path`], and a parse arm — the rest of the
+/// pipeline is already language-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Language {
+    Python,
+}
+
+impl Language {
+    /// The language of a repo-relative path by extension, or `None` when no
+    /// parser exists for it (the file's graph/effect facts still come from
+    /// SCIP — only the parser-based facts are skipped).
+    pub fn from_path(path: &str) -> Option<Language> {
+        match path.rsplit('.').next() {
+            Some("py" | "pyi") => Some(Language::Python),
+            _ => None,
+        }
+    }
+
+    /// Per-function facts for `source` in this language.
+    pub fn parse(self, source: &str) -> Result<Vec<FunctionFacts>> {
+        match self {
+            Language::Python => analyze_file(source),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FunctionFacts {
     pub name: String,
