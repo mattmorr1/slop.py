@@ -214,9 +214,11 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
                 continue;
             };
             if redundant {
+                // Shape match corroborated by the judge — promote the
+                // candidate from Advisory to a Warning worth acting on.
+                f.severity = Severity::Warning;
                 f.message = format!("{} — confirmed by semantic review: {reason}", f.message);
             } else {
-                f.severity = Severity::Advisory;
                 f.message = format!(
                     "{} (unconfirmed — semantic review found a different purpose: {reason})",
                     f.message

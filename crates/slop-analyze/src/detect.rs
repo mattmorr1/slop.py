@@ -204,16 +204,43 @@ pub fn dead_island(
         if referenced {
             continue;
         }
+        // Methods are dispatched via a receiver (`obj.method()`), which SCIP
+        // routinely fails to resolve when the receiver type is dynamic — so an
+        // unreferenced method is a much weaker "dead" signal than an
+        // unreferenced free function (which is called by name). Downgrade
+        // methods to Advisory rather than emitting Warning-grade false
+        // positives (found dogfooding vigil: `TTLCache.set`, etc.).
+        let is_method = graph
+            .graph
+            .edges_directed(idx, Direction::Incoming)
+            .any(|e| {
+                *e.weight() == EdgeKind::Contains
+                    && graph.entity(e.source()).entity_type == NodeType::Class
+            });
+        let (severity, message) = if is_method {
+            (
+                Severity::Advisory,
+                format!(
+                    "`{}` has no resolved caller — possibly dead, but methods are often dispatched dynamically (SCIP can miss the call site)",
+                    entity.id
+                ),
+            )
+        } else {
+            (
+                Severity::Warning,
+                format!(
+                    "`{}` is never referenced anywhere in the codebase and is not a declared entry point",
+                    entity.id
+                ),
+            )
+        };
         findings.push(Finding {
             rule: "dead-island",
-            severity: Severity::Warning,
+            severity,
             entity: entity.id.clone(),
             file: entity.file.clone(),
             lines: entity.source_range,
-            message: format!(
-                "`{}` is never referenced anywhere in the codebase and is not a declared entry point",
-                entity.id
-            ),
+            message,
             fix_guidance: format!(
                 "Delete `{}`, or declare it in slop.toml `entry_points` if it is a public API",
                 entity.id
@@ -495,12 +522,17 @@ pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) 
         let peer_labels: Vec<&str> = group.peers.iter().map(|p| p.entity.as_str()).collect();
         findings.push(Finding {
             rule: "duplicate-structural",
-            severity: Severity::Warning,
+            // Advisory by default: a shape match is a *candidate*, not a
+            // confirmed duplicate — thin per-resource wrappers collide on
+            // control flow without being copy-paste (dogfooding vigil:
+            // `calculate_case_metrics` ~ `get_template`). `--tier3` promotes
+            // the ones its judge confirms to Warning (see check::run).
+            severity: Severity::Advisory,
             entity: group.canonical.entity.clone(),
             file: group.canonical.file.clone(),
             lines: group.canonical.lines,
             message: format!(
-                "`{}` is structurally identical to `{}` (same shape, renamed variables/literals)",
+                "`{}` is structurally identical to `{}` (same shape, renamed variables/literals) — candidate duplicate; confirm with --tier3",
                 group.canonical.entity,
                 peer_labels.join("`, `")
             ),
