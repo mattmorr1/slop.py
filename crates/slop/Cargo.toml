@@ -17,6 +17,7 @@ serde_json = { workspace = true }
 slop-analyze = { workspace = true }
 slop-graph = { workspace = true }
 slop-llm = { workspace = true }
+slop-lsp = { workspace = true }
 slop-mcp = { workspace = true }
 slop-proxy = { workspace = true }
 slop-resolve = { workspace = true }

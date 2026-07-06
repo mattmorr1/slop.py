@@ -183,6 +183,17 @@ enum Command {
         /// Which hook event this invocation handles
         event: HookEvent,
     },
+    /// Serve slop as a language server (LSP over stdio): publishes findings as
+    /// editor diagnostics on open/save. Editor-agnostic — point VS Code,
+    /// Neovim, Zed, or JetBrains at `slop lsp` (see editors/vscode for a shim).
+    Lsp {
+        /// Repo root the server analyzes (default: current directory)
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+        /// Path to index.scip (default: <repo>/index.scip)
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
     /// Serve slop's MCP tools (validate_change, get_context_envelope,
     /// query_subgraph) over stdio. Launched per-project by an agent host
     /// (e.g. Claude Code); speaks newline-delimited JSON-RPC 2.0.
@@ -545,6 +556,9 @@ fn main() -> Result<()> {
                 HookEvent::UserPromptSubmit => harness::handle_user_prompt_submit(&input),
             };
             println!("{output}");
+        }
+        Command::Lsp { repo, index } => {
+            slop_lsp::serve_stdio(repo, index)?;
         }
         Command::Mcp { repo, index } => {
             slop_mcp::serve_stdio(repo, index)?;
