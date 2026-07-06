@@ -61,6 +61,10 @@ enum Command {
         /// Edit-zone entity id (repeatable), e.g. `utils.dates::parse`
         #[arg(long = "edit")]
         edit: Vec<String>,
+        /// Edit-zone by file (repeatable): use every entity defined in this
+        /// repo-relative file as a locus — mirrors what the read hook does.
+        #[arg(long = "edit-file")]
+        edit_file: Vec<String>,
         /// Graph hops from the edit zone kept full-fidelity
         #[arg(long, default_value_t = 1)]
         hops: usize,
@@ -223,12 +227,21 @@ fn main() -> Result<()> {
             repo,
             file,
             index,
-            edit,
+            mut edit,
+            edit_file,
             hops,
             densify,
             stats,
         } => {
             let analysis = check::load_analysis(&repo, index.as_deref())?;
+            // Expand --edit-file into the entity ids defined in those files.
+            if !edit_file.is_empty() {
+                for (_, e) in analysis.built.graph.entities() {
+                    if edit_file.contains(&e.file) {
+                        edit.push(e.id.clone());
+                    }
+                }
+            }
             let source = std::fs::read_to_string(repo.join(&file))
                 .with_context(|| format!("reading {file}"))?;
 
