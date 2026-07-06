@@ -12,6 +12,18 @@ All of it reuses the same analysis engine `slop check` runs — no reimplementat
 
 Build the binary first: `cargo build --release` → `target/release/slop`.
 
+### Local LLM (Ollama)
+
+Anywhere slop needs an LLM it can use a local Ollama model instead of the
+Claude API — free, offline, no key:
+
+- **Tier-3 judging**: `SLOP_JUDGE=ollama slop check <repo> --tier3` (or via
+  `validate_change`). Selects the local backend; otherwise Claude is used.
+- **Skeleton densification**: `slop compress … --densify` adds a one-line
+  semantic summary above each skeleton (pure gain on undocumented functions).
+- Config: `OLLAMA_HOST` (default `http://localhost:11434`), `OLLAMA_MODEL`
+  (default `qwen2.5:1.5b`). Requires `ollama serve` running.
+
 ---
 
 ## 1. MCP tools
