@@ -73,8 +73,15 @@ fn event_loop(
                 Action::FixSelected => {
                     let before = snapshot(app);
                     let args = cmd_args(Cmd::FixApply, repo, index);
-                    let panel =
-                        suspend_fix_and_verify(terminal, exe.as_os_str(), &args, &exe, repo, index);
+                    let panel = suspend_fix_and_verify(
+                        terminal,
+                        exe.as_os_str(),
+                        &args,
+                        &exe,
+                        repo,
+                        index,
+                        false,
+                    );
                     reload(app, repo, index);
                     app.status =
                         Some(format!("mechanical fix — {}", delta(before, snapshot(app))));
@@ -96,6 +103,7 @@ fn event_loop(
                             &exe,
                             repo,
                             index,
+                            true, // ensure the context layer so claude sees slop's MCP + hooks
                         );
                         reload(app, repo, index);
                         app.status =
@@ -255,8 +263,15 @@ fn suspend_fix_and_verify(
     exe: &Path,
     repo: &Path,
     index: Option<&Path>,
+    install_first: bool,
 ) -> VerifyPanel {
     ratatui::restore();
+    // Make sure the context layer is wired so a headless `claude` sees slop's
+    // MCP tools + hooks (idempotent; only when not already installed).
+    if install_first && !context_layer_present(repo) {
+        println!("[slop] wiring the context layer (slop install)…");
+        let _ = Command::new(exe).arg("install").arg(repo).status();
+    }
     println!("\n$ {} {}\n", program.to_string_lossy(), args.join(" "));
     let _ = Command::new(program).args(args).current_dir(repo).status();
     println!("\n[slop] verifying (reindex + gate)…");
@@ -331,6 +346,14 @@ fn copy_to_clipboard(text: &str) -> bool {
         }
     }
     false
+}
+
+/// Is slop's MCP server already wired into the repo's `.mcp.json`? Cheap check
+/// so we only run `slop install` when the context layer is actually missing.
+fn context_layer_present(repo: &Path) -> bool {
+    std::fs::read_to_string(repo.join(".mcp.json"))
+        .map(|s| s.contains("\"slop\""))
+        .unwrap_or(false)
 }
 
 /// The project's test command, by ecosystem marker. `None` if we can't tell.

@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use slop_analyze::baseline::Baseline;
 use slop_analyze::check::{self, CheckRequest, CheckResult};
 use slop_analyze::findings::Severity;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use slop_analyze::compress::{self, CompressConfig};
 use slop_analyze::{detect, fix, gate, harness, infer, policy::Policy, rename, suppress};
@@ -100,6 +100,11 @@ enum Command {
         /// Apply changes to disk (default: report only)
         #[arg(long)]
         write: bool,
+        /// Also remove dead free functions (Warning `dead-island`). Opt-in even
+        /// with --write: deleting code is riskier than the comment/rename fixes
+        /// (SCIP can miss a dynamic caller), so review the dry-run first.
+        #[arg(long)]
+        remove_dead: bool,
     },
     /// Zoned graph-distance compression of a file (D11): full fidelity within
     /// --hops of the --edit loci, skeletons beyond. Prints the compressed
@@ -376,7 +381,7 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Fix { repo, index, write } => {
+        Command::Fix { repo, index, write, remove_dead } => {
             let analysis = check::load_analysis(&repo, index.as_deref())?;
             let policy = Policy::load(&repo).unwrap_or_default();
             let findings = detect::run_all(&analysis.built, &policy, &analysis.facts);
@@ -412,8 +417,39 @@ fn main() -> Result<()> {
                 }
             }
 
+            // Dead-code removal (opt-in). Runs after renames (which don't change
+            // line counts, so the parser's spans stay valid) and marks touched
+            // files so the over-commenting pass below skips them — its cached
+            // line numbers would be stale once whole functions are deleted.
+            let mut removed_fns = 0usize;
+            let mut dead_files: HashSet<String> = HashSet::new();
+            if remove_dead {
+                let removals = fix::plan_dead_removals(&analysis.built, &analysis.facts, &findings);
+                let mut by_file: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+                for r in &removals {
+                    let verb = if write { "remove" } else { "would remove" };
+                    println!("{verb} [dead-island] {} ({})", r.entity, r.file);
+                    by_file.entry(r.file.clone()).or_default().push(r.lines);
+                }
+                for (file, ranges) in by_file {
+                    dead_files.insert(file.clone());
+                    removed_fns += ranges.len();
+                    if write {
+                        let path = repo.join(&file);
+                        let src = std::fs::read_to_string(&path)
+                            .with_context(|| format!("reading {file}"))?;
+                        let new_src = fix::delete_line_ranges(&src, &ranges);
+                        std::fs::write(&path, &new_src)
+                            .with_context(|| format!("writing {file}"))?;
+                    }
+                }
+            }
+
             let mut by_file: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
             for f in findings.iter().filter(|f| f.rule == "over-commenting") {
+                if dead_files.contains(&f.file) {
+                    continue; // a dead-removal shifted this file's lines; skip
+                }
                 by_file.entry(f.file.clone()).or_default().push(f.lines);
             }
             let mut files: Vec<_> = by_file.into_iter().collect();
@@ -440,21 +476,26 @@ fn main() -> Result<()> {
                     println!("would fix {file}: {n} restating comment(s)");
                 }
             }
-            if total == 0 && renamed == 0 {
+            if total == 0 && renamed == 0 && removed_fns == 0 {
                 println!("nothing to fix");
             } else if write {
                 println!(
-                    "applied {renamed} rename(s); removed {total} comment(s) across {touched} file(s)"
+                    "applied {renamed} rename(s); removed {total} comment(s) across {touched} file(s); removed {removed_fns} dead function(s)"
                 );
-                if renamed > 0 {
+                if renamed > 0 || removed_fns > 0 {
                     println!(
-                        "note: renames changed references — re-index (e.g. `slop gate {} --reindex`) before the next check",
+                        "note: renames/removals changed the code — re-index (e.g. `slop gate {} --reindex`) before the next check",
                         repo.display()
                     );
                 }
             } else {
+                let tail = if remove_dead {
+                    format!(" + {removed_fns} dead function(s)")
+                } else {
+                    " (pass --remove-dead to also delete dead free functions)".to_string()
+                };
                 println!(
-                    "dry-run: {renamed} rename(s) + {total} comment(s) across {touched} file(s) — re-run with --write to apply"
+                    "dry-run: {renamed} rename(s) + {total} comment(s) across {touched} file(s){tail} — re-run with --write to apply"
                 );
             }
         }

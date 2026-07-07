@@ -10,6 +10,10 @@
 
 use std::collections::HashSet;
 
+use crate::build::BuiltGraph;
+use crate::findings::{Finding, Severity};
+use crate::source::{self, FileFacts};
+
 /// Common words that carry no restatement signal.
 const STOPWORDS: &[&str] = &[
     "the", "a", "an", "to", "of", "for", "and", "or", "is", "are", "this", "that", "it", "in",
@@ -111,9 +115,108 @@ pub fn fix_over_commenting(source: &str, ranges: &[(usize, usize)]) -> (String, 
     (out, remove.len())
 }
 
+/// A dead free function slated for removal: its 0-based inclusive line span
+/// (from the parser's `FunctionFacts`, which is 0-based and covers decorators).
+#[derive(Debug, Clone)]
+pub struct DeadRemoval {
+    pub file: String,
+    pub entity: String,
+    pub lines: (u32, u32),
+}
+
+/// Plan removals for `dead-island` findings. Only **Warning**-severity ones —
+/// i.e. free functions with no resolved caller and not an entry point. Methods
+/// stay Advisory (SCIP misses dynamic dispatch) and are never auto-removed. The
+/// span comes from the parser's `FunctionFacts` (covers decorators), joined to
+/// the finding by graph entity.
+pub fn plan_dead_removals(
+    built: &BuiltGraph,
+    facts: &[FileFacts],
+    findings: &[Finding],
+) -> Vec<DeadRemoval> {
+    let dead: HashSet<&str> = findings
+        .iter()
+        .filter(|f| f.rule == "dead-island" && f.severity == Severity::Warning)
+        .map(|f| f.entity.as_str())
+        .collect();
+    if dead.is_empty() {
+        return Vec::new();
+    }
+    let index = source::location_index(built);
+    let mut out = Vec::new();
+    for ff in facts {
+        for fact in &ff.functions {
+            let Some(entity) = source::entity_for(built, &index, &ff.file, fact) else {
+                continue;
+            };
+            if dead.contains(entity.id.as_str()) {
+                out.push(DeadRemoval {
+                    file: ff.file.clone(),
+                    entity: entity.id.clone(),
+                    lines: (fact.start_line, fact.end_line),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Delete the given **0-based** inclusive line ranges from `source`, then
+/// collapse any run of 3+ blank lines the deletion left behind to two blanks
+/// (PEP8 top-level spacing). Returns the rewritten source.
+pub fn delete_line_ranges(source: &str, ranges: &[(u32, u32)]) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let trailing_newline = source.ends_with('\n');
+    let mut remove: HashSet<usize> = HashSet::new();
+    for &(s, e) in ranges {
+        let start = s as usize;
+        let end = (e as usize).min(lines.len().saturating_sub(1));
+        for i in start..=end {
+            remove.insert(i);
+        }
+    }
+    let kept: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !remove.contains(i))
+        .map(|(_, l)| *l)
+        .collect();
+
+    // Collapse 3+ consecutive blanks (a removed function often leaves a gap).
+    let mut out_lines: Vec<&str> = Vec::with_capacity(kept.len());
+    let mut blanks = 0;
+    for l in kept {
+        if l.trim().is_empty() {
+            blanks += 1;
+            if blanks > 2 {
+                continue;
+            }
+        } else {
+            blanks = 0;
+        }
+        out_lines.push(l);
+    }
+    let mut out = out_lines.join("\n");
+    if trailing_newline {
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deletes_line_ranges_and_collapses_gap() {
+        let src = "def a():\n    pass\n\n\ndef dead():\n    pass\n\n\ndef b():\n    pass\n";
+        // Delete `dead` (lines 4-5, 0-based: `def dead():` + `    pass`).
+        let out = delete_line_ranges(src, &[(4, 5)]);
+        assert!(!out.contains("dead"), "{out}");
+        assert!(out.contains("def a") && out.contains("def b"));
+        // At most 2 blank lines (PEP8 spacing) — never a 3+ blank run.
+        assert!(!out.contains("\n\n\n\n"), "{out:?}");
+    }
 
     #[test]
     fn removes_pure_restatement() {
