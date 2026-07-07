@@ -182,6 +182,11 @@ pub fn dead_island(
         if entity.entity_type != NodeType::Function {
             continue;
         }
+        // Test files: doubles/mocks/fixtures are called dynamically by the test
+        // framework, invisible to SCIP — `dead-island` here is noise.
+        if crate::source::is_test_file(&entity.file) {
+            continue;
+        }
         if policy.is_entry_point(&entity.id) {
             continue;
         }
