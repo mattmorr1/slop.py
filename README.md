@@ -58,6 +58,15 @@ Findings are grouped by severity and colorized on a terminal (piping stays
 plain; `NO_COLOR` is honored). Every run ends with a **health score** (0–100),
 and `slop check` exits non-zero when anything is *Blocking*.
 
+### Interactive dashboard
+
+Run **`slop`** with no command in a terminal (or `slop dash [repo]`) to open a
+full-screen TUI: browse the whole-repo audit with the arrow keys, read each
+finding's fix guidance in a detail pane, filter by severity (`f`), toggle
+grandfathered findings (`g`), and reload in place (`r`). It shows health scored
+two ways — everything vs. only un-grandfathered — so a baselined repo doesn't
+look falsely pristine.
+
 ## What it flags
 
 | Rule | Severity | What it catches |

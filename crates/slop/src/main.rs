@@ -15,9 +15,10 @@ use slop_resolve::{Resolver, ScipResolver};
 
 #[derive(Parser)]
 #[command(name = "slop", about = "Codebase-relative AI-slop analyzer", version)]
+#[command(after_help = "Run `slop` with no command in a terminal to open the interactive dashboard.")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 /// Hook events slop can handle. Kebab-cased on the CLI by clap:
@@ -183,6 +184,18 @@ enum Command {
         /// Which hook event this invocation handles
         event: HookEvent,
     },
+    /// Open the interactive findings dashboard (full-screen TUI). Browse the
+    /// whole-repo audit with arrow keys, filter by severity, toggle
+    /// grandfathered findings, reload in place. Bare `slop` in a terminal opens
+    /// this on the current directory.
+    Dash {
+        /// Repo root (default: current directory)
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+        /// Path to index.scip (default: <repo>/index.scip)
+        #[arg(long)]
+        index: Option<PathBuf>,
+    },
     /// Serve slop as a language server (LSP over stdio): publishes findings as
     /// editor diagnostics on open/save. Editor-agnostic — point VS Code,
     /// Neovim, Zed, or JetBrains at `slop lsp` (see editors/vscode for a shim).
@@ -291,7 +304,21 @@ enum DebugCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    let Some(command) = cli.command else {
+        // Bare `slop`: open the dashboard in a terminal, else print help (so
+        // piping / CI still gets something useful instead of a raw-mode error).
+        if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+            return slop_tui::run(PathBuf::from("."), None);
+        }
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+    match command {
+        Command::Dash { repo, index } => {
+            slop_tui::run(repo, index)?;
+        }
         Command::Check {
             repo,
             index,
