@@ -100,7 +100,52 @@ effect, not the last pilot's null. The baseline *never* reuses the channel (it
 can't; it doesn't know it exists); the harness makes reuse happen. This is the
 first statistically-significant evidence for the steering claim.
 
-**Caveats.** One task, one tiny model, N=20. A 1.5B still reaches for raw net
+## `function_ab.py` — implement-a-function A/B (local ollama)
+
+Extends the additions test to *implementing a function body* with a local model,
+grading parse/adherence and materializing each arm on a git branch/worktree to
+diff. **Known confound:** arm A is handed the full channel file while arm B gets
+the compressed skeleton + steering, so it entangles "more context" with
+"steering." Kept as a local (no-API) harness; for a *clean* steering result use
+`proxy_ab.py`. Instructive finding: given the full file, even an 8B reuses the
+channel unprompted — the harness's value is surfacing it *without* the dump.
+
+## `proxy_ab.py` — steering A/B through `slop proxy` (real Anthropic API)
+
+The cleanest steering test: the same message-creation request sent through two
+proxies whose *only* difference is `--steer`, so there's no context confound.
+Tokens come from the proxy's own usage log (real, not estimated). Needs
+`ANTHROPIC_API_KEY` and a `<repo>/slop.toml` naming the sanctioned channel.
+
+```
+cargo build --release
+ANTHROPIC_API_KEY=... python3 bench/proxy_ab.py [N] [model] [repo]
+```
+
+### Result (2026-07-06, vigil DB channel, claude-haiku-4-5, N=3/arm)
+
+| | A (steer off) | B (steer on) |
+| --- | ---: | ---: |
+| sanctioned DB channel | 0% | **100%** |
+| input tokens (mean) | 74 | 110 (+36) |
+| output tokens (mean) | 98 | 102 |
+
+Without steering, Haiku **hallucinated** infra vigil doesn't have
+(`django.apps.get_model('security','Finding')` — vigil isn't Django); with 36
+tokens of steering it reused the real `database.service.DatabaseService`. A
+capable model absent context doesn't reach for raw SQL — it invents a
+plausible-but-wrong framework, which is exactly the slop the harness prevents.
+
+**Caveats.** One task, N=3, a syntactic adherence proxy. Steered Claude reused
+the right *class* but guessed the method (`query_findings` vs the real
+`get_findings`) — surfacing the signature is the MCP `query_subgraph` tool's job,
+which a one-shot proxy request can't call. vigil has no auto-inferable *net*
+channel (its ~20 `tools/` integrations each use raw httpx — infra-bypass at
+scale); the DB channel policy was hand-authored for this run.
+
+## Steering pilot caveats (steering_ab.py)
+
+One task, one tiny model, N=20. A 1.5B still reaches for raw net
 70% of the time even handed the interface — so the harness *shifts* behaviour
 but a weak model caps the ceiling low; the effect should grow with model
 capability. Adherence is scored by a syntactic proxy (which import/type the new
