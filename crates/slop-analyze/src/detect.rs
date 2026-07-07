@@ -425,6 +425,13 @@ pub fn purity_lie(built: &BuiltGraph) -> Vec<Finding> {
 const COMPLEXITY_THRESHOLD: u32 = 10;
 const NESTING_THRESHOLD: u32 = 4;
 const BRANCH_THRESHOLD: u32 = 12;
+/// A structural shape shared by more than this many functions is a codebase
+/// convention (plugin/registry/handler boilerplate — every entry has the same
+/// control flow *by design*), not a copy-paste worth unifying. Flagging it just
+/// points at N siblings nobody will merge, so `duplicate-structural` skips such
+/// families (dogfooding vigil: ~20 MCP tools share one `handle_list_tools`
+/// shape).
+const CONVENTION_FAMILY_MAX: usize = 8;
 
 /// Entity label for a parsed function: the graph node's ID when the join
 /// succeeds, a file-derived fallback otherwise.
@@ -517,7 +524,10 @@ fn shape_groups(members: &[Member]) -> Vec<StructuralGroup> {
         by_shape.entry(m.structural_hash.as_str()).or_default().push(i);
     }
     let mut groups = Vec::new();
-    for group in by_shape.values().filter(|g| g.len() > 1) {
+    for group in by_shape
+        .values()
+        .filter(|g| g.len() > 1 && g.len() <= CONVENTION_FAMILY_MAX)
+    {
         let distinct_bodies: std::collections::HashSet<&str> =
             group.iter().map(|&i| members[i].body_hash.as_str()).collect();
         if distinct_bodies.len() < 2 {
@@ -551,7 +561,18 @@ fn shape_groups(members: &[Member]) -> Vec<StructuralGroup> {
 /// `duplicate-structural` below for why that call can't be made on tokens
 /// alone).
 pub fn structural_duplicate_groups(built: &BuiltGraph, facts: &[crate::source::FileFacts]) -> Vec<StructuralGroup> {
-    shape_groups(&collect_members(built, facts))
+    let members = dedup_members(built, facts);
+    shape_groups(&members)
+}
+
+/// Members eligible for duplication analysis: exclude test files (parameterized
+/// test cases and shared setup converge on the same shape/body by design — not
+/// slop worth unifying).
+fn dedup_members(built: &BuiltGraph, facts: &[crate::source::FileFacts]) -> Vec<Member> {
+    collect_members(built, facts)
+        .into_iter()
+        .filter(|m| !crate::source::is_test_file(&m.file))
+        .collect()
 }
 
 /// Tier-1 (exact) and Tier-2 (structural) duplication, complexity spikes,
@@ -615,7 +636,7 @@ pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) 
         }
     }
 
-    let members = collect_members(built, facts);
+    let members = dedup_members(built, facts);
 
     // Tier-1: identical bodies. One finding per exact-duplicate set.
     let mut by_body: HashMap<&str, Vec<usize>> = HashMap::new();
@@ -758,6 +779,33 @@ mod tests {
             effects.insert(id.to_string(), es.iter().map(|s| s.to_string()).collect());
         }
         Baseline { version: 1, findings: vec![], effects }
+    }
+
+    fn member(label: &str, shape: &str, body: &str) -> Member {
+        Member {
+            label: label.into(),
+            file: "m.py".into(),
+            lines: (0, 1),
+            body_hash: body.into(),
+            structural_hash: shape.into(),
+            docstring: None,
+        }
+    }
+
+    #[test]
+    fn large_shape_family_is_a_convention_not_a_duplicate() {
+        let mut members = Vec::new();
+        // A shape shared by 9 functions (> CONVENTION_FAMILY_MAX) — boilerplate.
+        for i in 0..9 {
+            members.push(member(&format!("big::f{i}"), "S", &format!("b{i}")));
+        }
+        // A shape shared by 3 — a real candidate.
+        for i in 0..3 {
+            members.push(member(&format!("small::g{i}"), "T", &format!("c{i}")));
+        }
+        let groups = shape_groups(&members);
+        assert_eq!(groups.len(), 1, "large family should be suppressed");
+        assert!(groups[0].canonical.entity.starts_with("small::"));
     }
 
     #[test]
