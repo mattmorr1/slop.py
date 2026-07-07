@@ -14,11 +14,19 @@ pub struct BuiltGraph {
     pub graph: CodeGraph,
     /// SCIP symbol -> node, for detectors that start from a symbol.
     pub by_symbol: HashMap<String, NodeIndex>,
+    /// Entities with at least one *reference* occurrence anywhere in the repo
+    /// (not just a call from within a function). Broader than incoming `Calls`
+    /// edges: it also catches a function passed to `Depends(...)`, used as a
+    /// decorator, or listed in `__all__` at module scope — references SCIP
+    /// records but the graph doesn't turn into a `Calls` edge (no enclosing
+    /// function). `dead-island` consults this so those aren't false positives.
+    pub referenced: std::collections::HashSet<NodeIndex>,
 }
 
 pub fn build_graph(resolver: &dyn Resolver) -> BuiltGraph {
     let mut graph = CodeGraph::new();
     let mut by_symbol: HashMap<String, NodeIndex> = HashMap::new();
+    let mut referenced: std::collections::HashSet<NodeIndex> = std::collections::HashSet::new();
 
     // Pass 1: nodes. One Module node per file, one node per class/function
     // definition. Scopes (definition + body range) drive pass-2 attribution.
@@ -142,10 +150,7 @@ pub fn build_graph(resolver: &dyn Resolver) -> BuiltGraph {
                 if kind == SymbolKind::Term && !def.is_external() {
                     continue;
                 }
-                let from = match enclosing(occ.range.start_line, occ.range.start_col, None) {
-                    Some(n) => n,
-                    None => continue,
-                };
+                let internal = by_symbol.contains_key(&occ.symbol);
                 let to = match by_symbol.get(&occ.symbol) {
                     Some(&idx) => idx,
                     None => {
@@ -171,6 +176,18 @@ pub fn build_graph(resolver: &dyn Resolver) -> BuiltGraph {
                         idx
                     }
                 };
+                let from_opt = enclosing(occ.range.start_line, occ.range.start_col, None);
+                // "Referenced anywhere": any internal reference that isn't the
+                // symbol referring to itself (recursion). Includes module-level
+                // references with no enclosing function — the ones that would
+                // otherwise produce no `Calls` edge and look dead.
+                if internal && from_opt != Some(to) {
+                    referenced.insert(to);
+                }
+                let from = match from_opt {
+                    Some(n) => n,
+                    None => continue,
+                };
                 if from == to {
                     continue;
                 }
@@ -191,5 +208,5 @@ pub fn build_graph(resolver: &dyn Resolver) -> BuiltGraph {
         }
     }
 
-    BuiltGraph { graph, by_symbol }
+    BuiltGraph { graph, by_symbol, referenced }
 }

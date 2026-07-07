@@ -202,10 +202,15 @@ pub fn dead_island(
         if framework_method {
             continue;
         }
-        let referenced = graph
-            .graph
-            .edges_directed(idx, Direction::Incoming)
-            .any(|e| *e.weight() == EdgeKind::Calls);
+        // Referenced anywhere in the repo — a Calls edge, or any other
+        // reference SCIP recorded (passed to `Depends(...)`, used as a
+        // decorator, exported in `__all__`, imported). The latter catches
+        // framework-registered functions that have no in-function call site.
+        let referenced = built.referenced.contains(&idx)
+            || graph
+                .graph
+                .edges_directed(idx, Direction::Incoming)
+                .any(|e| *e.weight() == EdgeKind::Calls);
         if referenced {
             continue;
         }
@@ -770,7 +775,7 @@ mod tests {
         for e in entities {
             graph.add_entity(e);
         }
-        BuiltGraph { graph, by_symbol: HashMap::new() }
+        BuiltGraph { graph, by_symbol: HashMap::new(), referenced: Default::default() }
     }
 
     fn baseline_effects(pairs: &[(&str, &[&str])]) -> Baseline {
@@ -790,6 +795,24 @@ mod tests {
             structural_hash: shape.into(),
             docstring: None,
         }
+    }
+
+    #[test]
+    fn referenced_anywhere_spares_dead_island() {
+        // Two free functions, neither with a Calls edge; one is marked
+        // referenced (as a module-level use — Depends/decorator/__all__ would
+        // land here). Only the truly-unreferenced one is dead.
+        let mut built = built_with(vec![func("m::used", &[]), func("m::dead", &[])]);
+        let used = built.graph.node("m::used").expect("node");
+        built.referenced.insert(used);
+        let findings = dead_island(&built, &Policy::default(), &Default::default());
+        let dead: Vec<&str> = findings
+            .iter()
+            .filter(|f| f.rule == "dead-island")
+            .map(|f| f.entity.as_str())
+            .collect();
+        assert!(dead.contains(&"m::dead"), "unreferenced fn should be dead");
+        assert!(!dead.contains(&"m::used"), "referenced fn must be spared");
     }
 
     #[test]
