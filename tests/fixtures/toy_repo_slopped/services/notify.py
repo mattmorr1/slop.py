@@ -9,3 +9,4 @@ def send_notification(message: str) -> None:
 
 def notify_with_report(rows: list) -> None:
     send_notification(build_report(rows))
+
