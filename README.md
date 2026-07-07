@@ -61,11 +61,22 @@ and `slop check` exits non-zero when anything is *Blocking*.
 ### Interactive dashboard
 
 Run **`slop`** with no command in a terminal (or `slop dash [repo]`) to open a
-full-screen TUI: browse the whole-repo audit with the arrow keys, read each
-finding's fix guidance in a detail pane, filter by severity (`f`), toggle
-grandfathered findings (`g`), and reload in place (`r`). It shows health scored
-two ways — everything vs. only un-grandfathered — so a baselined repo doesn't
-look falsely pristine.
+full-screen TUI. It's the control surface for everything else:
+
+- browse the whole-repo audit with the arrow keys; each finding's fix guidance
+  shows in a detail pane
+- **`Enter`** opens the selected finding in your editor at its line
+  (`$SLOP_EDITOR`, else `cursor`/`code`)
+- **`x`** applies the mechanical repair when the finding is auto-fixable
+  (over-commenting / naming); otherwise it points you at the guidance
+- **`c`** opens a command palette to run any slop command — re-index, check,
+  fix, baseline, init policy, install harness, gate — after which the dashboard
+  reloads, so you watch the findings clear (the verification loop)
+- **`f`** filters by severity, **`g`** toggles grandfathered findings, **`r`**
+  reloads
+
+Health is scored two ways — everything vs. only un-grandfathered — so a
+baselined repo doesn't look falsely pristine.
 
 ## What it flags
 

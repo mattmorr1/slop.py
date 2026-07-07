@@ -1,15 +1,16 @@
 //! Rendering: turn `App` state into a ratatui frame. Pure drawing — all the
 //! decision logic lives in `app`. Layout: a header band, a findings list beside
-//! a detail pane, and a footer of key hints.
+//! a detail pane, a status line, and a footer of key hints. The command palette
+//! renders as a centered overlay when open.
 
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use slop_analyze::findings::Severity;
 
-use crate::app::App;
+use crate::app::{App, Cmd, Mode};
 
 fn severity_color(sev: Severity) -> Color {
     match sev {
@@ -28,9 +29,10 @@ fn severity_tag(sev: Severity) -> &'static str {
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let [header, body, footer] = Layout::vertical([
+    let [header, body, status, footer] = Layout::vertical([
         Constraint::Length(6),
         Constraint::Min(0),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -40,16 +42,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_header(frame, header, app);
     draw_list(frame, list_area, app);
     draw_detail(frame, detail_area, app);
-    frame.render_widget(
-        Line::from(
-            " ↑/↓ move · f filter · g grandfathered · r reload · q quit",
-        )
-        .style(Style::new().add_modifier(Modifier::DIM)),
-        footer,
-    );
+    draw_status(frame, status, app);
+    draw_footer(frame, footer, app);
+
+    if app.mode == Mode::Palette {
+        draw_palette(frame, body, app);
+    }
 }
 
-fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let (total, b, w, a) = app.counts();
     let mut lines = vec![
         Line::from(vec![
@@ -76,12 +77,10 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         )),
     ];
     if app.policy_is_empty {
-        lines.push(Line::from(
-            Span::styled(
-                "no slop.toml — infra-bypass checks silent (run `slop init`)",
-                Style::new().fg(Color::DarkGray),
-            ),
-        ));
+        lines.push(Line::from(Span::styled(
+            "no slop.toml — infra-bypass checks silent (press c → init policy)",
+            Style::new().fg(Color::DarkGray),
+        )));
     }
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(Block::bordered()),
@@ -89,7 +88,7 @@ fn draw_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     );
 }
 
-fn draw_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn draw_list(frame: &mut Frame, area: Rect, app: &App) {
     let visible = app.visible();
     let block = Block::bordered().title(format!(" findings ({}) ", visible.len()));
     if visible.is_empty() {
@@ -132,22 +131,16 @@ fn draw_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::bordered().title(" detail ");
     let Some(f) = app.selected_finding() else {
-        frame.render_widget(
-            Paragraph::new("nothing selected").block(block),
-            area,
-        );
+        frame.render_widget(Paragraph::new("nothing selected").block(block), area);
         return;
     };
     let sev = f.finding.severity;
     let mut lines = vec![
         Line::from(vec![
-            Span::styled(
-                severity_tag(sev),
-                Style::new().fg(severity_color(sev)).bold(),
-            ),
+            Span::styled(severity_tag(sev), Style::new().fg(severity_color(sev)).bold()),
             Span::raw("  "),
             Span::styled(f.finding.rule, Style::new().bold()),
         ]),
@@ -160,6 +153,18 @@ fn draw_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     if f.grandfathered {
         lines.push(Line::from(Span::styled(
             "grandfathered by baseline (not counted in `new` health)",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    // Fixability hint.
+    if crate::app::is_mechanical(f.finding.rule) {
+        lines.push(Line::from(Span::styled(
+            "auto-fixable — press x to apply the mechanical repair",
+            Style::new().fg(Color::Green),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "manual fix — press Enter to open in your editor",
             Style::new().fg(Color::DarkGray),
         )));
     }
@@ -176,4 +181,50 @@ fn draw_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
+    if let Some(msg) = &app.status {
+        frame.render_widget(
+            Line::from(format!(" {msg}")).style(Style::new().fg(Color::Cyan)),
+            area,
+        );
+    }
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let hint = match app.mode {
+        Mode::Palette => "↑/↓ move · enter run · esc cancel",
+        Mode::Normal => {
+            " ↑/↓ move · enter open · x fix · c commands · f filter · g grandfathered · r reload · q quit"
+        }
+    };
+    frame.render_widget(
+        Line::from(hint).style(Style::new().add_modifier(Modifier::DIM)),
+        area,
+    );
+}
+
+fn draw_palette(frame: &mut Frame, area: Rect, app: &App) {
+    // Centered overlay sized to the command list.
+    let height = (Cmd::ALL.len() as u16) + 2;
+    let [v] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [popup] = Layout::horizontal([Constraint::Percentage(70)])
+        .flex(Flex::Center)
+        .areas(v);
+
+    let items: Vec<ListItem> = Cmd::ALL
+        .iter()
+        .map(|c| ListItem::new(Line::from(c.label())))
+        .collect();
+    let list = List::new(items)
+        .block(Block::bordered().title(" run a command "))
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▸ ");
+    let mut state = ListState::default();
+    state.select(Some(app.palette_selected));
+    frame.render_widget(Clear, popup); // clear what's underneath
+    frame.render_stateful_widget(list, popup, &mut state);
 }

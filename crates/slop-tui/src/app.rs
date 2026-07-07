@@ -1,12 +1,62 @@
 //! Dashboard state and key-driven transitions — the testable core of the TUI.
-//! No terminal or ratatui here: `on_key` mutates state (or asks the run loop to
-//! reload/quit), and `visible` derives the filtered finding list the renderer
-//! draws. This is what the headless tests exercise; only `ui`/`lib` need a
-//! terminal.
+//! No terminal or ratatui here: `on_key` mutates state and returns an `Action`
+//! the run loop performs (open in IDE, run a slop command, reload, quit).
+//! `visible` derives the filtered finding list the renderer draws. This is what
+//! the headless tests exercise; only `ui`/`lib` need a terminal.
 
 use crossterm::event::KeyCode;
 use slop_analyze::check::{AuditFinding, AuditResult};
 use slop_analyze::findings::Severity;
+
+/// Rules `slop fix` can repair mechanically (behaviour-safe comment deletion and
+/// SCIP-verified renames). Everything else is manual — the finding carries
+/// guidance instead.
+pub const MECHANICAL_RULES: &[&str] = &["over-commenting", "naming-convention"];
+
+pub fn is_mechanical(rule: &str) -> bool {
+    MECHANICAL_RULES.contains(&rule)
+}
+
+/// A slop command runnable from the dashboard's palette. The run loop maps each
+/// to a real invocation and reloads the audit afterward (the verification loop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cmd {
+    Reindex,
+    Check,
+    InitPolicy,
+    Baseline,
+    FixDry,
+    FixApply,
+    Install,
+    Gate,
+}
+
+impl Cmd {
+    /// Palette order.
+    pub const ALL: [Cmd; 8] = [
+        Cmd::Reindex,
+        Cmd::Check,
+        Cmd::FixDry,
+        Cmd::FixApply,
+        Cmd::Baseline,
+        Cmd::InitPolicy,
+        Cmd::Install,
+        Cmd::Gate,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Cmd::Reindex => "re-index          regenerate the SCIP index",
+            Cmd::Check => "check             judge the working-tree diff",
+            Cmd::FixDry => "fix (dry-run)     preview mechanical repairs",
+            Cmd::FixApply => "fix (apply)       write mechanical repairs",
+            Cmd::Baseline => "baseline          grandfather current findings",
+            Cmd::InitPolicy => "init policy       infer + write slop.toml",
+            Cmd::Install => "install harness   wire MCP + hooks into the repo",
+            Cmd::Gate => "gate              CI-style pass/fail verdict",
+        }
+    }
+}
 
 /// Which severities the list shows. Cycled with `f`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -23,7 +73,6 @@ impl Filter {
         }
     }
 
-    /// All → Blocking → Warning → Advisory → All.
     fn next(self) -> Filter {
         match self {
             Filter::All => Filter::Only(Severity::Blocking),
@@ -43,12 +92,26 @@ impl Filter {
     }
 }
 
+/// Normal browsing vs the command palette overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    Palette,
+}
+
 /// What a key press asks the run loop to do after state is updated.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     None,
     Quit,
     Reload,
+    /// Open the selected finding's file at its line in the IDE.
+    OpenSelected,
+    /// Apply the mechanical fix for the selected finding (run loop confirms it
+    /// really is mechanical).
+    FixSelected,
+    /// Run a palette command, then reload.
+    RunCommand(Cmd),
 }
 
 pub struct App {
@@ -60,11 +123,12 @@ pub struct App {
     pub policy_is_empty: bool,
     /// Index into the *visible* (filtered) list.
     pub selected: usize,
-    /// Include grandfathered findings in the list (toggle `g`). Default on: the
-    /// dashboard is for exploring the whole repo, and grandfathered rows are
-    /// marked, not hidden — the opposite of `slop check`'s silent drop.
     pub show_grandfathered: bool,
     pub filter: Filter,
+    pub mode: Mode,
+    pub palette_selected: usize,
+    /// One-line result of the last action, shown in the status bar.
+    pub status: Option<String>,
 }
 
 impl App {
@@ -79,12 +143,15 @@ impl App {
             selected: 0,
             show_grandfathered: true,
             filter: Filter::All,
+            mode: Mode::Normal,
+            palette_selected: 0,
+            status: None,
         };
         app.set_result(result);
         app
     }
 
-    /// Replace the findings (e.g. after a reload), keeping the view settings and
+    /// Replace the findings (e.g. after a reload), keeping view settings and
     /// clamping the selection into the new list.
     pub fn set_result(&mut self, result: AuditResult) {
         self.findings = result.findings;
@@ -95,8 +162,6 @@ impl App {
         self.clamp();
     }
 
-    /// The findings currently shown, honoring the grandfathered toggle and the
-    /// severity filter. Order is `audit`'s (most-severe first).
     pub fn visible(&self) -> Vec<&AuditFinding> {
         self.findings
             .iter()
@@ -109,8 +174,13 @@ impl App {
         self.visible().into_iter().nth(self.selected)
     }
 
-    /// Total findings and per-severity counts over the *whole* set (not the
-    /// filtered view) — the header summary.
+    /// Is the selected finding mechanically fixable?
+    pub fn selected_is_mechanical(&self) -> bool {
+        self.selected_finding()
+            .map(|f| is_mechanical(f.finding.rule))
+            .unwrap_or(false)
+    }
+
     pub fn counts(&self) -> (usize, usize, usize, usize) {
         let mut b = 0;
         let mut w = 0;
@@ -125,26 +195,93 @@ impl App {
         (self.findings.len(), b, w, a)
     }
 
-    /// Handle a key; returns what the run loop should do next.
     pub fn on_key(&mut self, key: KeyCode) -> Action {
+        match self.mode {
+            Mode::Palette => self.on_key_palette(key),
+            Mode::Normal => self.on_key_normal(key),
+        }
+    }
+
+    fn on_key_normal(&mut self, key: KeyCode) -> Action {
         match key {
-            KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
-            KeyCode::Char('r') => return Action::Reload,
-            KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
-            KeyCode::Home => self.selected = 0,
-            KeyCode::End => self.selected = self.visible().len().saturating_sub(1),
+            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            KeyCode::Char('r') => Action::Reload,
+            KeyCode::Char('c') => {
+                self.mode = Mode::Palette;
+                self.palette_selected = 0;
+                Action::None
+            }
+            KeyCode::Enter => {
+                if self.selected_finding().is_some() {
+                    Action::OpenSelected
+                } else {
+                    Action::None
+                }
+            }
+            KeyCode::Char('x') => {
+                match self.selected_finding() {
+                    Some(f) if is_mechanical(f.finding.rule) => Action::FixSelected,
+                    Some(f) => {
+                        self.status = Some(format!(
+                            "{} isn't auto-fixable — press Enter to open it and follow the fix guidance",
+                            f.finding.rule
+                        ));
+                        Action::None
+                    }
+                    None => Action::None,
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_by(1);
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_by(-1);
+                Action::None
+            }
+            KeyCode::Home => {
+                self.selected = 0;
+                Action::None
+            }
+            KeyCode::End => {
+                self.selected = self.visible().len().saturating_sub(1);
+                Action::None
+            }
             KeyCode::Char('g') => {
                 self.show_grandfathered = !self.show_grandfathered;
                 self.clamp();
+                Action::None
             }
             KeyCode::Char('f') => {
                 self.filter = self.filter.next();
                 self.clamp();
+                Action::None
             }
-            _ => {}
+            _ => Action::None,
         }
-        Action::None
+    }
+
+    fn on_key_palette(&mut self, key: KeyCode) -> Action {
+        match key {
+            KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('q') => {
+                self.mode = Mode::Normal;
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.palette_selected = (self.palette_selected + 1).min(Cmd::ALL.len() - 1);
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.palette_selected = self.palette_selected.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Enter => {
+                let cmd = Cmd::ALL[self.palette_selected];
+                self.mode = Mode::Normal;
+                Action::RunCommand(cmd)
+            }
+            _ => Action::None,
+        }
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -160,7 +297,6 @@ impl App {
         };
     }
 
-    /// Keep `selected` inside the current visible list.
     fn clamp(&mut self) {
         let len = self.visible().len();
         if len == 0 {
@@ -212,12 +348,11 @@ mod tests {
             (finding("a", Severity::Blocking, "x"), false),
             (finding("b", Severity::Warning, "y"), false),
         ]);
-        assert_eq!(app.selected, 0);
-        app.on_key(KeyCode::Up); // already at top
+        app.on_key(KeyCode::Up);
         assert_eq!(app.selected, 0);
         app.on_key(KeyCode::Down);
         assert_eq!(app.selected, 1);
-        app.on_key(KeyCode::Down); // past the end
+        app.on_key(KeyCode::Down);
         assert_eq!(app.selected, 1);
     }
 
@@ -227,12 +362,12 @@ mod tests {
             (finding("a", Severity::Blocking, "x"), false),
             (finding("b", Severity::Warning, "y"), true),
         ]);
-        assert_eq!(app.visible().len(), 2); // default shows grandfathered
-        app.on_key(KeyCode::End); // select last (the grandfathered one)
+        assert_eq!(app.visible().len(), 2);
+        app.on_key(KeyCode::End);
         assert_eq!(app.selected, 1);
-        app.on_key(KeyCode::Char('g')); // hide grandfathered
+        app.on_key(KeyCode::Char('g'));
         assert_eq!(app.visible().len(), 1);
-        assert_eq!(app.selected, 0); // reclamped
+        assert_eq!(app.selected, 0);
     }
 
     #[test]
@@ -242,17 +377,46 @@ mod tests {
             (finding("b", Severity::Warning, "y"), false),
             (finding("c", Severity::Advisory, "z"), false),
         ]);
-        app.on_key(KeyCode::Char('f')); // -> blocking only
+        app.on_key(KeyCode::Char('f'));
         assert_eq!(app.filter.label(), "blocking");
         assert_eq!(app.visible().len(), 1);
         assert_eq!(app.selected_finding().unwrap().finding.rule, "a");
     }
 
     #[test]
-    fn q_quits_r_reloads() {
+    fn enter_opens_and_q_quits() {
         let mut app = app_with(vec![(finding("a", Severity::Blocking, "x"), false)]);
-        assert_eq!(app.on_key(KeyCode::Char('r')), Action::Reload);
+        assert_eq!(app.on_key(KeyCode::Enter), Action::OpenSelected);
         assert_eq!(app.on_key(KeyCode::Char('q')), Action::Quit);
+    }
+
+    #[test]
+    fn x_fixes_mechanical_but_only_advises_on_manual() {
+        // over-commenting is mechanical -> FixSelected
+        let mut mech = app_with(vec![(finding("over-commenting", Severity::Advisory, "x"), false)]);
+        assert_eq!(mech.on_key(KeyCode::Char('x')), Action::FixSelected);
+        // infra-bypass is manual -> no action, but a status hint is set
+        let mut manual = app_with(vec![(finding("infra-bypass", Severity::Blocking, "y"), false)]);
+        assert_eq!(manual.on_key(KeyCode::Char('x')), Action::None);
+        assert!(manual.status.as_ref().unwrap().contains("isn't auto-fixable"));
+    }
+
+    #[test]
+    fn palette_opens_navigates_and_runs() {
+        let mut app = app_with(vec![(finding("a", Severity::Blocking, "x"), false)]);
+        assert_eq!(app.on_key(KeyCode::Char('c')), Action::None);
+        assert_eq!(app.mode, Mode::Palette);
+        app.on_key(KeyCode::Down); // move to second command (Check)
+        assert_eq!(app.on_key(KeyCode::Enter), Action::RunCommand(Cmd::Check));
+        assert_eq!(app.mode, Mode::Normal); // palette closed
+    }
+
+    #[test]
+    fn palette_esc_cancels_without_running() {
+        let mut app = app_with(vec![(finding("a", Severity::Blocking, "x"), false)]);
+        app.on_key(KeyCode::Char('c'));
+        assert_eq!(app.on_key(KeyCode::Esc), Action::None);
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]
@@ -261,7 +425,7 @@ mod tests {
             (finding("a", Severity::Blocking, "x"), false),
             (finding("b", Severity::Warning, "y"), false),
         ]);
-        app.on_key(KeyCode::Char('f')); // filter to blocking only
-        assert_eq!(app.counts(), (2, 1, 1, 0)); // still counts both
+        app.on_key(KeyCode::Char('f'));
+        assert_eq!(app.counts(), (2, 1, 1, 0));
     }
 }
