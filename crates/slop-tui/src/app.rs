@@ -30,11 +30,12 @@ pub enum Cmd {
     FixApply,
     Install,
     Gate,
+    Test,
 }
 
 impl Cmd {
     /// Palette order.
-    pub const ALL: [Cmd; 8] = [
+    pub const ALL: [Cmd; 9] = [
         Cmd::Reindex,
         Cmd::Check,
         Cmd::FixDry,
@@ -43,6 +44,7 @@ impl Cmd {
         Cmd::InitPolicy,
         Cmd::Install,
         Cmd::Gate,
+        Cmd::Test,
     ];
 
     pub fn label(self) -> &'static str {
@@ -55,8 +57,16 @@ impl Cmd {
             Cmd::InitPolicy => "init policy       infer + write slop.toml",
             Cmd::Install => "install harness   wire MCP + hooks into the repo",
             Cmd::Gate => "gate              CI-style pass/fail verdict",
+            Cmd::Test => "run tests         the project's test suite (pytest / npm)",
         }
     }
+}
+
+/// The parsed outcome of a `v`erification run, shown as an overlay panel.
+#[derive(Debug, Clone)]
+pub struct VerifyPanel {
+    pub passed: bool,
+    pub lines: Vec<String>,
 }
 
 /// Which severities the list shows. Cycled with `f`.
@@ -99,6 +109,7 @@ pub enum Mode {
     Normal,
     Palette,
     Explorer,
+    Verify,
 }
 
 /// What a key press asks the run loop to do after state is updated.
@@ -117,6 +128,8 @@ pub enum Action {
     /// Load the 1-hop subgraph for this entity into the explorer (the run loop
     /// holds the graph and computes it, then calls `set_explorer_subgraph`).
     Explore(String),
+    /// Run `slop gate` and show the pass/fail verdict as a panel.
+    Verify,
 }
 
 pub struct App {
@@ -139,6 +152,8 @@ pub struct App {
     pub explorer: Option<Subgraph>,
     pub explorer_selected: usize,
     pub explorer_stack: Vec<String>,
+    /// The verification verdict overlay (set by the run loop after `v`).
+    pub verify: Option<VerifyPanel>,
 }
 
 impl App {
@@ -159,6 +174,7 @@ impl App {
             explorer: None,
             explorer_selected: 0,
             explorer_stack: Vec::new(),
+            verify: None,
         };
         app.set_result(result);
         app
@@ -223,10 +239,22 @@ impl App {
         self.explorer_selected = 0;
     }
 
+    /// Show the verification verdict the run loop parsed from `slop gate`.
+    pub fn set_verify(&mut self, panel: VerifyPanel) {
+        self.verify = Some(panel);
+        self.mode = Mode::Verify;
+    }
+
     pub fn on_key(&mut self, key: KeyCode) -> Action {
         match self.mode {
             Mode::Palette => self.on_key_palette(key),
             Mode::Explorer => self.on_key_explorer(key),
+            Mode::Verify => {
+                // Any key dismisses the verdict panel.
+                self.verify = None;
+                self.mode = Mode::Normal;
+                Action::None
+            }
             Mode::Normal => self.on_key_normal(key),
         }
     }
@@ -283,6 +311,7 @@ impl App {
                 self.palette_selected = 0;
                 Action::None
             }
+            KeyCode::Char('v') => Action::Verify,
             KeyCode::Char('e') => match self.selected_finding() {
                 Some(f) => {
                     let entity = f.finding.entity.clone();
@@ -556,6 +585,17 @@ mod tests {
         app.on_key(KeyCode::Down);
         app.on_key(KeyCode::Down); // past end
         assert_eq!(app.explorer_selected, 1);
+    }
+
+    #[test]
+    fn v_triggers_verify_and_panel_dismisses_on_any_key() {
+        let mut app = app_with(vec![(finding("a", Severity::Blocking, "x"), false)]);
+        assert_eq!(app.on_key(KeyCode::Char('v')), Action::Verify);
+        app.set_verify(VerifyPanel { passed: true, lines: vec!["health 100/100".into()] });
+        assert_eq!(app.mode, Mode::Verify);
+        app.on_key(KeyCode::Char('j')); // any key dismisses
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.verify.is_none());
     }
 
     #[test]

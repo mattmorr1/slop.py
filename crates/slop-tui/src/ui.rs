@@ -52,6 +52,45 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.mode == Mode::Palette {
         draw_palette(frame, body, app);
     }
+    if app.mode == Mode::Verify {
+        draw_verify(frame, body, app);
+    }
+}
+
+fn draw_verify(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(panel) = &app.verify else {
+        return;
+    };
+    let height = (panel.lines.len() as u16) + 4;
+    let [v] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [popup] = Layout::horizontal([Constraint::Percentage(60)])
+        .flex(Flex::Center)
+        .areas(v);
+
+    let (verdict, color) = if panel.passed {
+        ("GATE PASS", Color::Green)
+    } else {
+        ("GATE FAIL", Color::Red)
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(verdict, Style::new().bold().fg(color))),
+        Line::from(""),
+    ];
+    for l in &panel.lines {
+        lines.push(Line::from(l.clone()));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "any key to dismiss",
+        Style::new().add_modifier(Modifier::DIM),
+    )));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(Block::bordered().title(" verification ")),
+        popup,
+    );
 }
 
 fn draw_explorer(frame: &mut Frame, area: Rect, app: &App) {
@@ -270,8 +309,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hint = match app.mode {
         Mode::Palette => "↑/↓ move · enter run · esc cancel",
         Mode::Explorer => "↑/↓ move · enter jump · backspace back · esc close",
+        Mode::Verify => "any key to dismiss",
         Mode::Normal => {
-            " ↑/↓ move · enter open · e explore · x fix · c commands · f filter · g grand · r reload · q quit"
+            " enter open · e explore · x fix · v verify · c commands · f filter · g grand · r reload · q quit"
         }
     };
     frame.render_widget(

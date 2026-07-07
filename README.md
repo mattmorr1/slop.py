@@ -73,9 +73,13 @@ full-screen TUI. It's the control surface for everything else:
   signature and 1-hop edges (what it calls / imports, and who calls it) from the
   SCIP graph. `Enter` jumps focus to a neighbor, `Backspace` goes back — walk the
   call graph to understand code, not just lint it
+- **`v`** verifies: runs `slop gate` and shows a PASS/FAIL verdict panel with
+  the health + failing/blocking counts — the CI check, in place
 - **`c`** opens a command palette to run any slop command — re-index, check,
-  fix, baseline, init policy, install harness, gate — after which the dashboard
-  reloads, so you watch the findings clear (the verification loop)
+  fix, baseline, init policy, install harness, gate, run the project's tests —
+  after which the dashboard reloads and the status shows the `blocking N→M ·
+  health A→B` delta, so you watch the finding actually clear (the verification
+  loop)
 - **`f`** filters by severity, **`g`** toggles grandfathered findings, **`r`**
   reloads
 
