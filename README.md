@@ -126,6 +126,16 @@ Claude Code) drives. Wire them into a repo with one command:
 slop install /path/to/repo   # merges MCP server + hooks into the repo's config
 ```
 
+Or launch Claude Code with the layer already active — `slop claude` wires the
+harness (idempotently) and starts `claude` in the repo so it loads the MCP
+server and hooks:
+
+```sh
+slop claude                  # install harness + launch claude in the cwd
+slop claude --proxy          # also route the session through slop's steering proxy
+slop claude -- --resume      # args after `--` pass through to claude
+```
+
 - **Claude skill** — `slop install` drops a `/slop` skill so the agent knows
   when and how to check, triage, fix, and gate on its own.
 - **MCP tools** — `validate_change`, `get_context_envelope`, `query_subgraph`.
