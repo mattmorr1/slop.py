@@ -107,6 +107,17 @@ fn event_loop(
                     app.set_verify(run_gate(&exe, repo, index));
                     reload(app, repo, index);
                 }
+                Action::YankSelected => {
+                    app.status = Some(match app.selected_detail_text() {
+                        Some(text) if copy_to_clipboard(&text) => {
+                            "copied finding detail to clipboard".to_string()
+                        }
+                        Some(_) => {
+                            "no clipboard tool found (need pbcopy / xclip / wl-copy)".to_string()
+                        }
+                        None => "nothing selected".to_string(),
+                    });
+                }
                 Action::Explore(id) => match query::subgraph(built, &id, 1, None) {
                     Some(sg) => app.set_explorer_subgraph(sg),
                     None => {
@@ -235,6 +246,39 @@ fn run_gate(exe: &Path, repo: &Path, index: Option<&Path>) -> VerifyPanel {
             lines: vec![format!("gate failed to run: {e}")],
         },
     }
+}
+
+/// Copy `text` to the system clipboard, trying the platform tools in turn
+/// (macOS `pbcopy`, then X11 `xclip`, then Wayland `wl-copy`). Returns whether
+/// one succeeded — lets the user grab a finding's detail without fighting the
+/// terminal's row-wise mouse selection.
+fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::Stdio;
+    let tools: [(&str, &[&str]); 3] = [
+        ("pbcopy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("wl-copy", &[]),
+    ];
+    for (prog, args) in tools {
+        let Ok(mut child) = Command::new(prog)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+            // Drop stdin to send EOF before waiting, so the tool flushes.
+        }
+        if child.wait().map(|s| s.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The project's test command, by ecosystem marker. `None` if we can't tell.

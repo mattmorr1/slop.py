@@ -311,7 +311,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Explorer => "↑/↓ move · enter jump · backspace back · esc close",
         Mode::Verify => "any key to dismiss",
         Mode::Normal => {
-            " enter open · e explore · x fix · v verify · c commands · f filter · g grand · r reload · q quit"
+            " enter open · y copy · e explore · x fix · v verify · c cmds · f filter · g grand · r reload · q quit"
         }
     };
     frame.render_widget(

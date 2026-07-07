@@ -130,6 +130,8 @@ pub enum Action {
     Explore(String),
     /// Run `slop gate` and show the pass/fail verdict as a panel.
     Verify,
+    /// Copy the selected finding's detail to the system clipboard.
+    YankSelected,
 }
 
 pub struct App {
@@ -201,6 +203,21 @@ impl App {
 
     pub fn selected_finding(&self) -> Option<&AuditFinding> {
         self.visible().into_iter().nth(self.selected)
+    }
+
+    /// Plain-text detail block for the selected finding — what `y` copies to the
+    /// clipboard, so you don't have to fight terminal row-selection to grab it.
+    pub fn selected_detail_text(&self) -> Option<String> {
+        let f = self.selected_finding()?;
+        Some(format!(
+            "[{}] {}\n{}:{}\n{}\n\nfix: {}",
+            f.finding.rule,
+            f.finding.entity,
+            f.finding.file,
+            f.finding.lines.0 + 1,
+            f.finding.message,
+            f.finding.fix_guidance,
+        ))
     }
 
     /// Is the selected finding mechanically fixable?
@@ -312,6 +329,13 @@ impl App {
                 Action::None
             }
             KeyCode::Char('v') => Action::Verify,
+            KeyCode::Char('y') => {
+                if self.selected_finding().is_some() {
+                    Action::YankSelected
+                } else {
+                    Action::None
+                }
+            }
             KeyCode::Char('e') => match self.selected_finding() {
                 Some(f) => {
                     let entity = f.finding.entity.clone();
@@ -585,6 +609,15 @@ mod tests {
         app.on_key(KeyCode::Down);
         app.on_key(KeyCode::Down); // past end
         assert_eq!(app.explorer_selected, 1);
+    }
+
+    #[test]
+    fn y_yanks_and_builds_detail_text() {
+        let mut app = app_with(vec![(finding("infra-bypass", Severity::Blocking, "svc::foo"), false)]);
+        assert_eq!(app.on_key(KeyCode::Char('y')), Action::YankSelected);
+        let text = app.selected_detail_text().unwrap();
+        assert!(text.contains("[infra-bypass] svc::foo"));
+        assert!(text.contains("fix: fix"));
     }
 
     #[test]

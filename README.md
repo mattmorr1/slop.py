@@ -73,6 +73,9 @@ full-screen TUI. It's the control surface for everything else:
   signature and 1-hop edges (what it calls / imports, and who calls it) from the
   SCIP graph. `Enter` jumps focus to a neighbor, `Backspace` goes back — walk the
   call graph to understand code, not just lint it
+- **`y`** copies the selected finding's full detail (rule, entity, `file:line`,
+  message, fix) to the clipboard — no fighting the terminal's row-wise mouse
+  selection to grab multiline text out of the detail box
 - **`v`** verifies: runs `slop gate` and shows a PASS/FAIL verdict panel with
   the health + failing/blocking counts — the CI check, in place
 - **`c`** opens a command palette to run any slop command — re-index, check,
