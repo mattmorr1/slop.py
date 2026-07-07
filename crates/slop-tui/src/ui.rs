@@ -277,7 +277,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            "manual fix — press Enter to open in your editor",
+            "needs judgment — press a to fix with Claude Code, or Enter to open",
             Style::new().fg(Color::DarkGray),
         )));
     }
@@ -311,7 +311,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Explorer => "↑/↓ move · enter jump · backspace back · esc close",
         Mode::Verify => "any key to dismiss",
         Mode::Normal => {
-            " enter open · y copy · e explore · x fix · v verify · c cmds · f filter · g grand · r reload · q quit"
+            " enter open · x fix · a ask-claude · e explore · v verify · y copy · c cmds · f filter · g grand · q quit"
         }
     };
     frame.render_widget(

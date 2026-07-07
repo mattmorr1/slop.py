@@ -68,7 +68,11 @@ full-screen TUI. It's the control surface for everything else:
 - **`Enter`** opens the selected finding in your editor at its line
   (`$SLOP_EDITOR`, else `cursor`/`code`)
 - **`x`** applies the mechanical repair when the finding is auto-fixable
-  (over-commenting / naming); otherwise it points you at the guidance
+  (over-commenting / naming) — deterministic, no LLM
+- **`a`** dispatches the finding to **Claude Code** (headless, `acceptEdits`)
+  seeded with its fix guidance — for the semantic findings the mechanical fixer
+  can't touch. Both `x` and `a` then reindex + gate to verify the finding
+  actually cleared, so *every* finding has a fix path from the dashboard
 - **`e`** opens the **graph explorer** on the selected finding: its effect
   signature and 1-hop edges (what it calls / imports, and who calls it) from the
   SCIP graph. `Enter` jumps focus to a neighbor, `Backspace` goes back — walk the

@@ -132,6 +132,10 @@ pub enum Action {
     Verify,
     /// Copy the selected finding's detail to the system clipboard.
     YankSelected,
+    /// Dispatch the selected finding to Claude Code (headless) to fix, then
+    /// reindex + gate to verify. For the semantic rules the deterministic
+    /// fixer can't touch.
+    FixWithClaude,
 }
 
 pub struct App {
@@ -211,6 +215,25 @@ impl App {
         let f = self.selected_finding()?;
         Some(format!(
             "[{}] {}\n{}:{}\n{}\n\nfix: {}",
+            f.finding.rule,
+            f.finding.entity,
+            f.finding.file,
+            f.finding.lines.0 + 1,
+            f.finding.message,
+            f.finding.fix_guidance,
+        ))
+    }
+
+    /// The instruction handed to `claude -p` for the selected finding — scoped
+    /// and minimal, with the guardrail that fixing slop mustn't introduce more.
+    pub fn selected_claude_prompt(&self) -> Option<String> {
+        let f = self.selected_finding()?;
+        Some(format!(
+            "Fix this code-quality finding in the current repository with the minimal change.\n\
+             Rule: {}\nEntity: {} ({}:{})\nProblem: {}\nRequired fix: {}\n\n\
+             Do not add new external dependencies or bypass the codebase's sanctioned \
+             channels — resolving one finding must not introduce another. Edit only what's \
+             needed, then stop.",
             f.finding.rule,
             f.finding.entity,
             f.finding.file,
@@ -329,6 +352,13 @@ impl App {
                 Action::None
             }
             KeyCode::Char('v') => Action::Verify,
+            KeyCode::Char('a') => {
+                if self.selected_finding().is_some() {
+                    Action::FixWithClaude
+                } else {
+                    Action::None
+                }
+            }
             KeyCode::Char('y') => {
                 if self.selected_finding().is_some() {
                     Action::YankSelected
@@ -618,6 +648,16 @@ mod tests {
         let text = app.selected_detail_text().unwrap();
         assert!(text.contains("[infra-bypass] svc::foo"));
         assert!(text.contains("fix: fix"));
+    }
+
+    #[test]
+    fn a_dispatches_to_claude_with_a_scoped_prompt() {
+        let mut app = app_with(vec![(finding("infra-bypass", Severity::Blocking, "svc::foo"), false)]);
+        assert_eq!(app.on_key(KeyCode::Char('a')), Action::FixWithClaude);
+        let prompt = app.selected_claude_prompt().unwrap();
+        assert!(prompt.contains("infra-bypass"));
+        assert!(prompt.contains("svc::foo"));
+        assert!(prompt.contains("minimal change"));
     }
 
     #[test]

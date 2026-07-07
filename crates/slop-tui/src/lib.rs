@@ -73,12 +73,35 @@ fn event_loop(
                 Action::FixSelected => {
                     let before = snapshot(app);
                     let args = cmd_args(Cmd::FixApply, repo, index);
-                    suspend_run(terminal, exe.as_os_str(), &args, repo)?;
+                    let panel =
+                        suspend_fix_and_verify(terminal, exe.as_os_str(), &args, &exe, repo, index);
                     reload(app, repo, index);
-                    app.status = Some(format!(
-                        "fixed (over-commenting + naming) — {}",
-                        delta(before, snapshot(app))
-                    ));
+                    app.status =
+                        Some(format!("mechanical fix — {}", delta(before, snapshot(app))));
+                    app.set_verify(panel);
+                }
+                Action::FixWithClaude => {
+                    if let Some(prompt) = app.selected_claude_prompt() {
+                        let before = snapshot(app);
+                        let args = vec![
+                            "-p".to_string(),
+                            prompt,
+                            "--permission-mode".to_string(),
+                            "acceptEdits".to_string(),
+                        ];
+                        let panel = suspend_fix_and_verify(
+                            terminal,
+                            OsStr::new("claude"),
+                            &args,
+                            &exe,
+                            repo,
+                            index,
+                        );
+                        reload(app, repo, index);
+                        app.status =
+                            Some(format!("Claude fix — {}", delta(before, snapshot(app))));
+                        app.set_verify(panel);
+                    }
                 }
                 Action::RunCommand(Cmd::Test) => {
                     // The project's own test suite — run the real runner, not slop.
@@ -104,7 +127,9 @@ fn event_loop(
                         Some(format!("ran `slop {}` — {}", args.join(" "), delta(before, snapshot(app))));
                 }
                 Action::Verify => {
-                    app.set_verify(run_gate(&exe, repo, index));
+                    // Manual verify is a fast check against the current index
+                    // (no reindex); post-fix verification reindexes for accuracy.
+                    app.set_verify(run_gate(&exe, repo, index, false));
                     reload(app, repo, index);
                 }
                 Action::YankSelected => {
@@ -220,10 +245,37 @@ fn delta(before: (usize, u32), after: (usize, u32)) -> String {
     )
 }
 
-/// Run `slop gate --all` and parse its JSON verdict into a panel. This is the
-/// canonical CI check — the honest "does this pass right now" answer.
-fn run_gate(exe: &Path, repo: &Path, index: Option<&Path>) -> VerifyPanel {
+/// Leave the alt-screen, run a fix (`slop fix` or `claude -p`), then reindex +
+/// gate to verify it actually cleared — the accurate loop, since an edit leaves
+/// the SCIP index stale. Returns the gate verdict panel; re-enters the TUI.
+fn suspend_fix_and_verify(
+    terminal: &mut ratatui::DefaultTerminal,
+    program: &OsStr,
+    args: &[String],
+    exe: &Path,
+    repo: &Path,
+    index: Option<&Path>,
+) -> VerifyPanel {
+    ratatui::restore();
+    println!("\n$ {} {}\n", program.to_string_lossy(), args.join(" "));
+    let _ = Command::new(program).args(args).current_dir(repo).status();
+    println!("\n[slop] verifying (reindex + gate)…");
+    let panel = run_gate(exe, repo, index, true);
+    println!("[slop] press Enter to return to the dashboard…");
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    *terminal = ratatui::init();
+    panel
+}
+
+/// Run `slop gate --all` (optionally `--reindex` first) and parse its JSON
+/// verdict into a panel. This is the canonical CI check — the honest "does this
+/// pass right now" answer.
+fn run_gate(exe: &Path, repo: &Path, index: Option<&Path>, reindex: bool) -> VerifyPanel {
     let mut args = vec!["gate".to_string(), repo.display().to_string(), "--all".to_string()];
+    if reindex {
+        args.push("--reindex".to_string());
+    }
     push_index(&mut args, index);
     match Command::new(exe).args(&args).output() {
         Ok(out) => {
