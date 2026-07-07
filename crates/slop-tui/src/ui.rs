@@ -40,14 +40,88 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)]).areas(body);
 
     draw_header(frame, header, app);
-    draw_list(frame, list_area, app);
-    draw_detail(frame, detail_area, app);
+    if app.mode == Mode::Explorer {
+        draw_explorer(frame, body, app);
+    } else {
+        draw_list(frame, list_area, app);
+        draw_detail(frame, detail_area, app);
+    }
     draw_status(frame, status, app);
     draw_footer(frame, footer, app);
 
     if app.mode == Mode::Palette {
         draw_palette(frame, body, app);
     }
+}
+
+fn draw_explorer(frame: &mut Frame, area: Rect, app: &App) {
+    let [focus_area, list_area] =
+        Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(area);
+
+    let Some(sg) = &app.explorer else {
+        frame.render_widget(
+            Paragraph::new("loading subgraph…").block(Block::bordered().title(" explore ")),
+            area,
+        );
+        return;
+    };
+
+    let effects = if sg.effects.is_empty() {
+        "none".to_string()
+    } else {
+        sg.effects
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let focus = Paragraph::new(Text::from(vec![
+        Line::from(vec![
+            Span::styled(sg.target.clone(), Style::new().bold().fg(Color::Cyan)),
+            Span::styled(format!("  [{}]", sg.entity_type), Style::new().add_modifier(Modifier::DIM)),
+        ]),
+        Line::from(vec![
+            Span::styled("effects: ", Style::new().add_modifier(Modifier::DIM)),
+            Span::styled(effects, Style::new().fg(Color::Magenta)),
+        ]),
+    ]))
+    .block(Block::bordered().title(" explore "));
+    frame.render_widget(focus, focus_area);
+
+    let block = Block::bordered().title(format!(" edges ({}) ", sg.neighbors.len()));
+    if sg.neighbors.is_empty() {
+        frame.render_widget(
+            Paragraph::new("no edges at depth 1")
+                .style(Style::new().add_modifier(Modifier::DIM))
+                .block(block),
+            list_area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = sg
+        .neighbors
+        .iter()
+        .map(|n| {
+            // out = this entity depends on the neighbor; in = neighbor depends on it.
+            let (arrow, verb) = if n.direction == "out" {
+                ("→", n.edge.clone())
+            } else {
+                ("←", format!("{} by", n.edge))
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{arrow} ")),
+                Span::styled(format!("{verb:<12}"), Style::new().add_modifier(Modifier::DIM)),
+                Span::raw(n.id.clone()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("▸ ");
+    let mut state = ListState::default();
+    state.select(Some(app.explorer_selected));
+    frame.render_stateful_widget(list, list_area, &mut state);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -195,8 +269,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hint = match app.mode {
         Mode::Palette => "↑/↓ move · enter run · esc cancel",
+        Mode::Explorer => "↑/↓ move · enter jump · backspace back · esc close",
         Mode::Normal => {
-            " ↑/↓ move · enter open · x fix · c commands · f filter · g grandfathered · r reload · q quit"
+            " ↑/↓ move · enter open · e explore · x fix · c commands · f filter · g grand · r reload · q quit"
         }
     };
     frame.render_widget(

@@ -69,6 +69,10 @@ full-screen TUI. It's the control surface for everything else:
   (`$SLOP_EDITOR`, else `cursor`/`code`)
 - **`x`** applies the mechanical repair when the finding is auto-fixable
   (over-commenting / naming); otherwise it points you at the guidance
+- **`e`** opens the **graph explorer** on the selected finding: its effect
+  signature and 1-hop edges (what it calls / imports, and who calls it) from the
+  SCIP graph. `Enter` jumps focus to a neighbor, `Backspace` goes back — walk the
+  call graph to understand code, not just lint it
 - **`c`** opens a command palette to run any slop command — re-index, check,
   fix, baseline, init policy, install harness, gate — after which the dashboard
   reloads, so you watch the findings clear (the verification loop)

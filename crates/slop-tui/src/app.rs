@@ -7,6 +7,7 @@
 use crossterm::event::KeyCode;
 use slop_analyze::check::{AuditFinding, AuditResult};
 use slop_analyze::findings::Severity;
+use slop_analyze::query::Subgraph;
 
 /// Rules `slop fix` can repair mechanically (behaviour-safe comment deletion and
 /// SCIP-verified renames). Everything else is manual — the finding carries
@@ -92,11 +93,12 @@ impl Filter {
     }
 }
 
-/// Normal browsing vs the command palette overlay.
+/// Normal browsing, the command palette overlay, or the graph explorer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Palette,
+    Explorer,
 }
 
 /// What a key press asks the run loop to do after state is updated.
@@ -112,6 +114,9 @@ pub enum Action {
     FixSelected,
     /// Run a palette command, then reload.
     RunCommand(Cmd),
+    /// Load the 1-hop subgraph for this entity into the explorer (the run loop
+    /// holds the graph and computes it, then calls `set_explorer_subgraph`).
+    Explore(String),
 }
 
 pub struct App {
@@ -129,6 +134,11 @@ pub struct App {
     pub palette_selected: usize,
     /// One-line result of the last action, shown in the status bar.
     pub status: Option<String>,
+    /// Graph explorer: the current focus's 1-hop subgraph (set by the run loop),
+    /// the selected neighbor, and the focus history for back-navigation.
+    pub explorer: Option<Subgraph>,
+    pub explorer_selected: usize,
+    pub explorer_stack: Vec<String>,
 }
 
 impl App {
@@ -146,6 +156,9 @@ impl App {
             mode: Mode::Normal,
             palette_selected: 0,
             status: None,
+            explorer: None,
+            explorer_selected: 0,
+            explorer_stack: Vec::new(),
         };
         app.set_result(result);
         app
@@ -195,10 +208,69 @@ impl App {
         (self.findings.len(), b, w, a)
     }
 
+    /// Install the subgraph the run loop computed for the current focus.
+    pub fn set_explorer_subgraph(&mut self, mut subgraph: Subgraph) {
+        // Stable display order: out-edges (what it depends on) before in-edges
+        // (what depends on it), then by edge kind and id.
+        subgraph.neighbors.sort_by(|a, b| {
+            let rank = |d: &str| if d == "out" { 0 } else { 1 };
+            rank(&a.direction)
+                .cmp(&rank(&b.direction))
+                .then_with(|| a.edge.cmp(&b.edge))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        self.explorer = Some(subgraph);
+        self.explorer_selected = 0;
+    }
+
     pub fn on_key(&mut self, key: KeyCode) -> Action {
         match self.mode {
             Mode::Palette => self.on_key_palette(key),
+            Mode::Explorer => self.on_key_explorer(key),
             Mode::Normal => self.on_key_normal(key),
+        }
+    }
+
+    fn on_key_explorer(&mut self, key: KeyCode) -> Action {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Normal;
+                self.explorer = None;
+                self.explorer_stack.clear();
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(sg) = &self.explorer {
+                    self.explorer_selected =
+                        (self.explorer_selected + 1).min(sg.neighbors.len().saturating_sub(1));
+                }
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.explorer_selected = self.explorer_selected.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Enter => {
+                // Jump focus to the selected neighbor, remembering where we were.
+                if let Some(sg) = &self.explorer {
+                    if let Some(n) = sg.neighbors.get(self.explorer_selected) {
+                        let next = n.id.clone();
+                        self.explorer_stack.push(sg.target.clone());
+                        return Action::Explore(next);
+                    }
+                }
+                Action::None
+            }
+            KeyCode::Backspace => {
+                if let Some(prev) = self.explorer_stack.pop() {
+                    Action::Explore(prev)
+                } else {
+                    self.mode = Mode::Normal;
+                    self.explorer = None;
+                    Action::None
+                }
+            }
+            _ => Action::None,
         }
     }
 
@@ -211,6 +283,17 @@ impl App {
                 self.palette_selected = 0;
                 Action::None
             }
+            KeyCode::Char('e') => match self.selected_finding() {
+                Some(f) => {
+                    let entity = f.finding.entity.clone();
+                    self.mode = Mode::Explorer;
+                    self.explorer = None;
+                    self.explorer_selected = 0;
+                    self.explorer_stack.clear();
+                    Action::Explore(entity)
+                }
+                None => Action::None,
+            },
             KeyCode::Enter => {
                 if self.selected_finding().is_some() {
                     Action::OpenSelected
@@ -417,6 +500,62 @@ mod tests {
         app.on_key(KeyCode::Char('c'));
         assert_eq!(app.on_key(KeyCode::Esc), Action::None);
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    fn subgraph(target: &str, neighbors: &[(&str, &str)]) -> Subgraph {
+        use slop_analyze::query::Neighbor;
+        Subgraph {
+            target: target.to_string(),
+            entity_type: "Function".to_string(),
+            effects: Vec::new(),
+            neighbors: neighbors
+                .iter()
+                .map(|(id, dir)| Neighbor {
+                    id: id.to_string(),
+                    entity_type: "Function".to_string(),
+                    edge: "Calls".to_string(),
+                    direction: dir.to_string(),
+                    distance: 1,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn e_opens_explorer_on_selected_entity() {
+        let mut app = app_with(vec![(finding("infra-bypass", Severity::Blocking, "svc::foo"), false)]);
+        assert_eq!(app.on_key(KeyCode::Char('e')), Action::Explore("svc::foo".to_string()));
+        assert_eq!(app.mode, Mode::Explorer);
+    }
+
+    #[test]
+    fn explorer_jump_pushes_stack_and_back_pops() {
+        let mut app = app_with(vec![(finding("a", Severity::Blocking, "x"), false)]);
+        app.on_key(KeyCode::Char('e')); // -> Explore("x"), mode Explorer
+        app.set_explorer_subgraph(subgraph("x", &[("y", "out"), ("z", "in")]));
+        // jump to first neighbor
+        assert_eq!(app.on_key(KeyCode::Enter), Action::Explore("y".to_string()));
+        assert_eq!(app.explorer_stack, vec!["x".to_string()]);
+        app.set_explorer_subgraph(subgraph("y", &[("x", "in")]));
+        // back returns to x
+        assert_eq!(app.on_key(KeyCode::Backspace), Action::Explore("x".to_string()));
+        assert!(app.explorer_stack.is_empty());
+        // back again with empty stack closes the explorer
+        app.set_explorer_subgraph(subgraph("x", &[("y", "out")]));
+        assert_eq!(app.on_key(KeyCode::Backspace), Action::None);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn explorer_navigation_clamps() {
+        let mut app = app_with(vec![(finding("a", Severity::Blocking, "x"), false)]);
+        app.on_key(KeyCode::Char('e'));
+        app.set_explorer_subgraph(subgraph("x", &[("y", "out"), ("z", "out")]));
+        app.on_key(KeyCode::Up); // already at 0
+        assert_eq!(app.explorer_selected, 0);
+        app.on_key(KeyCode::Down);
+        app.on_key(KeyCode::Down); // past end
+        assert_eq!(app.explorer_selected, 1);
     }
 
     #[test]

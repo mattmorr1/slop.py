@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
-use slop_analyze::check;
+use slop_analyze::build::BuiltGraph;
+use slop_analyze::{check, query};
 
 pub mod app;
 pub mod ui;
@@ -23,6 +24,9 @@ pub use app::{Action, App, Cmd};
 /// Run the dashboard for `repo` until the user quits. Computes the initial
 /// audit, then drives the draw/input loop. Restores the terminal even on error.
 pub fn run(repo: PathBuf, index: Option<PathBuf>) -> Result<()> {
+    // Keep the graph alive for the whole session — the explorer queries it on
+    // every focus change.
+    let analysis = check::load_analysis(&repo, index.as_deref())?;
     let result = check::audit(&repo, index.as_deref())?;
     let name = repo
         .canonicalize()
@@ -32,7 +36,7 @@ pub fn run(repo: PathBuf, index: Option<PathBuf>) -> Result<()> {
     let mut app = App::new(name, result);
 
     let mut terminal = ratatui::init();
-    let outcome = event_loop(&mut terminal, &mut app, &repo, index.as_deref());
+    let outcome = event_loop(&mut terminal, &mut app, &analysis.built, &repo, index.as_deref());
     ratatui::restore();
     outcome
 }
@@ -40,6 +44,7 @@ pub fn run(repo: PathBuf, index: Option<PathBuf>) -> Result<()> {
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
+    built: &BuiltGraph,
     repo: &Path,
     index: Option<&Path>,
 ) -> Result<()> {
@@ -79,6 +84,16 @@ fn event_loop(
                     reload(app, repo, index);
                     app.status = Some(format!("ran `slop {}` and reloaded", args.join(" ")));
                 }
+                Action::Explore(id) => match query::subgraph(built, &id, 1, None) {
+                    Some(sg) => app.set_explorer_subgraph(sg),
+                    None => {
+                        app.status = Some(format!("no graph node for {id}"));
+                        // Initial open failed — fall back to browsing.
+                        if app.explorer.is_none() {
+                            app.mode = app::Mode::Normal;
+                        }
+                    }
+                },
             }
         }
     }
