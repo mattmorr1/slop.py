@@ -55,6 +55,29 @@ pub fn is_test_file(path: &str) -> bool {
         || base == "conftest.py"
 }
 
+/// Repo-relative paths of git submodules, parsed from `<repo>/.gitmodules`.
+/// Submodule code is a separate project vendored in — findings there aren't the
+/// parent repo's to fix, so the audit excludes them.
+pub fn submodule_paths(repo: &Path) -> Vec<String> {
+    let text = match std::fs::read_to_string(repo.join(".gitmodules")) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("path"))
+        .filter_map(|rest| rest.trim().strip_prefix('='))
+        .map(|p| p.trim().trim_end_matches('/').to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Is `file` inside one of the given submodule paths?
+pub fn in_submodule(file: &str, submodules: &[String]) -> bool {
+    submodules
+        .iter()
+        .any(|s| file == s || file.starts_with(&format!("{s}/")))
+}
+
 /// Join key: a graph Function node whose body span starts on the fact's
 /// def line (SCIP enclosing_range start == ruff def start).
 pub fn entity_for<'a>(
@@ -82,7 +105,17 @@ pub fn location_index(built: &BuiltGraph) -> HashMap<(String, usize), NodeIndex>
 
 #[cfg(test)]
 mod tests {
-    use super::is_test_file;
+    use super::{in_submodule, is_test_file};
+
+    #[test]
+    fn submodule_containment() {
+        let subs = vec!["deeptempo-core".to_string(), "vendor/lib".to_string()];
+        assert!(in_submodule("deeptempo-core", &subs));
+        assert!(in_submodule("deeptempo-core/pkg/a.py", &subs));
+        assert!(in_submodule("vendor/lib/x.py", &subs));
+        assert!(!in_submodule("backend/api.py", &subs));
+        assert!(!in_submodule("deeptempo-core-extra/a.py", &subs)); // prefix, not path
+    }
 
     #[test]
     fn recognizes_test_paths() {

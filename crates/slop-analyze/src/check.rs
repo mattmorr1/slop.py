@@ -246,7 +246,11 @@ pub fn audit(repo: &Path, index: Option<&Path>) -> Result<AuditResult> {
     let mut raw = crate::detect::run_all(&built, &policy, &facts);
     raw.extend(crate::detect::effect_creep(&built, &baseline));
     let suppressions = suppress::scan(repo, &facts);
-    let all = suppress::filter(raw, &suppressions);
+    let submodules = source::submodule_paths(repo);
+    let all: Vec<_> = suppress::filter(raw, &suppressions)
+        .into_iter()
+        .filter(|f| !source::in_submodule(&f.file, &submodules))
+        .collect();
 
     // (rule, entity) is the baseline fingerprint — see `Baseline::filter`.
     let grandfathered_set: std::collections::HashSet<(&str, &str)> = baseline
@@ -324,6 +328,12 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
     }
     let suppressions = suppress::scan(&req.repo, &facts);
     let unsuppressed = suppress::filter(raw, &suppressions);
+    // Git submodules are separate projects vendored in — not this repo's to fix.
+    let submodules = source::submodule_paths(&req.repo);
+    let unsuppressed: Vec<_> = unsuppressed
+        .into_iter()
+        .filter(|f| !source::in_submodule(&f.file, &submodules))
+        .collect();
     let effective = baseline.filter(unsuppressed);
 
     let (findings, health_line) = if req.all {
