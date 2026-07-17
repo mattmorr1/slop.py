@@ -168,6 +168,8 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
         decorated: is_decorated(node),
         param_count,
         returns_value: returns_value(body),
+        forward_target: None,
+        forward_identity: false,
     }
     .into()
 }

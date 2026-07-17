@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use ruff_python_ast::token::{Token, TokenKind};
-use ruff_python_ast::{self as ast, Stmt};
+use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
@@ -91,6 +91,16 @@ pub struct FunctionFacts {
     pub param_count: u32,
     /// Body contains `return <expr>` at any depth.
     pub returns_value: bool,
+    /// When the whole body is exactly `return CALLEE(args)`, the callee as
+    /// written (`read_file`, `os.path.join`); `None` otherwise. The thin-wrapper
+    /// signal — a one-statement function that only delegates.
+    pub forward_target: Option<String>,
+    /// The delegation passes this function's parameters to the callee
+    /// positionally, unchanged and complete, with a bare-name callee and no
+    /// defaults/varargs in play — so inlining reduces to renaming the callee at
+    /// the call site. `false` when args are reordered, bound, partial, or the
+    /// callee is dotted.
+    pub forward_identity: bool,
 }
 
 struct LineIndex(Vec<TextSize>);
@@ -370,6 +380,8 @@ fn function_facts(
     let mut cf = ControlFlow::default();
     control_flow(&func.body, 1, lines, &mut cf);
 
+    let (forward_target, forward_identity) = forwarder(func);
+
     FunctionFacts {
         name: func.name.to_string(),
         name_line: lines.line(func.name.range().start()),
@@ -388,7 +400,67 @@ fn function_facts(
         decorated: !func.decorator_list.is_empty(),
         param_count,
         returns_value: body_returns_value(&func.body),
+        forward_target,
+        forward_identity,
     }
+}
+
+/// Detect the thin-wrapper shape: a body that is exactly `return CALLEE(args)`.
+/// Returns the callee as written and whether the delegation is a pure positional
+/// pass-through of the function's own parameters (the rename-safe inline case).
+fn forwarder(func: &ast::StmtFunctionDef) -> (Option<String>, bool) {
+    let [Stmt::Return(ret)] = func.body.as_slice() else {
+        return (None, false);
+    };
+    let Some(Expr::Call(call)) = ret.value.as_deref() else {
+        return (None, false);
+    };
+    let Some(callee) = callee_path(&call.func) else {
+        return (None, false);
+    };
+    let identity = callee_path_is_bare(&call.func) && args_are_params_verbatim(func, call);
+    (Some(callee), identity)
+}
+
+/// Render `foo` / `pkg.mod.foo` from a call target; `None` for anything not a
+/// plain name or attribute chain (subscripts, calls, lambdas).
+fn callee_path(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(n) => Some(n.id.to_string()),
+        Expr::Attribute(a) => Some(format!("{}.{}", callee_path(&a.value)?, a.attr)),
+        _ => None,
+    }
+}
+
+fn callee_path_is_bare(expr: &Expr) -> bool {
+    matches!(expr, Expr::Name(_))
+}
+
+/// The call passes exactly the function's positional parameters, in order, by
+/// name — and the signature carries nothing (defaults, `*args`, `**kwargs`,
+/// keyword-only) that would make a bare callee-rename change behavior.
+fn args_are_params_verbatim(func: &ast::StmtFunctionDef, call: &ast::ExprCall) -> bool {
+    let p = &func.parameters;
+    let clean = p.kwonlyargs.is_empty() && p.vararg.is_none() && p.kwarg.is_none();
+    let positional: Vec<&str> = p
+        .posonlyargs
+        .iter()
+        .chain(p.args.iter())
+        .filter(|pd| pd.default.is_none())
+        .map(|pd| pd.parameter.name.as_str())
+        .collect();
+    let all_positional_defaultless =
+        positional.len() == p.posonlyargs.len() + p.args.len();
+    if !clean || !all_positional_defaultless {
+        return false;
+    }
+    let a = &call.arguments;
+    if !a.keywords.is_empty() || a.args.len() != positional.len() {
+        return false;
+    }
+    a.args.iter().zip(&positional).all(|(arg, name)| {
+        matches!(arg, Expr::Name(n) if n.id.as_str() == *name)
+    })
 }
 
 fn body_returns_value(stmts: &[Stmt]) -> bool {
@@ -427,6 +499,56 @@ fn body_returns_value(stmts: &[Stmt]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn only(src: &str) -> FunctionFacts {
+        let mut f = analyze_file(src).unwrap();
+        assert_eq!(f.len(), 1, "expected exactly one function");
+        f.pop().unwrap()
+    }
+
+    #[test]
+    fn pure_positional_forward_is_identity() {
+        let f = only("def load(path):\n    return read_file(path)\n");
+        assert_eq!(f.forward_target.as_deref(), Some("read_file"));
+        assert!(f.forward_identity);
+    }
+
+    #[test]
+    fn dotted_callee_forwards_but_is_not_rename_safe() {
+        let f = only("def join(a, b):\n    return os.path.join(a, b)\n");
+        assert_eq!(f.forward_target.as_deref(), Some("os.path.join"));
+        assert!(!f.forward_identity);
+    }
+
+    #[test]
+    fn reordered_or_bound_args_are_not_identity() {
+        let swap = only("def f(a, b):\n    return g(b, a)\n");
+        assert_eq!(swap.forward_target.as_deref(), Some("g"));
+        assert!(!swap.forward_identity);
+        let bound = only("def f(a, b):\n    return g(a, b, mode=1)\n");
+        assert!(!bound.forward_identity);
+    }
+
+    #[test]
+    fn defaults_and_varargs_block_identity() {
+        let deflt = only("def f(a, b=2):\n    return g(a, b)\n");
+        assert!(!deflt.forward_identity);
+        let star = only("def f(*args):\n    return g(*args)\n");
+        assert!(!star.forward_identity);
+    }
+
+    #[test]
+    fn multi_statement_body_is_not_a_forwarder() {
+        let f = only("def f(a):\n    x = a + 1\n    return g(x)\n");
+        assert_eq!(f.forward_target, None);
+        assert!(!f.forward_identity);
+    }
+
+    #[test]
+    fn non_call_return_is_not_a_forwarder() {
+        let f = only("def name(self):\n    return self._name\n");
+        assert_eq!(f.forward_target, None);
+    }
 
     #[test]
     fn identical_bodies_hash_equal_despite_comments_and_names() {
