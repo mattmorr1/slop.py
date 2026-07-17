@@ -43,11 +43,33 @@ pub struct Verdict {
 }
 
 /// Abstraction so tests can run without the network and backends (Claude /
-/// Ollama) are interchangeable.
+/// Ollama) are interchangeable. Backends implement only the transport
+/// (`judge_prompt` + `model`); the two question shapes are default methods over
+/// their own prompt renderers, so a new judged rule is a renderer, not a
+/// per-backend request.
 pub trait Judge {
-    fn judge(&self, pairs: &[JudgeInput]) -> Result<Vec<Verdict>>;
-    /// Model identifier, for the "judging N pairs via <model>" log line.
+    /// Execute one batched structured-verdict request for a rendered prompt.
+    fn judge_prompt(&self, prompt: &str) -> Result<Vec<Verdict>>;
+    /// Model identifier, for the "judging N via <model>" log line.
     fn model(&self) -> &str;
+
+    /// Semantic-redundancy verdicts for candidate pairs (`redundant` = the two
+    /// serve the same purpose).
+    fn judge(&self, pairs: &[JudgeInput]) -> Result<Vec<Verdict>> {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.judge_prompt(&render_prompt(pairs))
+    }
+
+    /// Trivial-wrapper verdicts (`redundant` = the wrapper's name adds nothing
+    /// the call site would miss — inline it).
+    fn judge_wrappers(&self, wrappers: &[JudgeInput]) -> Result<Vec<Verdict>> {
+        if wrappers.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.judge_prompt(&render_wrapper_prompt(wrappers))
+    }
 }
 
 pub struct ClaudeJudge {
@@ -110,22 +132,93 @@ pub(crate) fn render_prompt(pairs: &[JudgeInput]) -> String {
     prompt
 }
 
+/// Prompt for the trivial-wrapper gate: for each one-line forwarder, does its
+/// name carry meaning the call site would lose? `a_label` is the wrapper name,
+/// `b_label` the callee it delegates to, `a_context` its signature/caller
+/// context. `redundant=true` means the name is slop and the wrapper should be
+/// inlined; `false` means the name states intent the callee doesn't.
+pub(crate) fn render_wrapper_prompt(wrappers: &[JudgeInput]) -> String {
+    let mut prompt = String::from(
+        "You are reviewing a Python codebase for trivial wrapper functions: one-line functions \
+         whose entire body forwards their arguments to a single other call. Some are slop and \
+         should be inlined at their few call sites; others earn their place because the NAME \
+         expresses a domain concept, a policy, or an abstraction boundary the raw call would \
+         lose.\n\nFor each wrapper below decide: if you replaced every call to it with the \
+         delegated call, would the code lose meaning the name was carrying? If the name adds \
+         nothing beyond the callee (a mechanical rename or a redundant synonym), answer \
+         redundant=true (inline it). If the name states intent the callee does not, answer \
+         redundant=false (keep it).\n",
+    );
+    for w in wrappers {
+        prompt.push_str(&format!(
+            "\n<wrapper index=\"{}\" name=\"{}\" delegates_to=\"{}\">\n{}\n</wrapper>\n",
+            w.index, w.a_label, w.b_label, w.a_context,
+        ));
+    }
+    prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct Spy(RefCell<String>);
+    impl Judge for Spy {
+        fn model(&self) -> &str {
+            "spy"
+        }
+        fn judge_prompt(&self, prompt: &str) -> Result<Vec<Verdict>> {
+            *self.0.borrow_mut() = prompt.to_string();
+            Ok(Vec::new())
+        }
+    }
+
+    fn input() -> JudgeInput {
+        JudgeInput {
+            index: 0,
+            a_label: "load".into(),
+            a_context: "def load(path):".into(),
+            b_label: "read_file".into(),
+            b_context: String::new(),
+        }
+    }
+
+    #[test]
+    fn wrapper_and_redundancy_route_distinct_prompts() {
+        let spy = Spy::default();
+        spy.judge_wrappers(&[input()]).unwrap();
+        let wrapper = spy.0.borrow().clone();
+        spy.judge(&[input()]).unwrap();
+        let redundancy = spy.0.borrow().clone();
+        assert!(wrapper.contains("trivial wrapper") && wrapper.contains("delegates_to=\"read_file\""));
+        assert!(redundancy.contains("semantic redundancy"));
+        assert_ne!(wrapper, redundancy);
+    }
+
+    #[test]
+    fn empty_inputs_skip_the_transport() {
+        let spy = Spy::default();
+        assert!(spy.judge_wrappers(&[]).unwrap().is_empty());
+        assert!(spy.judge(&[]).unwrap().is_empty());
+        assert!(spy.0.borrow().is_empty(), "transport must not run for empty input");
+    }
+}
+
 impl Judge for ClaudeJudge {
     fn model(&self) -> &str {
         &self.model
     }
 
-    fn judge(&self, pairs: &[JudgeInput]) -> Result<Vec<Verdict>> {
-        if pairs.is_empty() {
-            return Ok(Vec::new());
-        }
+    fn judge_prompt(&self, prompt: &str) -> Result<Vec<Verdict>> {
         let schema = verdict_schema();
 
         let body = json!({
             "model": self.model,
             "max_tokens": 4096,
             "output_config": {"format": {"type": "json_schema", "schema": schema}},
-            "messages": [{"role": "user", "content": render_prompt(pairs)}],
+            "messages": [{"role": "user", "content": prompt}],
         });
 
         let response = ureq::post(API_URL)

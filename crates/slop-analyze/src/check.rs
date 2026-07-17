@@ -113,6 +113,77 @@ fn tier3_findings(
     Ok(findings)
 }
 
+/// Tier-3 gate for `trivial-wrapper`: the structural pass finds one-line
+/// forwarders with 1-2 callers; the judge rules whether each name earns its
+/// keep. Only judge-confirmed slop becomes a Warning — no structural
+/// false-positive gates CI on its own.
+fn tier3_wrapper_findings(
+    built: &build::BuiltGraph,
+    policy: &Policy,
+    facts: &[source::FileFacts],
+    _repo: &Path,
+) -> Result<Vec<Finding>> {
+    use slop_llm::{judge_from_env, JudgeInput};
+
+    let candidates = crate::detect::trivial_wrapper_candidates(built, policy, facts);
+    if candidates.is_empty() {
+        eprintln!("tier3: no trivial-wrapper candidates");
+        return Ok(Vec::new());
+    }
+    let judge = judge_from_env()?;
+    eprintln!(
+        "tier3: judging {} trivial-wrapper(s) via {}",
+        candidates.len(),
+        judge.model()
+    );
+    let inputs: Vec<JudgeInput> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| JudgeInput {
+            index: i,
+            a_label: c.name.clone(),
+            a_context: format!(
+                "{}\n# {} caller(s); whole body: return {}(...)",
+                c.signature, c.callers, c.forward_target
+            ),
+            b_label: c.forward_target.clone(),
+            b_context: String::new(),
+        })
+        .collect();
+    let verdicts = judge.judge_wrappers(&inputs)?;
+
+    let mut findings = Vec::new();
+    for v in verdicts.into_iter().filter(|v| v.redundant) {
+        let Some(c) = candidates.get(v.index) else {
+            continue;
+        };
+        let fix_guidance = if c.forward_identity {
+            format!(
+                "Inline `{}`: replace `{}(...)` at its {} call site(s) with `{}(...)`, then delete the wrapper",
+                c.name, c.name, c.callers, c.forward_target
+            )
+        } else {
+            format!(
+                "Inline `{}`'s body into its {} call site(s) and delete the wrapper",
+                c.name, c.callers
+            )
+        };
+        findings.push(Finding {
+            rule: "trivial-wrapper",
+            severity: Severity::Warning,
+            entity: c.entity.clone(),
+            file: c.file.clone(),
+            lines: c.lines,
+            message: format!(
+                "`{}` only forwards to `{}` ({} caller(s)) and its name adds nothing the call site would miss: {}",
+                c.name, c.forward_target, c.callers, v.reason
+            ),
+            fix_guidance,
+        });
+    }
+    Ok(findings)
+}
+
 /// Confirms or demotes Tier-2 `duplicate-structural` findings: matching
 /// shape is a weak signal on its own (see `detect::shape_groups`), so when
 /// `--tier3` is on, ask the judge whether each group's canonical member and
@@ -325,6 +396,7 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
             }
         }
         raw.extend(tier3_findings(&built, &facts, &req.repo)?);
+        raw.extend(tier3_wrapper_findings(&built, &policy, &facts, &req.repo)?);
     }
     let suppressions = suppress::scan(&req.repo, &facts);
     let unsuppressed = suppress::filter(raw, &suppressions);

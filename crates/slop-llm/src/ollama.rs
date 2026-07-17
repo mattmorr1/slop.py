@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{render_prompt, verdict_schema, Judge, JudgeInput, Verdict};
+use crate::{verdict_schema, Judge, Verdict};
 
 pub const DEFAULT_MODEL: &str = "qwen2.5:1.5b";
 const DEFAULT_HOST: &str = "http://localhost:11434";
@@ -76,14 +76,11 @@ impl Judge for Ollama {
         &self.model
     }
 
-    fn judge(&self, pairs: &[JudgeInput]) -> Result<Vec<Verdict>> {
-        if pairs.is_empty() {
-            return Ok(Vec::new());
-        }
+    fn judge_prompt(&self, prompt: &str) -> Result<Vec<Verdict>> {
         // Ollama's structured-output `format` takes a JSON Schema directly.
         let body = json!({
             "model": self.model,
-            "messages": [{ "role": "user", "content": render_prompt(pairs) }],
+            "messages": [{ "role": "user", "content": prompt }],
             "stream": false,
             "format": verdict_schema(),
             "options": { "temperature": 0 },
