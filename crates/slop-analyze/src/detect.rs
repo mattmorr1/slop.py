@@ -711,6 +711,97 @@ pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) 
     findings
 }
 
+/// A `trivial-wrapper` candidate: a one-statement forwarder that survived the
+/// structural exclusions and now needs the semantic judge to separate a name
+/// that earns its keep from slop. Never a finding on its own — no Warning
+/// without tier-3 confirmation (D8).
+pub struct WrapperCandidate {
+    pub entity: String,
+    pub name: String,
+    pub file: String,
+    pub lines: (usize, usize),
+    pub signature: String,
+    /// The callee the body delegates to, as written.
+    pub forward_target: String,
+    /// Positional pass-through with a bare callee — the rename-safe inline case.
+    pub forward_identity: bool,
+    /// Distinct functions with a resolved `Calls` edge to this one. An
+    /// over-count: SCIP records a callback pass (`register(load)`) as a call
+    /// too, so this bounds the real caller set from above — safe for the gate,
+    /// but the rewrite (fix::plan_inlines) must re-check each textual site.
+    pub callers: usize,
+}
+
+const MAX_WRAPPER_CALLERS: usize = 2;
+
+fn is_dunder(name: &str) -> bool {
+    name.len() > 4 && name.starts_with("__") && name.ends_with("__")
+}
+
+/// Structural pre-filter for `trivial-wrapper`: one-statement forwarders with a
+/// small, resolved caller set, minus every shape where a thin body is
+/// intentional — protocol/dunder methods and any method (SCIP under-resolves
+/// dynamic dispatch; a thin override is contract, not slop), decorated /
+/// framework-registered functions, declared entry points, and tests. Output is
+/// candidates for the semantic judge, never findings.
+pub fn trivial_wrapper_candidates(
+    built: &BuiltGraph,
+    policy: &Policy,
+    facts: &[crate::source::FileFacts],
+) -> Vec<WrapperCandidate> {
+    let graph = &built.graph;
+    let index = crate::source::location_index(built);
+    let mut out = Vec::new();
+    for ff in facts {
+        if crate::source::is_test_file(&ff.file) {
+            continue;
+        }
+        for fact in &ff.functions {
+            let Some(target) = &fact.forward_target else {
+                continue;
+            };
+            if fact.decorated || is_dunder(&fact.name) {
+                continue;
+            }
+            let Some(entity) = crate::source::entity_for(built, &index, &ff.file, fact) else {
+                continue;
+            };
+            if policy.is_entry_point(&entity.id) {
+                continue;
+            }
+            let Some(idx) = graph.node(&entity.id) else {
+                continue;
+            };
+            let is_method = graph.graph.edges_directed(idx, Direction::Incoming).any(|e| {
+                *e.weight() == EdgeKind::Contains
+                    && graph.entity(e.source()).entity_type == NodeType::Class
+            });
+            if is_method {
+                continue;
+            }
+            let callers = graph
+                .graph
+                .edges_directed(idx, Direction::Incoming)
+                .filter(|e| *e.weight() == EdgeKind::Calls)
+                .count();
+            if callers == 0 || callers > MAX_WRAPPER_CALLERS {
+                continue;
+            }
+            out.push(WrapperCandidate {
+                entity: entity.id.clone(),
+                name: fact.name.clone(),
+                file: ff.file.clone(),
+                lines: (fact.start_line as usize, fact.end_line as usize),
+                signature: fact.signature.clone(),
+                forward_target: target.clone(),
+                forward_identity: fact.forward_identity,
+                callers,
+            });
+        }
+    }
+    out
+}
+
 /// All detectors, sorted by severity then location.
 pub fn run_all(
     built: &BuiltGraph,
@@ -813,6 +904,73 @@ mod tests {
             .collect();
         assert!(dead.contains(&"m::dead"), "unreferenced fn should be dead");
         assert!(!dead.contains(&"m::used"), "referenced fn must be spared");
+    }
+
+    fn func_at(id: &str, line: usize) -> CodeEntity {
+        let mut e = func(id, &[]);
+        e.source_range = (line, line + 1);
+        e
+    }
+
+    fn py_facts(file: &str, src: &str) -> crate::source::FileFacts {
+        crate::source::FileFacts {
+            file: file.into(),
+            functions: slop_parse::Language::Python.parse(src).unwrap(),
+        }
+    }
+
+    #[test]
+    fn identity_forwarder_with_a_caller_is_a_candidate() {
+        let facts = vec![py_facts("m.py", "def load(path):\n    return read_file(path)\n")];
+        let mut built = built_with(vec![func_at("m::load", 0), func_at("m::caller", 10)]);
+        let (load, caller) =
+            (built.graph.node("m::load").unwrap(), built.graph.node("m::caller").unwrap());
+        built.graph.add_edge(caller, load, EdgeKind::Calls);
+        let cands = trivial_wrapper_candidates(&built, &Policy::default(), &facts);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].entity, "m::load");
+        assert_eq!(cands[0].forward_target, "read_file");
+        assert!(cands[0].forward_identity);
+        assert_eq!(cands[0].callers, 1);
+    }
+
+    #[test]
+    fn forwarder_with_no_resolved_caller_is_dead_island_not_a_wrapper() {
+        let facts = vec![py_facts("m.py", "def load(path):\n    return read_file(path)\n")];
+        let built = built_with(vec![func_at("m::load", 0)]);
+        assert!(trivial_wrapper_candidates(&built, &Policy::default(), &facts).is_empty());
+    }
+
+    #[test]
+    fn forwarder_with_three_callers_is_over_threshold() {
+        let facts = vec![py_facts("m.py", "def load(path):\n    return read_file(path)\n")];
+        let mut built = built_with(vec![
+            func_at("m::load", 0),
+            func_at("m::a", 10),
+            func_at("m::b", 20),
+            func_at("m::c", 30),
+        ]);
+        let load = built.graph.node("m::load").unwrap();
+        for c in ["m::a", "m::b", "m::c"] {
+            let idx = built.graph.node(c).unwrap();
+            built.graph.add_edge(idx, load, EdgeKind::Calls);
+        }
+        assert!(trivial_wrapper_candidates(&built, &Policy::default(), &facts).is_empty());
+    }
+
+    #[test]
+    fn thin_method_is_excluded() {
+        let facts = vec![py_facts("m.py", "class C:\n    def wrap(self, x):\n        return g(x)\n")];
+        let mut built = built_with(vec![func_at("m::C::wrap", 1), func_at("m::caller", 10)]);
+        let cls = built.graph.add_entity(CodeEntity {
+            entity_type: NodeType::Class,
+            ..func_at("m::C", 0)
+        });
+        let (wrap, caller) =
+            (built.graph.node("m::C::wrap").unwrap(), built.graph.node("m::caller").unwrap());
+        built.graph.add_edge(cls, wrap, EdgeKind::Contains);
+        built.graph.add_edge(caller, wrap, EdgeKind::Calls);
+        assert!(trivial_wrapper_candidates(&built, &Policy::default(), &facts).is_empty());
     }
 
     #[test]
