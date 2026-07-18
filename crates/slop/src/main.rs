@@ -10,7 +10,7 @@ use slop_analyze::findings::Severity;
 use std::collections::{HashMap, HashSet};
 
 use slop_analyze::compress::{self, CompressConfig};
-use slop_analyze::{detect, fix, gate, harness, infer, policy::Policy, rename, suppress};
+use slop_analyze::{detect, fix, gate, harness, infer, inline, policy::Policy, rename, suppress};
 use slop_resolve::{Resolver, ScipResolver};
 
 #[derive(Parser)]
@@ -105,6 +105,12 @@ enum Command {
         /// (SCIP can miss a dynamic caller), so review the dry-run first.
         #[arg(long)]
         remove_dead: bool,
+        /// Also inline judge-confirmed trivial wrappers (`trivial-wrapper`):
+        /// rewrite every reference to the callee and delete the wrapper. Runs
+        /// the Tier-3 judge (needs an API key) and touches multiple files, so
+        /// it is opt-in; review the dry-run first.
+        #[arg(long)]
+        inline_wrappers: bool,
     },
     /// Zoned graph-distance compression of a file (D11): full fidelity within
     /// --hops of the --edit loci, skeletons beyond. Prints the compressed
@@ -381,7 +387,7 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Fix { repo, index, write, remove_dead } => {
+        Command::Fix { repo, index, write, remove_dead, inline_wrappers } => {
             let analysis = check::load_analysis(&repo, index.as_deref())?;
             let policy = Policy::load(&repo).unwrap_or_default();
             let findings = detect::run_all(&analysis.built, &policy, &analysis.facts);
@@ -476,15 +482,63 @@ fn main() -> Result<()> {
                     println!("would fix {file}: {n} restating comment(s)");
                 }
             }
-            if total == 0 && renamed == 0 && removed_fns == 0 {
+            // Inlining rewrites references and deletes wrapper definitions, so
+            // its SCIP occurrence lines are only valid against unmodified files.
+            // Under --write it must be the sole writing pass this run; re-index
+            // between it and the others. Dry-run reports alongside them safely.
+            let mut inlined = 0usize;
+            if inline_wrappers {
+                if write && (renamed > 0 || removed_fns > 0 || total > 0) {
+                    bail!(
+                        "--inline-wrappers --write must run alone: other fixes already rewrote files this run, so the index is stale — re-index, then run `slop fix {} --inline-wrappers --write` on its own",
+                        repo.display()
+                    );
+                }
+                let wrapper_findings = check::tier3_wrapper_findings(
+                    &analysis.built,
+                    &policy,
+                    &analysis.facts,
+                    &repo,
+                )?;
+                let plan = inline::plan_inlines(
+                    &analysis.built,
+                    &resolver,
+                    &repo,
+                    &analysis.facts,
+                    &wrapper_findings,
+                );
+                for outcome in &plan.outcomes {
+                    match outcome {
+                        inline::InlineOutcome::Planned(p) => {
+                            inlined += 1;
+                            let verb = if write { "inline" } else { "would inline" };
+                            println!(
+                                "{verb} [trivial-wrapper] {} -> {} ({} reference(s) across {} file(s))",
+                                p.entity, p.callee, p.occurrences, p.file_count
+                            );
+                        }
+                        inline::InlineOutcome::Skipped { entity, reason } => {
+                            eprintln!("skip inline {entity}: {reason}");
+                        }
+                    }
+                }
+                if write {
+                    for (file, src) in &plan.files {
+                        std::fs::write(repo.join(file), src)
+                            .with_context(|| format!("writing {file}"))?;
+                    }
+                }
+            }
+
+            if total == 0 && renamed == 0 && removed_fns == 0 && inlined == 0 {
                 println!("nothing to fix");
             } else if write {
                 println!(
-                    "applied {renamed} rename(s); removed {total} comment(s) across {touched} file(s); removed {removed_fns} dead function(s)"
+                    "applied {renamed} rename(s); removed {total} comment(s) across {touched} file(s); removed {removed_fns} dead function(s); inlined {inlined} wrapper(s)"
                 );
-                if renamed > 0 || removed_fns > 0 {
+                if renamed > 0 || removed_fns > 0 || inlined > 0 {
                     println!(
-                        "note: renames/removals changed the code — re-index (e.g. `slop gate {} --reindex`) before the next check",
+                        "note: renames/removals/inlines changed the code — re-index (e.g. `slop gate {} --reindex`) before the next check",
                         repo.display()
                     );
                 }
@@ -494,8 +548,13 @@ fn main() -> Result<()> {
                 } else {
                     " (pass --remove-dead to also delete dead free functions)".to_string()
                 };
+                let wrap = if inline_wrappers {
+                    format!(" + {inlined} wrapper inline(s)")
+                } else {
+                    " (pass --inline-wrappers to also inline confirmed trivial wrappers)".to_string()
+                };
                 println!(
-                    "dry-run: {renamed} rename(s) + {total} comment(s) across {touched} file(s){tail} — re-run with --write to apply"
+                    "dry-run: {renamed} rename(s) + {total} comment(s) across {touched} file(s){tail}{wrap} — re-run with --write to apply"
                 );
             }
         }

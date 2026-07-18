@@ -222,7 +222,7 @@ pub struct Renames {
 }
 
 /// The SCIP symbol whose definition node carries `entity` id, if any.
-fn symbol_for<'a>(built: &'a BuiltGraph, entity: &str) -> Option<&'a str> {
+pub(crate) fn symbol_for<'a>(built: &'a BuiltGraph, entity: &str) -> Option<&'a str> {
     let node = built.graph.node(entity)?;
     built
         .by_symbol

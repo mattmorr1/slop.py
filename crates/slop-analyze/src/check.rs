@@ -117,7 +117,7 @@ fn tier3_findings(
 /// forwarders with 1-2 callers; the judge rules whether each name earns its
 /// keep. Only judge-confirmed slop becomes a Warning — no structural
 /// false-positive gates CI on its own.
-fn tier3_wrapper_findings(
+pub fn tier3_wrapper_findings(
     built: &build::BuiltGraph,
     policy: &Policy,
     facts: &[source::FileFacts],
