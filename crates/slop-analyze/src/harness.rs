@@ -18,8 +18,11 @@ use std::hash::{Hash, Hasher};
 
 use serde_json::{json, Value};
 
+use slop_parse::Language;
+
 use crate::compress::{self, CompressConfig};
 use crate::policy::Policy;
+use crate::precheck::precheck;
 
 /// Only bother remapping when the strip saves at least this fraction of
 /// characters — otherwise pass the read through untouched.
@@ -212,6 +215,83 @@ pub fn compress_read(
     (stats.skeletonized > 0).then_some(out)
 }
 
+/// The full proposed content of the file a write tool is about to produce.
+/// `Write` carries it directly; `Edit`/`MultiEdit` carry fragments that only
+/// parse in context, so their replacements are applied to the on-disk file
+/// instead — a dedented fragment would fail to parse and silently skip the check.
+fn proposed_content(tool: &str, input: &Value, abs_path: &Path) -> Option<String> {
+    let ti = input.get("tool_input")?;
+    match tool {
+        "Write" => as_str(ti, "content").map(str::to_string),
+        "Edit" => apply_edit(&std::fs::read_to_string(abs_path).ok()?, ti),
+        "MultiEdit" => {
+            let mut current = std::fs::read_to_string(abs_path).ok()?;
+            for edit in ti.get("edits")?.as_array()? {
+                current = apply_edit(&current, edit)?;
+            }
+            Some(current)
+        }
+        _ => None,
+    }
+}
+
+fn apply_edit(current: &str, edit: &Value) -> Option<String> {
+    let old = as_str(edit, "old_string")?;
+    let new = as_str(edit, "new_string")?;
+    if old.is_empty() {
+        return None;
+    }
+    if edit.get("replace_all").and_then(Value::as_bool).unwrap_or(false) {
+        Some(current.replace(old, new))
+    } else {
+        Some(current.replacen(old, new, 1))
+    }
+}
+
+/// PreToolUse handler (W2): pre-check a *proposed* write against the sanctioned
+/// -channel policy and steer via `additionalContext`, before the edit lands.
+///
+/// Warn-only on purpose. `permissionDecision: "deny"` is deliberately unused:
+/// a false deny blocks real work, and per-language detector precision is not
+/// measured yet. Promote a rule to `ask`/`deny` only once its measured precision
+/// earns it.
+pub fn handle_pre_tool_use(input: &Value) -> Value {
+    let tool = as_str(input, "tool_name").unwrap_or("");
+    if !matches!(tool, "Write" | "Edit" | "MultiEdit") {
+        return json!({});
+    }
+    let (file, cwd) = read_target(input);
+    let Some(file) = file else {
+        return json!({});
+    };
+    let Some(lang) = Language::from_path(&file) else {
+        return json!({});
+    };
+    let repo = find_repo_root(&cwd);
+    let policy = Policy::load(&repo).unwrap_or_default();
+    // No policy => silent (D8), and we skip reading the file at all.
+    if policy.channels.is_empty() {
+        return json!({});
+    }
+    let Some(rel) = repo_relative(&repo, &file) else {
+        return json!({});
+    };
+    let Some(content) = proposed_content(tool, input, Path::new(&file)) else {
+        return json!({});
+    };
+    let findings = precheck(lang, &rel, &content, &policy);
+    if findings.is_empty() {
+        return json!({});
+    }
+    let context: Vec<String> = findings.iter().map(|f| f.steering()).collect();
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": context.join("\n"),
+        }
+    })
+}
+
 /// PostToolUse handler. Returns the JSON to print to stdout: either a
 /// `hookSpecificOutput` with `updatedToolOutput`/`additionalContext`, or an
 /// empty object (no-op passthrough).
@@ -223,7 +303,7 @@ pub fn handle_post_tool_use(input: &Value) -> Value {
         if let Some(path) = input
             .get("tool_input")
             .and_then(|t| as_str(t, "file_path"))
-            .filter(|p| p.ends_with(".py"))
+            .filter(|p| Language::from_path(p).is_some())
         {
             let repo = find_repo_root(&read_target(input).1);
             if let Some(rel) = repo_relative(&repo, path) {
@@ -237,7 +317,7 @@ pub fn handle_post_tool_use(input: &Value) -> Value {
         return json!({});
     }
     let (file, cwd) = read_target(input);
-    let Some(file) = file.filter(|f| f.ends_with(".py")) else {
+    let Some(file) = file.filter(|f| Language::from_path(f).is_some()) else {
         return json!({});
     };
     let repo = find_repo_root(&cwd);
@@ -408,6 +488,98 @@ mod tests {
         }));
         assert_eq!(out, json!({})); // edits are silent, side-effect only
         assert_eq!(load_state(&zone).edits, vec!["mod.py".to_string()]);
+        let _ = std::fs::remove_file(&zone);
+    }
+
+    /// A repo with a Net channel policy and a file on disk to Edit against.
+    fn repo_with_policy(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("slop-pre-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+            dir.join("slop.toml"),
+            "[channels]\nnet = [\"core.http_client.HttpClient\"]\n",
+        );
+        dir
+    }
+
+    #[test]
+    fn pre_tool_use_steers_a_proposed_bypass() {
+        let dir = repo_with_policy("write");
+        let target = dir.join("services").join("alerts.py");
+        let _ = std::fs::create_dir_all(target.parent().unwrap());
+        let out = handle_pre_tool_use(&json!({
+            "tool_name": "Write",
+            "cwd": dir.to_string_lossy(),
+            "tool_input": {
+                "file_path": target.to_string_lossy(),
+                "content": "import requests\n\ndef send(u):\n    return requests.post(u)\n",
+            }
+        }));
+        let ctx = out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(ctx.contains("core.http_client.HttpClient"), "got {ctx:?}");
+        // Warn-only: never asserts a permission decision.
+        assert!(out["hookSpecificOutput"].get("permissionDecision").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_tool_use_reconstructs_an_edit_from_disk() {
+        // An Edit's new_string is a dedented fragment that would not parse on its
+        // own — the check has to apply it to the real file first.
+        let dir = repo_with_policy("edit");
+        let target = dir.join("alerts.py");
+        let _ = std::fs::write(&target, "import requests\n\ndef send(u):\n    return None\n");
+        let out = handle_pre_tool_use(&json!({
+            "tool_name": "Edit",
+            "cwd": dir.to_string_lossy(),
+            "tool_input": {
+                "file_path": target.to_string_lossy(),
+                "old_string": "    return None",
+                "new_string": "    return requests.post(u)",
+            }
+        }));
+        assert!(out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("core.http_client.HttpClient"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_tool_use_is_silent_without_a_policy_and_on_reads() {
+        // No slop.toml anywhere => no steering (D8).
+        let out = handle_pre_tool_use(&json!({
+            "tool_name": "Write",
+            "cwd": "/nope",
+            "tool_input": { "file_path": "/nope/a.py", "content": "import requests\n" }
+        }));
+        assert_eq!(out, json!({}));
+        // Reads are the PostToolUse hook's business, not this one's.
+        assert_eq!(
+            handle_pre_tool_use(&json!({
+                "tool_name": "Read", "tool_input": {"file_path": "/x/a.py"}
+            })),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn edit_zone_records_every_supported_language() {
+        // W3: the wedge is not Python-only. A .rs edit must register too.
+        let dir = std::env::temp_dir().join(format!("slop-lang-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let zone = zone_file(&dir);
+        let _ = std::fs::remove_file(&zone);
+        for name in ["a.rs", "b.ts", "c.py"] {
+            handle_post_tool_use(&json!({
+                "tool_name": "Edit",
+                "cwd": dir.to_string_lossy(),
+                "tool_input": { "file_path": dir.join(name).to_string_lossy() }
+            }));
+        }
+        assert_eq!(load_state(&zone).edits, vec!["a.rs", "b.ts", "c.py"]);
         let _ = std::fs::remove_file(&zone);
     }
 

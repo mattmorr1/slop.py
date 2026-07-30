@@ -25,6 +25,7 @@ struct Cli {
 /// `post-tool-use`, `user-prompt-submit`.
 #[derive(Clone, Copy, ValueEnum)]
 enum HookEvent {
+    PreToolUse,
     PostToolUse,
     UserPromptSubmit,
 }
@@ -703,12 +704,15 @@ fn main() -> Result<()> {
             use std::io::Read;
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
-            let input: serde_json::Value = if buf.trim().is_empty() {
-                serde_json::json!({})
-            } else {
-                serde_json::from_str(&buf)?
-            };
+            // Hooks run on every read/write, so payload we can't parse is a
+            // silent no-op rather than an error: a non-zero exit here would
+            // surface as a hook failure in the agent host on each tool call.
+            // Same discipline as the read-remap, which passes a read through
+            // untouched rather than risk corrupting it.
+            let input: serde_json::Value =
+                serde_json::from_str(&buf).unwrap_or_else(|_| serde_json::json!({}));
             let output = match event {
+                HookEvent::PreToolUse => harness::handle_pre_tool_use(&input),
                 HookEvent::PostToolUse => harness::handle_post_tool_use(&input),
                 HookEvent::UserPromptSubmit => harness::handle_user_prompt_submit(&input),
             };

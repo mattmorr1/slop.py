@@ -83,14 +83,31 @@ npx --yes @sourcegraph/scip-python index <repo> --project-name <name> --output <
 
 ## 2. Hooks
 
-Both hooks derive steering from `slop.toml` alone (no SCIP index, no graph
-build) so they are cheap enough to run on every read/prompt.
+All three hooks derive steering from `slop.toml` alone (no SCIP index, no graph
+build) so they are cheap enough to run on every read/write/prompt.
+
+- `slop hook pre-tool-use` — **write-time steering**: judges the content a
+  `Write`/`Edit`/`MultiEdit` is *about to* produce, before it lands, and attaches
+  `additionalContext` naming the sanctioned channel it bypasses.
+  - Content-local by design: it parses the proposed text, takes the qualified
+    names it references, and asks the policy whether an effect it acquires
+    already has a channel. No index, no graph — ~7ms including process spawn.
+  - An `Edit`'s `new_string` is a dedented fragment that wouldn't parse alone, so
+    the replacement is applied to the on-disk file first and the *result* checked.
+  - **Warn-only.** It never sets `permissionDecision`, so it cannot block a write.
+    Denying is gated on measured per-rule precision — a false deny costs more than
+    a missed finding. Promote a rule only once its precision earns it.
+  - Silent when the repo has no `slop.toml` channels (D8), and for files in no
+    supported language.
+  - Sees *direct* acquisition only (no graph ⇒ no transitive propagation). The
+    deeper checks stay in `validate_change` / `slop gate`.
 
 - `slop hook post-tool-use` — maintains a **session edit zone** and does
   **zoned graph-distance compression** on reads:
-  - On a `Write`/`Edit`/`MultiEdit` of a `.py` file, records it in the edit
-    zone (a small state file in the system temp dir, keyed by repo).
-  - On a `Read` of a `.py` file, skeletonizes functions that are more than
+  - On a `Write`/`Edit`/`MultiEdit` of a file in any supported language
+    (Python, JS/TS, Rust), records it in the edit zone (a small state file in
+    the system temp dir, keyed by repo).
+  - On a `Read` of such a file, skeletonizes functions that are more than
     `edit_zone_hops` (1) graph hops from the edit zone — full fidelity for the
     code you're working near, a signature + effect-signature + docstring
     contract for the distant context — and attaches sanctioned-channel
@@ -104,7 +121,8 @@ build) so they are cheap enough to run on every read/prompt.
     skeleton (fail → re-read → verbatim → succeeds). Set
     `SLOP_COMPRESS_READS=0` to disable read compression entirely (steering
     still applies).
-  - Non-`Read`/`Write`/`Edit`, non-`.py` reads pass through untouched.
+  - Non-`Read`/`Write`/`Edit` calls, and reads of files in no supported
+    language, pass through untouched.
 
   > Cost: a read that triggers zoned compression builds the graph
   > (~0.1–0.5s depending on repo size, needs `<repo>/index.scip`). Small
@@ -120,6 +138,14 @@ the session edit zone that read compression measures graph distance against:
 ```json
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "/abs/path/to/target/release/slop hook pre-tool-use" }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Read|Write|Edit|MultiEdit",

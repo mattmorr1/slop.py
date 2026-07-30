@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 /// Argument tail that marks a `command` string as slop-authored. Used to find
 /// and replace prior installs so re-running doesn't stack duplicate hooks.
+pub const PRE_TOOL_CMD: &str = "hook pre-tool-use";
 pub const POST_TOOL_CMD: &str = "hook post-tool-use";
 pub const PROMPT_CMD: &str = "hook user-prompt-submit";
 
@@ -19,6 +20,9 @@ pub const PROMPT_CMD: &str = "hook user-prompt-submit";
 /// compression + steering; the write tools let it record the session edit zone
 /// that compression measures graph distance against.
 const POST_TOOL_MATCHER: &str = "Read|Write|Edit|MultiEdit";
+
+/// The PreToolUse hook only judges proposed writes, so it never sees reads.
+const PRE_TOOL_MATCHER: &str = "Write|Edit|MultiEdit";
 
 fn ensure_object(v: &mut Value) -> &mut serde_json::Map<String, Value> {
     if !v.is_object() {
@@ -47,7 +51,9 @@ pub fn merge_mcp(mut existing: Value, exe: &str, repo: &str) -> Value {
 fn is_slop_command(hook: &Value) -> bool {
     hook.get("command")
         .and_then(Value::as_str)
-        .is_some_and(|c| c.contains(POST_TOOL_CMD) || c.contains(PROMPT_CMD))
+        .is_some_and(|c| {
+            c.contains(PRE_TOOL_CMD) || c.contains(POST_TOOL_CMD) || c.contains(PROMPT_CMD)
+        })
 }
 
 /// Strip slop-authored inner hooks from an event's group array, dropping any
@@ -82,12 +88,19 @@ fn command_group(matcher: Option<&str>, command: String) -> Value {
     }
 }
 
-/// Add (or replace) slop's PostToolUse + UserPromptSubmit hooks in a
-/// `settings.json` value, preserving unrelated hooks.
+/// Add (or replace) slop's PreToolUse + PostToolUse + UserPromptSubmit hooks in
+/// a `settings.json` value, preserving unrelated hooks.
 pub fn merge_hooks(mut existing: Value, exe: &str) -> Value {
     let obj = ensure_object(&mut existing);
     let hooks_val = obj.entry("hooks").or_insert_with(|| json!({}));
     let hooks = ensure_object(hooks_val);
+
+    let mut pre = strip_slop_groups(hooks.get("PreToolUse"));
+    pre.push(command_group(
+        Some(PRE_TOOL_MATCHER),
+        format!("{exe} {PRE_TOOL_CMD}"),
+    ));
+    hooks.insert("PreToolUse".to_string(), Value::Array(pre));
 
     let mut post = strip_slop_groups(hooks.get("PostToolUse"));
     post.push(command_group(
