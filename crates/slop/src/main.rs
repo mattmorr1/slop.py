@@ -182,7 +182,7 @@ enum Command {
         /// make the loop act on duplicate-exact / complexity-spike.
         #[arg(long, value_enum, default_value_t = FailOn::Blocking)]
         fail_on: FailOn,
-        /// Regenerate the SCIP index (via scip-python) before checking
+        /// Regenerate the SCIP index (auto-detected indexer) before checking
         #[arg(long)]
         reindex: bool,
         /// Run inside an isolated `git worktree` of the repo
@@ -229,10 +229,11 @@ enum Command {
         #[arg(long)]
         index: Option<PathBuf>,
     },
-    /// Generate (or regenerate) the SCIP index slop reads, via scip-python.
-    /// Wraps the `npx @sourcegraph/scip-python` invocation and verifies the
-    /// result actually has definitions — scip-python can crash mid-walk and
-    /// still write a near-empty index that makes every check silently pass.
+    /// Generate (or regenerate) the SCIP index slop reads. Wraps the per-language
+    /// indexer (`scip-python`, `scip-typescript`, `rust-analyzer scip`) and
+    /// verifies the result actually has definitions — an indexer can crash
+    /// mid-walk and still write a near-empty index that makes every check
+    /// silently pass.
     Index {
         /// Repo root to index (default: current directory)
         #[arg(default_value = ".")]
@@ -719,11 +720,7 @@ fn main() -> Result<()> {
             indexer,
         } => {
             let out = output.unwrap_or_else(|| repo.join("index.scip"));
-            let project = project_name.unwrap_or_else(|| {
-                repo.file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "repo".to_string())
-            });
+            let project = project_name.unwrap_or_else(|| default_project_name(&repo));
             run_indexer(indexer, &repo, &out, &project)?;
             // Verify it's usable, not just present (scip-python can exit 0 with
             // a broken, definition-less index).
@@ -731,7 +728,7 @@ fn main() -> Result<()> {
             let defs = resolver.definition_count();
             if defs == 0 {
                 bail!(
-                    "indexed {} but the result has no definitions — scip-python likely failed. Check its output above.",
+                    "indexed {} but the result has no definitions — the indexer likely failed. Check its output above.",
                     repo.display()
                 );
             }
@@ -1143,12 +1140,14 @@ fn wait_for_port(port: u16) -> Result<()> {
 /// index path needs.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Indexer {
-    /// Detect from project markers (pyproject/setup/*.py vs package.json/tsconfig).
+    /// Detect from project markers (pyproject/setup/*.py vs Cargo.toml vs package.json/tsconfig).
     Auto,
     /// `scip-python` (Python).
     Python,
     /// `scip-typescript` (JavaScript / TypeScript).
     Typescript,
+    /// `rust-analyzer scip` (Rust) — the one indexer that needs no npx.
+    Rust,
 }
 
 impl Indexer {
@@ -1158,10 +1157,14 @@ impl Indexer {
             return self;
         }
         let has = |f: &str| repo.join(f).exists();
-        // Python markers win when both ecosystems are present — slop's
-        // parser-based rules are Python-only, so it's the richer target.
+        // Python markers win when several ecosystems are present — slop's
+        // parser-based rules cover Python most fully, so it's the richer target.
+        // Cargo.toml is checked before the JS markers because a Rust repo often
+        // carries a package.json for web assets, but not the reverse.
         if has("pyproject.toml") || has("setup.py") || has("requirements.txt") || has_top_level_ext(repo, "py") {
             Indexer::Python
+        } else if has("Cargo.toml") {
+            Indexer::Rust
         } else if has("tsconfig.json") || has("package.json") {
             Indexer::Typescript
         } else {
@@ -1183,7 +1186,7 @@ fn has_top_level_ext(repo: &Path, ext: &str) -> bool {
 }
 
 /// Source-file extensions slop indexes — the staleness check watches these.
-const SOURCE_EXTS: &[&str] = &["py", "js", "jsx", "ts", "tsx", "mjs", "cjs"];
+const SOURCE_EXTS: &[&str] = &["py", "js", "jsx", "ts", "tsx", "mjs", "cjs", "rs"];
 
 /// Directories never worth walking for source-file mtimes.
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", ".venv", "venv", "target", "__pycache__"];
@@ -1249,33 +1252,49 @@ fn run_scip_index(repo: &Path, index: Option<&Path>) -> Result<()> {
     run_indexer(Indexer::Auto, repo, &out, "slop-gate")
 }
 
+/// scip-python's `--project-name` default: the repo directory name.
+fn default_project_name(repo: &Path) -> String {
+    repo.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repo".to_string())
+}
+
 /// Run the resolved SCIP indexer for `repo`, writing to `out`.
 fn run_indexer(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> Result<()> {
     let indexer = indexer.resolve(repo);
-    let mut cmd = Process::new("npx");
-    cmd.arg("--yes");
-    match indexer {
-        Indexer::Python | Indexer::Auto => {
-            cmd.args(["@sourcegraph/scip-python", "index"])
-                .arg(repo)
-                .args(["--project-name", project, "--output"])
-                .arg(out);
+    let npx = || {
+        let mut cmd = Process::new("npx");
+        cmd.arg("--yes");
+        cmd
+    };
+    let (tool, install_hint, mut cmd) = match indexer {
+        Indexer::Rust => {
+            // rust-analyzer emits SCIP natively, so Rust needs no Node toolchain.
+            let mut cmd = Process::new("rust-analyzer");
+            cmd.arg("scip").arg(repo).arg("--output").arg(out);
+            ("rust-analyzer scip", "install it with: rustup component add rust-analyzer", cmd)
         }
         Indexer::Typescript => {
             // scip-typescript reads the project's tsconfig from its cwd and
             // takes just an output path.
+            let mut cmd = npx();
             cmd.args(["@sourcegraph/scip-typescript", "index", "--output"])
                 .arg(out)
                 .current_dir(repo);
+            ("scip-typescript", "is npx on PATH?", cmd)
         }
-    }
-    let tool = match indexer {
-        Indexer::Typescript => "scip-typescript",
-        _ => "scip-python",
+        Indexer::Python | Indexer::Auto => {
+            let mut cmd = npx();
+            cmd.args(["@sourcegraph/scip-python", "index"])
+                .arg(repo)
+                .args(["--project-name", project, "--output"])
+                .arg(out);
+            ("scip-python", "is npx on PATH?", cmd)
+        }
     };
     let status = cmd
         .status()
-        .with_context(|| format!("running {tool} (is npx on PATH?)"))?;
+        .with_context(|| format!("running {tool} ({install_hint})"))?;
     if !status.success() {
         bail!("{tool} indexing failed for {}", repo.display());
     }

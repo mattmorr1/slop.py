@@ -21,6 +21,9 @@ pub fn module_of(symbol: &str) -> Option<String> {
 /// Human-oriented entity ID: module path joined to the descriptor chain
 /// with `::`, suffix punctuation stripped.
 pub fn entity_id(symbol: &str) -> Option<String> {
+    if let Some((package, descriptors)) = rust_parts(symbol) {
+        return Some(rust_entity_id(package, descriptors));
+    }
     let descriptors = descriptors_of(symbol)?;
     let mut parts: Vec<String> = Vec::new();
     for segment in split_descriptors(descriptors) {
@@ -54,7 +57,8 @@ pub fn entity_id(symbol: &str) -> Option<String> {
 /// module-specifier descriptor (`"node:fs"`) for builtins, leaving the useless
 /// `.d.ts` filename as the descriptor's "module". This derives a clean
 /// `<module>.<member>` (e.g. `axios.get`, `fs.readFileSync`, `process.env`) so
-/// the seed table matches on the name you'd actually `import`.
+/// the seed table matches on the name you'd actually `import`. Rust falls
+/// through to [`entity_id`], which already crate-prefixes (`std::env::var`).
 pub fn external_effect_id(symbol: &str) -> Option<String> {
     let mut fields = symbol.splitn(5, ' ');
     let scheme = fields.next()?;
@@ -92,6 +96,85 @@ pub fn external_effect_id(symbol: &str) -> Option<String> {
         Some(m) if m != module => format!("{module}::{m}"),
         _ => module,
     })
+}
+
+/// Package (crate) and descriptor fields of a `rust-analyzer` SCIP symbol, or
+/// `None` for any other scheme. Rust needs both: the crate lives in the package
+/// field (like scip-typescript) *and* the module path in the descriptors (like
+/// scip-python).
+fn rust_parts(symbol: &str) -> Option<(&str, &str)> {
+    let mut fields = symbol.splitn(5, ' ');
+    if fields.next()? != "rust-analyzer" {
+        return None;
+    }
+    let _manager = fields.next()?;
+    let package = fields.next()?;
+    let _version = fields.next()?;
+    Some((package, fields.next()?))
+}
+
+/// Flatten a Rust descriptor chain to `crate::module::Type::method`. Rust
+/// descriptors carry a `crate/` root marker, anonymous `impl#` blocks, generic
+/// parameters and trait qualifiers — e.g. ``fs/impl#[DirEntry]metadata().`` and
+/// ``collections/hash/map/impl#[`HashMap<K, V, S, A>`][`Index<&Q>`]index().`` —
+/// none of which belong in the ID the seed table matches and findings display.
+fn rust_entity_id(package: &str, descriptors: &str) -> String {
+    let mut parts = vec![package.to_string()];
+    for segment in split_descriptors(descriptors) {
+        // `crate` is the root marker and `impl` an anonymous block: neither names anything.
+        if segment == "crate" || segment == "impl" {
+            continue;
+        }
+        let (groups, member) = bracket_groups(segment);
+        // First bracket group = the implementing type; later groups are trait
+        // qualifiers that add nothing to the entity's identity.
+        parts.extend(groups.first().map(|g| clean_rust_name(g)));
+        parts.push(clean_rust_name(member));
+    }
+    parts.retain(|p| !p.is_empty());
+    parts.join("::")
+}
+
+/// Split a Rust descriptor segment into its top-level `[...]` group contents
+/// and the trailing member text. Backtick-quoted type names may themselves
+/// contain brackets (`[`[u8; 4]`]`), so quoting and nesting are both honored.
+fn bracket_groups(segment: &str) -> (Vec<&str>, &str) {
+    let mut groups = Vec::new();
+    let mut in_quote = false;
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut tail = 0usize;
+    for (i, &b) in segment.as_bytes().iter().enumerate() {
+        match b {
+            b'`' => in_quote = !in_quote,
+            b'[' if !in_quote => {
+                if depth == 0 {
+                    start = i + 1;
+                }
+                depth += 1;
+            }
+            b']' if !in_quote => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    groups.push(&segment[start..i]);
+                    tail = i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    (groups, &segment[tail..])
+}
+
+/// Strip backtick quoting, SCIP suffix punctuation and generic parameters from
+/// a Rust descriptor name: ``` `HashMap<K, V>` ``` becomes `HashMap`.
+fn clean_rust_name(name: &str) -> String {
+    let base = name.trim().trim_matches('`');
+    let base = base.trim_end_matches("().").trim_end_matches(['#', ':', '.', '!', '/']);
+    match base.find('<') {
+        Some(i) => base[..i].trim_end().to_string(),
+        None => base.trim().to_string(),
+    }
 }
 
 /// The descriptor tail of a SCIP symbol: everything after the 4
@@ -191,5 +274,56 @@ mod tests {
             external_effect_id("scip-python python requests 2.0 `requests.api`/post().").as_deref(),
             Some("requests.api::post")
         );
+    }
+
+    // Every input below is a verbatim symbol from a real `rust-analyzer scip`
+    // index of this repo — not a hand-written guess at the grammar.
+    const STD: &str = "rust-analyzer cargo std https://github.com/rust-lang/rust/library/std ";
+
+    #[test]
+    fn rust_ids_are_crate_prefixed() {
+        // Internal crate entities: the crate disambiguates same-named modules.
+        assert_eq!(
+            entity_id("rust-analyzer cargo slop-analyze 0.0.1 findings/Finding#").as_deref(),
+            Some("slop-analyze::findings::Finding")
+        );
+        // The `crate/` root marker reduces to the crate itself.
+        assert_eq!(
+            entity_id("rust-analyzer cargo slop-analyze 0.0.1 crate/").as_deref(),
+            Some("slop-analyze")
+        );
+        // Free function in a std module — the shape effect seeds key off.
+        assert_eq!(entity_id(&format!("{STD}env/var().")).as_deref(), Some("std::env::var"));
+        assert_eq!(
+            entity_id(&format!("{STD}fs/create_dir_all().")).as_deref(),
+            Some("std::fs::create_dir_all")
+        );
+    }
+
+    #[test]
+    fn rust_impl_blocks_and_generics_collapse() {
+        // `impl#` is anonymous; the implementing type is what names the method.
+        assert_eq!(
+            entity_id(&format!("{STD}fs/impl#[DirEntry]metadata().")).as_deref(),
+            Some("std::fs::DirEntry::metadata")
+        );
+        // Generic parameters are stripped; the trait qualifier group is dropped.
+        assert_eq!(
+            entity_id(&format!("{STD}collections/hash/map/impl#[`HashMap<K, V, S, A>`]contains_key().")).as_deref(),
+            Some("std::collections::hash::map::HashMap::contains_key")
+        );
+        assert_eq!(
+            entity_id(&format!("{STD}collections/hash/map/impl#[`HashMap<K, V, S, A>`][`Index<&Q>`]index().")).as_deref(),
+            Some("std::collections::hash::map::HashMap::index")
+        );
+    }
+
+    #[test]
+    fn rust_seed_prefixes_match_dotted_ids() {
+        // What `infer_effects` actually feeds the seed table (it maps `::`->`.`).
+        let dotted = |sym: &str| entity_id(sym).unwrap().replace("::", ".");
+        assert!(dotted(&format!("{STD}env/var().")).starts_with("std.env.var"));
+        assert!(dotted(&format!("{STD}fs/impl#[OpenOptions]create().")).starts_with("std.fs."));
+        assert!(dotted(&format!("{STD}process/impl#[Command]spawn().")).starts_with("std.process.Command"));
     }
 }

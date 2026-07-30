@@ -139,6 +139,75 @@ pub const SEEDS: &[Seed] = &[
     Seed { prefix: "child_process", effect: Effect::Concurrency },
     Seed { prefix: "worker_threads", effect: Effect::Concurrency },
     Seed { prefix: "cluster", effect: Effect::Concurrency },
+
+    // --- Rust ---
+    // Rust IDs are crate-prefixed by `entity_id` (`std::env::var`), so these
+    // never collide with the bare Node prefixes above (`net`, `fs`, `http`).
+    // std's module layout maps almost 1:1 onto the effect lattice, which is why
+    // this table is short. FS is enumerated per-member, not as a blanket
+    // `std.fs`, so reads don't also report as writes.
+    // Net
+    Seed { prefix: "std.net", effect: Effect::Net },
+    Seed { prefix: "tokio.net", effect: Effect::Net },
+    Seed { prefix: "reqwest", effect: Effect::Net },
+    Seed { prefix: "hyper", effect: Effect::Net },
+    Seed { prefix: "ureq", effect: Effect::Net },
+    Seed { prefix: "isahc", effect: Effect::Net },
+    Seed { prefix: "tonic", effect: Effect::Net },
+    Seed { prefix: "tungstenite", effect: Effect::Net },
+    // FS read
+    Seed { prefix: "std.fs.read", effect: Effect::FsRead },
+    Seed { prefix: "std.fs.read_to_string", effect: Effect::FsRead },
+    Seed { prefix: "std.fs.read_dir", effect: Effect::FsRead },
+    Seed { prefix: "std.fs.metadata", effect: Effect::FsRead },
+    Seed { prefix: "std.fs.canonicalize", effect: Effect::FsRead },
+    Seed { prefix: "std.fs.File.open", effect: Effect::FsRead },
+    Seed { prefix: "std.fs.DirEntry.metadata", effect: Effect::FsRead },
+    // FS write
+    Seed { prefix: "std.fs.write", effect: Effect::FsWrite },
+    Seed { prefix: "std.fs.copy", effect: Effect::FsWrite },
+    Seed { prefix: "std.fs.rename", effect: Effect::FsWrite },
+    Seed { prefix: "std.fs.create_dir", effect: Effect::FsWrite },
+    Seed { prefix: "std.fs.create_dir_all", effect: Effect::FsWrite },
+    Seed { prefix: "std.fs.remove_file", effect: Effect::FsWrite },
+    Seed { prefix: "std.fs.remove_dir", effect: Effect::FsWrite },
+    Seed { prefix: "std.fs.remove_dir_all", effect: Effect::FsWrite },
+    Seed { prefix: "std.fs.set_permissions", effect: Effect::FsWrite },
+    Seed { prefix: "std.fs.File.create", effect: Effect::FsWrite },
+    // OpenOptions is read-or-write by builder flags we can't see: both.
+    Seed { prefix: "std.fs.OpenOptions", effect: Effect::FsRead },
+    Seed { prefix: "std.fs.OpenOptions", effect: Effect::FsWrite },
+    Seed { prefix: "tokio.fs", effect: Effect::FsRead },
+    Seed { prefix: "tokio.fs", effect: Effect::FsWrite },
+    // DB
+    Seed { prefix: "sqlx", effect: Effect::Db },
+    Seed { prefix: "diesel", effect: Effect::Db },
+    Seed { prefix: "rusqlite", effect: Effect::Db },
+    Seed { prefix: "postgres", effect: Effect::Db },
+    Seed { prefix: "tokio_postgres", effect: Effect::Db },
+    Seed { prefix: "sea_orm", effect: Effect::Db },
+    // Env
+    Seed { prefix: "std.env.var", effect: Effect::Env },
+    Seed { prefix: "std.env.var_os", effect: Effect::Env },
+    Seed { prefix: "std.env.vars", effect: Effect::Env },
+    Seed { prefix: "std.env.vars_os", effect: Effect::Env },
+    Seed { prefix: "std.env.set_var", effect: Effect::Env },
+    Seed { prefix: "std.env.remove_var", effect: Effect::Env },
+    Seed { prefix: "dotenvy", effect: Effect::Env },
+    // Nondeterminism
+    Seed { prefix: "rand", effect: Effect::Nondeterminism },
+    Seed { prefix: "std.time.SystemTime.now", effect: Effect::Nondeterminism },
+    Seed { prefix: "std.time.Instant.now", effect: Effect::Nondeterminism },
+    Seed { prefix: "uuid.Uuid.new_v4", effect: Effect::Nondeterminism },
+    Seed { prefix: "chrono.Utc.now", effect: Effect::Nondeterminism },
+    Seed { prefix: "chrono.Local.now", effect: Effect::Nondeterminism },
+    // Concurrency
+    Seed { prefix: "std.process.Command", effect: Effect::Concurrency },
+    Seed { prefix: "std.thread.spawn", effect: Effect::Concurrency },
+    Seed { prefix: "std.sync.mpsc", effect: Effect::Concurrency },
+    Seed { prefix: "tokio.spawn", effect: Effect::Concurrency },
+    Seed { prefix: "tokio.task", effect: Effect::Concurrency },
+    Seed { prefix: "rayon", effect: Effect::Concurrency },
 ];
 
 /// Entity-id prefixes that never seed, even under a matching seed prefix:
@@ -259,5 +328,27 @@ mod tests {
         assert_eq!(seed_effects_for("child_process.exec"), vec![Effect::Concurrency]);
         // Boundary: a package that merely starts with a seed name doesn't match.
         assert!(seed_effects_for("axioms.thing").is_empty());
+    }
+
+    #[test]
+    fn rust_seeds_resolve() {
+        assert_eq!(seed_effects_for("std.env.var"), vec![Effect::Env]);
+        assert_eq!(seed_effects_for("std.fs.create_dir_all"), vec![Effect::FsWrite]);
+        assert_eq!(seed_effects_for("std.net.TcpStream.connect"), vec![Effect::Net]);
+        assert_eq!(seed_effects_for("std.process.Command.spawn"), vec![Effect::Concurrency]);
+        assert_eq!(seed_effects_for("reqwest.blocking.Client.get"), vec![Effect::Net]);
+        assert_eq!(
+            seed_effects_for("std.fs.OpenOptions.open"),
+            vec![Effect::FsRead, Effect::FsWrite]
+        );
+        // A read member must not also report as a write: `std.fs.read` is a
+        // sibling of `std.fs.read_to_string`, not a prefix of it.
+        assert_eq!(seed_effects_for("std.fs.read_to_string"), vec![Effect::FsRead]);
+        assert_eq!(seed_effects_for("std.fs.read_dir"), vec![Effect::FsRead]);
+        // Data you already hold is not fresh acquisition.
+        assert!(seed_effects_for("std.fs.DirEntry.path").is_empty());
+        assert!(seed_effects_for("std.time.Duration.as_secs").is_empty());
+        // The bare Node prefixes must not swallow crate-prefixed Rust IDs.
+        assert!(seed_effects_for("std.collections.hash.map.HashMap.insert").is_empty());
     }
 }

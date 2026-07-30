@@ -55,7 +55,11 @@ impl SymbolKind {
             SymbolKind::Function
         } else if symbol.ends_with('#') {
             SymbolKind::Class
-        } else if symbol.ends_with(':') {
+        } else if symbol.ends_with(':') || symbol.ends_with('/') {
+            // `:` is scip-python's namespace suffix; `/` is how rust-analyzer
+            // and scip-typescript terminate a module/file descriptor. Without
+            // the `/` arm those are `Unknown`, so no module nodes exist and the
+            // Imports graph (circular-import detection) is empty.
             SymbolKind::Module
         } else if symbol.ends_with(')') {
             SymbolKind::Parameter
