@@ -257,10 +257,9 @@ pub fn load_analysis(repo: &Path, index: Option<&Path>) -> Result<Analysis> {
         .unwrap_or_else(|| repo.join("index.scip"));
     if !index_path.exists() {
         bail!(
-            "no SCIP index at {} — generate one with:\n  npx --yes @sourcegraph/scip-python index {} --project-name <name> --output {}",
+            "no SCIP index at {} — generate one with:\n  slop index {}",
             index_path.display(),
             repo.display(),
-            index_path.display(),
         );
     }
     let resolver = ScipResolver::load(&index_path)?;

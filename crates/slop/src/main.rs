@@ -544,19 +544,26 @@ fn main() -> Result<()> {
                     );
                 }
             } else {
-                let tail = if remove_dead {
-                    format!(" + {removed_fns} dead function(s)")
-                } else {
-                    " (pass --remove-dead to also delete dead free functions)".to_string()
-                };
-                let wrap = if inline_wrappers {
-                    format!(" + {inlined} wrapper inline(s)")
-                } else {
-                    " (pass --inline-wrappers to also inline confirmed trivial wrappers)".to_string()
-                };
-                println!(
-                    "dry-run: {renamed} rename(s) + {total} comment(s) across {touched} file(s){tail}{wrap} — re-run with --write to apply"
-                );
+                let mut summary =
+                    format!("dry-run: {renamed} rename(s) + {total} comment(s) across {touched} file(s)");
+                if remove_dead {
+                    summary.push_str(&format!(" + {removed_fns} dead function(s)"));
+                }
+                if inline_wrappers {
+                    summary.push_str(&format!(" + {inlined} wrapper inline(s)"));
+                }
+                println!("{summary}");
+                println!("apply with: slop fix --write");
+                let mut extras = Vec::new();
+                if !remove_dead {
+                    extras.push("--remove-dead (delete dead free functions)");
+                }
+                if !inline_wrappers {
+                    extras.push("--inline-wrappers (inline confirmed trivial wrappers)");
+                }
+                if !extras.is_empty() {
+                    println!("more fixes available: {}", extras.join(", "));
+                }
             }
         }
         Command::Compress {
@@ -767,6 +774,13 @@ fn main() -> Result<()> {
             );
         }
         Command::Init { repo, index, write } => {
+            // Onboarding entry point: without an index every downstream step
+            // dead-ends, so generate one first (auto-detected indexer).
+            let index_path = index.clone().unwrap_or_else(|| repo.join("index.scip"));
+            if !index_path.exists() {
+                eprintln!("no {} — running slop index...", index_path.display());
+                run_indexer(Indexer::Auto, &repo, &index_path, &default_project_name(&repo))?;
+            }
             let check::Analysis { built, .. } = check::load_analysis(&repo, index.as_deref())?;
             let proposals = infer::infer_channels(&built);
             if proposals.is_empty() {
@@ -1033,11 +1047,10 @@ fn install_harness(repo: &Path, force: bool) -> Result<()> {
 
     println!(
         "\nharness installed. next:\n  \
-         - generate a SCIP index:  npx --yes @sourcegraph/scip-python index {repo_str} --project-name {} --output {repo_str}/index.scip\n  \
+         - generate a SCIP index:  slop index {repo_str}\n  \
          - optional policy:        slop init {repo_str} --write\n  \
          - gate the fix-loop:      slop gate {repo_str} --reindex\n\
-         Restart the agent host to load the new MCP server and hooks.",
-        repo.file_name().map(|s| s.to_string_lossy()).unwrap_or_else(|| "repo".into()),
+         Restart the agent host to load the new MCP server and hooks."
     );
     Ok(())
 }

@@ -13,7 +13,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use slop_analyze::build::BuiltGraph;
 use slop_analyze::{check, query};
 
@@ -61,6 +61,18 @@ fn event_loop(
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
                 continue;
+            }
+            // Ctrl-C / Ctrl-D always quit, from any mode. Raw mode disables the
+            // terminal's own signal handling, so crossterm hands us these as
+            // ordinary key events — without this they'd fall through to
+            // `on_key` and get read as a bare 'c'/'d' (which opens the palette,
+            // not quits). Breaking here also restores the terminal and exits 0,
+            // instead of leaving SIGINT to kill slop with a non-zero code that
+            // the launching shell reports as "execution failed".
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+            {
+                break;
             }
             match app.on_key(key.code) {
                 Action::Quit => break,
