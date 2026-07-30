@@ -3,7 +3,7 @@
 
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
-use slop_graph::{EdgeKind, Effect, NodeType};
+use slop_graph::{CodeEntity, EdgeKind, Effect, NodeType};
 
 use crate::build::BuiltGraph;
 use crate::findings::{Finding, Severity};
@@ -94,6 +94,27 @@ pub fn infra_bypass(built: &BuiltGraph, policy: &Policy) -> Vec<Finding> {
     findings
 }
 
+/// Is this Imports edge just Rust's module hierarchy? `mod child;` in the parent
+/// is a *containment* declaration, and `crate::`/`super::` paths in the child
+/// point back up through it, so a module and its own ancestor reference each
+/// other by construction — for every module in every crate. That is not an
+/// import cycle.
+///
+/// Deliberately Rust-only: in Python, `pkg/__init__` importing `pkg.sub` while
+/// `pkg.sub` imports from `pkg` is a genuine cycle that can fail at import time.
+/// Filtering at the edge keeps real Rust cycles (between *sibling* modules)
+/// visible instead of suppressing the whole SCC.
+fn rust_module_hierarchy(a: &CodeEntity, b: &CodeEntity) -> bool {
+    fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
+        descendant.len() > ancestor.len()
+            && descendant.starts_with(ancestor)
+            && descendant[ancestor.len()..].starts_with("::")
+    }
+    a.file.ends_with(".rs")
+        && b.file.ends_with(".rs")
+        && (is_ancestor(&a.id, &b.id) || is_ancestor(&b.id, &a.id))
+}
+
 /// Circular imports: Tarjan SCC on the `Imports` subgraph. A cycle is the
 /// finding (D6) — one per SCC, anchored on every member module so the diff
 /// filter keeps it when any member file changes.
@@ -108,6 +129,9 @@ pub fn circular_import(built: &BuiltGraph) -> Vec<Finding> {
             continue;
         }
         let (a, b) = graph.graph.edge_endpoints(edge).unwrap();
+        if rust_module_hierarchy(graph.entity(a), graph.entity(b)) {
+            continue;
+        }
         let ia = *map.entry(a).or_insert_with(|| imports.add_node(a));
         let ib = *map.entry(b).or_insert_with(|| imports.add_node(b));
         imports.add_edge(ia, ib, ());
@@ -177,14 +201,29 @@ pub fn dead_island(
         }
     }
 
+    // Trait implementations are reached through the trait, never by name, so
+    // they carry no by-name reference to find. Needs the SCIP symbol, which the
+    // entity doesn't keep, so invert the symbol map once.
+    let trait_impls: std::collections::HashSet<petgraph::graph::NodeIndex> = built
+        .by_symbol
+        .iter()
+        .filter(|(symbol, _)| crate::entity_id::is_trait_impl_method(symbol))
+        .map(|(_, &idx)| idx)
+        .collect();
+
     let mut findings = Vec::new();
     for (idx, entity) in graph.entities() {
         if entity.entity_type != NodeType::Function {
             continue;
         }
-        // Test files: doubles/mocks/fixtures are called dynamically by the test
-        // framework, invisible to SCIP — `dead-island` here is noise.
-        if crate::source::is_test_file(&entity.file) {
+        // Test doubles/mocks/fixtures are called dynamically by the test
+        // framework, invisible to SCIP — `dead-island` here is noise. Matched by
+        // path *and* by entity, since Rust and Go keep tests inside the source
+        // file under `mod tests`.
+        if crate::source::is_test_file(&entity.file) || crate::source::is_test_entity(&entity.id) {
+            continue;
+        }
+        if trait_impls.contains(&idx) {
             continue;
         }
         if policy.is_entry_point(&entity.id) {
@@ -390,6 +429,11 @@ pub fn purity_lie(built: &BuiltGraph) -> Vec<Finding> {
     let mut findings = Vec::new();
     for (_, entity) in graph.entities() {
         if entity.entity_type != NodeType::Function {
+            continue;
+        }
+        // A test named `validate_change_returns_...` is describing what it
+        // asserts, not promising purity — and reading fixtures is its job.
+        if crate::source::is_test_file(&entity.file) || crate::source::is_test_entity(&entity.id) {
             continue;
         }
         let name = entity.id.rsplit("::").next().unwrap_or(&entity.id);

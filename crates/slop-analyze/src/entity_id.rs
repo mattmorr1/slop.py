@@ -177,6 +177,22 @@ fn clean_rust_name(name: &str) -> String {
     }
 }
 
+/// Does `symbol` name a *trait* impl method? Rust marks an impl block with
+/// `impl#`, then one bracket group for the implementing type and a second for the
+/// trait when there is one: `impl#[`HashMap<K, V>`][`Index<&Q>`]index()`.
+///
+/// The distinction matters for reachability. A trait method is invoked through
+/// the trait — `Display::fmt` runs on every `{}` — so it is never dead even with
+/// no by-name reference, whereas an unused *inherent* method genuinely can be.
+pub fn is_trait_impl_method(symbol: &str) -> bool {
+    let Some((_, descriptors)) = rust_parts(symbol) else {
+        return false;
+    };
+    split_descriptors(descriptors)
+        .iter()
+        .any(|segment| bracket_groups(segment).0.len() >= 2)
+}
+
 /// The descriptor tail of a SCIP symbol: everything after the 4
 /// space-separated header fields (scheme, manager, package name, version).
 fn descriptors_of(symbol: &str) -> Option<&str> {
