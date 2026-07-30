@@ -130,6 +130,21 @@ build) so they are cheap enough to run on every read/write/prompt.
   > compress <repo> <file> --edit-file <other-file> --hops 1 --stats`.
 - `slop hook user-prompt-submit` — injects the repo's sanctioned-channel
   policy plus a pointer to `validate_change` as pre-hoc steering.
+- `slop hook session-start` / `slop hook subagent-start` — injects the
+  **world model**: the codebase facts an agent needs *before* it designs
+  anything, rather than as a correction afterwards.
+  - Sanctioned channels, layer rules, and a **capability index** — the
+    codebase's most-referenced functions grouped by effect, so the agent reuses
+    what exists instead of writing a parallel version. Redundancy is the most
+    common slop class and this is the cheapest prevention for it.
+  - This is the one hook that can afford a graph build, because it fires once
+    per session rather than per tool call (~190ms on this repo). Without an
+    index it degrades to policy-only facts instead of failing.
+  - Registered for subagents too: they otherwise start with no codebase
+    context whatsoever.
+  - Budgeted to 7000 chars against the host's 10k `additionalContext` cap;
+    capabilities are trimmed first, so the policy facts always survive.
+  - Silent when there is nothing to say (no policy and no graph).
 
 Register in `.claude/settings.json` (or just run `slop install`, which writes
 exactly this). The matcher covers the write tools too, so the hook can record

@@ -15,6 +15,8 @@ use serde_json::{json, Value};
 pub const PRE_TOOL_CMD: &str = "hook pre-tool-use";
 pub const POST_TOOL_CMD: &str = "hook post-tool-use";
 pub const PROMPT_CMD: &str = "hook user-prompt-submit";
+pub const SESSION_CMD: &str = "hook session-start";
+pub const SUBAGENT_CMD: &str = "hook subagent-start";
 
 /// Tools the PostToolUse hook is registered for: `Read` drives read-path
 /// compression + steering; the write tools let it record the session edit zone
@@ -52,7 +54,9 @@ fn is_slop_command(hook: &Value) -> bool {
     hook.get("command")
         .and_then(Value::as_str)
         .is_some_and(|c| {
-            c.contains(PRE_TOOL_CMD) || c.contains(POST_TOOL_CMD) || c.contains(PROMPT_CMD)
+            [PRE_TOOL_CMD, POST_TOOL_CMD, PROMPT_CMD, SESSION_CMD, SUBAGENT_CMD]
+                .iter()
+                .any(|cmd| c.contains(cmd))
         })
 }
 
@@ -112,6 +116,14 @@ pub fn merge_hooks(mut existing: Value, exe: &str) -> Value {
     let mut prompt = strip_slop_groups(hooks.get("UserPromptSubmit"));
     prompt.push(command_group(None, format!("{exe} {PROMPT_CMD}")));
     hooks.insert("UserPromptSubmit".to_string(), Value::Array(prompt));
+
+    // World model, injected once per session and into every subagent — subagents
+    // otherwise start with no codebase context at all.
+    for (event, cmd) in [("SessionStart", SESSION_CMD), ("SubagentStart", SUBAGENT_CMD)] {
+        let mut groups = strip_slop_groups(hooks.get(event));
+        groups.push(command_group(None, format!("{exe} {cmd}")));
+        hooks.insert(event.to_string(), Value::Array(groups));
+    }
 
     existing
 }

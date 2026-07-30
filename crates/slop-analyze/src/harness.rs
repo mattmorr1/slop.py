@@ -23,6 +23,7 @@ use slop_parse::Language;
 use crate::compress::{self, CompressConfig};
 use crate::policy::Policy;
 use crate::precheck::precheck;
+use crate::world;
 
 /// Only bother remapping when the strip saves at least this fraction of
 /// characters — otherwise pass the read through untouched.
@@ -369,6 +370,33 @@ pub fn handle_post_tool_use(input: &Value) -> Value {
     } else {
         json!({})
     }
+}
+
+/// SessionStart / SubagentStart handler (W4): inject the codebase world model
+/// once, up front, so the agent designs against what already exists instead of
+/// being corrected afterwards.
+///
+/// This is the one hook that can afford a graph build — it fires once per
+/// session, not per tool call — so it carries the capability index the cheap
+/// hooks can't. With no index it degrades to policy-only facts.
+pub fn handle_session_start(input: &Value, event: &str) -> Value {
+    let cwd = as_str(input, "cwd")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let repo = find_repo_root(&cwd);
+    let policy = Policy::load(&repo).unwrap_or_default();
+    let analysis = crate::check::load_analysis(&repo, None).ok();
+    let built = analysis.as_ref().map(|a| &a.built);
+
+    let Some(context) = world::render(&policy, built, world::DEFAULT_BUDGET) else {
+        return json!({});
+    };
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": context,
+        }
+    })
 }
 
 /// UserPromptSubmit handler: inject the repo's sanctioned-channel policy plus

@@ -28,6 +28,8 @@ enum HookEvent {
     PreToolUse,
     PostToolUse,
     UserPromptSubmit,
+    SessionStart,
+    SubagentStart,
 }
 
 /// Severity threshold at which `slop gate` fails (exits non-zero).
@@ -715,6 +717,8 @@ fn main() -> Result<()> {
                 HookEvent::PreToolUse => harness::handle_pre_tool_use(&input),
                 HookEvent::PostToolUse => harness::handle_post_tool_use(&input),
                 HookEvent::UserPromptSubmit => harness::handle_user_prompt_submit(&input),
+                HookEvent::SessionStart => harness::handle_session_start(&input, "SessionStart"),
+                HookEvent::SubagentStart => harness::handle_session_start(&input, "SubagentStart"),
             };
             println!("{output}");
         }

@@ -39,6 +39,14 @@ pub fn parse_repo(repo_root: &Path, files: &[&str]) -> Vec<FileFacts> {
     all
 }
 
+/// Is `entity_id` defined inside a test module? Rust (and Go) keep tests in the
+/// source file under `mod tests`, so [`is_test_file`] — which matches Python's
+/// separate-file convention — never sees them. Segment match on the `::` path,
+/// so `contests::run` is not mistaken for a test.
+pub fn is_test_entity(entity_id: &str) -> bool {
+    entity_id.split("::").any(|s| s == "tests" || s == "test")
+}
+
 /// Is `path` a test file? Test doubles, mocks, and fixtures are called
 /// dynamically by the test framework (collection, dependency injection), which
 /// SCIP can't resolve — so `dead-island` there is almost always a false
@@ -105,7 +113,18 @@ pub fn location_index(built: &BuiltGraph) -> HashMap<(String, usize), NodeIndex>
 
 #[cfg(test)]
 mod tests {
-    use super::{in_submodule, is_test_file};
+    use super::{in_submodule, is_test_entity, is_test_file};
+
+    #[test]
+    fn test_entities_are_matched_by_path_segment() {
+        // Rust/Go keep tests inside the source file, which is_test_file misses.
+        assert!(is_test_entity("slop-tui::app::tests::app_with"));
+        assert!(is_test_entity("mod::test::helper"));
+        // Substring matches must not count.
+        assert!(!is_test_entity("services::contests::run"));
+        assert!(!is_test_entity("utils::latest::value"));
+        assert!(!is_test_entity("slop-analyze::check::load_analysis"));
+    }
 
     #[test]
     fn submodule_containment() {
