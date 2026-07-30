@@ -354,6 +354,8 @@ fn main() -> Result<()> {
     };
     match command {
         Command::Dash { repo, index } => {
+            let index_path = index.clone().unwrap_or_else(|| repo.join("index.scip"));
+            ensure_index(&repo, &index_path)?;
             slop_tui::run(repo, index)?;
         }
         Command::Check {
@@ -369,6 +371,8 @@ fn main() -> Result<()> {
             let index_path = index.clone().unwrap_or_else(|| repo.join("index.scip"));
             if reindex {
                 run_scip_index(&repo, index.as_deref())?;
+            } else if ensure_index(&repo, &index_path)? {
+                // Just built it, so it cannot be stale.
             } else if let Some(msg) = index_staleness(&repo, &index_path) {
                 // Advisory only — the check still runs against the old index.
                 eprintln!("warning: {msg}\n  regenerate with `slop check {} --reindex`", repo.display());
@@ -678,6 +682,11 @@ fn main() -> Result<()> {
 
             if reindex {
                 run_scip_index(&work_repo, index.as_deref())?;
+            } else {
+                let path = index
+                    .clone()
+                    .unwrap_or_else(|| work_repo.join("index.scip"));
+                ensure_index(&work_repo, &path)?;
             }
 
             let outcome = gate::evaluate(
@@ -782,13 +791,8 @@ fn main() -> Result<()> {
             );
         }
         Command::Init { repo, index, write } => {
-            // Onboarding entry point: without an index every downstream step
-            // dead-ends, so generate one first (auto-detected indexer).
             let index_path = index.clone().unwrap_or_else(|| repo.join("index.scip"));
-            if !index_path.exists() {
-                eprintln!("no {} — running slop index...", index_path.display());
-                run_indexer(Indexer::Auto, &repo, &index_path, &default_project_name(&repo))?;
-            }
+            ensure_index(&repo, &index_path)?;
             let check::Analysis { built, .. } = check::load_analysis(&repo, index.as_deref())?;
             let proposals = infer::infer_channels(&built);
             if proposals.is_empty() {
@@ -1273,6 +1277,27 @@ fn run_scip_index(repo: &Path, index: Option<&Path>) -> Result<()> {
     run_indexer(Indexer::Auto, repo, &out, "slop-gate")
 }
 
+/// Build the index if it isn't there yet, so no command dead-ends on a missing
+/// one. Returns whether it built. Every entry point used to fail with "generate
+/// one with: slop index <repo>", which made the first command a new user runs an
+/// error telling them to run a different command.
+///
+/// Only ever builds when the index is *absent* — a stale index still warns
+/// rather than silently costing a rebuild on every invocation.
+fn ensure_index(repo: &Path, index_path: &Path) -> Result<bool> {
+    if index_path.exists() {
+        return Ok(false);
+    }
+    eprintln!("no {} — indexing first...", index_path.display());
+    run_indexer(
+        Indexer::Auto,
+        repo,
+        index_path,
+        &default_project_name(repo),
+    )?;
+    Ok(true)
+}
+
 /// scip-python's `--project-name` default: the repo directory name.
 fn default_project_name(repo: &Path) -> String {
     repo.file_name()
@@ -1305,7 +1330,12 @@ fn run_indexer(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> Resu
             ("scip-typescript", "is npx on PATH?", cmd)
         }
         Indexer::Python | Indexer::Auto => {
+            // scip-python resolves the project from its *cwd*, not from the path
+            // argument, so without this it indexes wherever slop was invoked
+            // from — silently analyzing the wrong codebase for any
+            // `slop check <other-repo>`.
             let mut cmd = npx();
+            cmd.current_dir(repo);
             cmd.args(["@sourcegraph/scip-python", "index"])
                 .arg(repo)
                 .args(["--project-name", project, "--output"])
