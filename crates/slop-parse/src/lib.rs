@@ -88,6 +88,11 @@ pub struct FunctionFacts {
     pub name_line: u32,
     pub start_line: u32,
     pub end_line: u32,
+    /// Inclusive line span of each top-level body statement, in source order.
+    /// The one thing SCIP does not encode (D20): occurrences carry positions but
+    /// no statement extents, and a multi-line right-hand side has to group with
+    /// the target it defines for def-use to mean anything.
+    pub stmt_spans: Vec<(u32, u32)>,
     /// Raw source from the `def` (or leading decorator) through the `:` —
     /// the type-annotated header used verbatim in skeletons.
     pub signature: String,
@@ -481,6 +486,7 @@ fn function_facts(
         name_line: lines.line(func.name.range().start()),
         start_line: lines.line(full.start()),
         end_line: lines.line(full.end()),
+        stmt_spans: func.body.iter().map(|s| (lines.line(s.range().start()), lines.line(s.range().end()))).collect(),
         signature,
         complexity,
         branch_points: cf.branch_points,
@@ -607,6 +613,14 @@ mod tests {
         let f = only(src);
         assert!(!f.alpha_hash.is_empty(), "body is below the significance floor");
         f.alpha_hash
+    }
+
+    /// A multi-line right-hand side must stay one statement: if it split, a
+    /// callee argument on a continuation line would land in the wrong component.
+    #[test]
+    fn stmt_spans_group_multi_line_statements() {
+        let src = "def f(a):\n    x = 1\n    # noise\n    y = wrap(\n        a,\n        x,\n    )\n    return y\n";
+        assert_eq!(only(src).stmt_spans, vec![(1, 1), (3, 6), (7, 7)]);
     }
 
     /// Written out rather than substring-replaced: a naive replace turned

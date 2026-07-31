@@ -102,6 +102,25 @@ impl ControlFlow {
     }
 }
 
+/// Inclusive line spans of a body's top-level statements, in source order.
+/// Comments are skipped: they hold no occurrences, so counting them as
+/// statements would only inflate a component's size.
+///
+/// An expression-bodied arrow (`x => x + 1`) is one statement, not a partition
+/// of its own subexpressions — hence the block check rather than descending
+/// unconditionally.
+pub fn stmt_spans(body: Node) -> Vec<(u32, u32)> {
+    let span = |n: &Node| (n.start_position().row as u32, n.end_position().row as u32);
+    if !body.kind().ends_with("block") {
+        return vec![span(&body)];
+    }
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .filter(|c| !c.kind().contains("comment"))
+        .map(|c| span(&c))
+        .collect()
+}
+
 /// Identifiers a function binds locally, for the α-equivalence hash.
 ///
 /// `binders` pairs a node kind that introduces a binding with the field its

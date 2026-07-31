@@ -14,7 +14,7 @@
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
-use crate::ts_state::{collect_bound, ControlFlow, HashState, Tok};
+use crate::ts_state::{collect_bound, stmt_spans, ControlFlow, HashState, Tok};
 use crate::{FunctionFacts, MIN_SIGNIFICANT_TOKENS};
 
 /// Function-like nodes that carry a body worth analyzing.
@@ -164,6 +164,7 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
         name_line,
         start_line,
         end_line,
+        stmt_spans: stmt_spans(body),
         signature,
         complexity: cf.complexity,
         branch_points: cf.branch_points,
@@ -353,6 +354,18 @@ mod tests {
         let foo = facts.iter().find(|f| f.name == "foo").unwrap();
         assert_eq!(foo.param_count, 2);
         assert!(foo.returns_value);
+    }
+
+    /// A multi-line right-hand side stays one statement; an expression-bodied
+    /// arrow is one statement rather than a partition of its subexpressions.
+    #[test]
+    fn stmt_spans_group_multi_line_and_expression_bodies() {
+        let src = "function f(a) {\n  const x = 1;\n  // noise\n  const y = wrap(\n    a,\n    x,\n  );\n  return y;\n}\nconst g = (z) => z * 2;\n";
+        let facts = analyze_js(src, false).unwrap();
+        let f = facts.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(f.stmt_spans, vec![(1, 1), (3, 6), (7, 7)]);
+        let g = facts.iter().find(|f| f.name == "g").unwrap();
+        assert_eq!(g.stmt_spans, vec![(9, 9)]);
     }
 
     #[test]

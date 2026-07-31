@@ -10,7 +10,7 @@
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
-use crate::ts_state::{collect_bound, ControlFlow, HashState, Tok};
+use crate::ts_state::{collect_bound, stmt_spans, ControlFlow, HashState, Tok};
 use crate::{FunctionFacts, MIN_SIGNIFICANT_TOKENS};
 
 const FN_KINDS: &[&str] = &["function_item"];
@@ -117,6 +117,7 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
         name_line: name_node.start_position().row as u32,
         start_line,
         end_line: node.end_position().row as u32,
+        stmt_spans: stmt_spans(body),
         signature,
         complexity: cf.complexity,
         branch_points: cf.branch_points,
@@ -423,6 +424,14 @@ mod tests {
         assert_eq!(foo.signature, "fn foo(a: i32, b: i32) -> i32");
         // `&self` counts, matching Python counting `self`.
         assert_eq!(facts[1].param_count, 2);
+    }
+
+    /// A multi-line right-hand side must stay one statement: if it split, a
+    /// callee argument on a continuation line would land in the wrong component.
+    #[test]
+    fn stmt_spans_group_multi_line_statements() {
+        let src = "fn f(a: i32) -> i32 {\n    let x = 1;\n    // noise\n    let y = wrap(\n        a,\n        x,\n    );\n    y\n}\n";
+        assert_eq!(only(src).stmt_spans, vec![(1, 1), (3, 6), (7, 7)]);
     }
 
     #[test]
