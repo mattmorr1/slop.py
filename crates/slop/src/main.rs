@@ -10,6 +10,9 @@ use slop_analyze::findings::Severity;
 use std::collections::{HashMap, HashSet};
 
 use slop_analyze::compress::{self, CompressConfig};
+use slop_analyze::index::{
+    default_project_name, ensure_index, run_indexer, run_scip_index, Indexer,
+};
 use slop_analyze::{detect, fix, gate, harness, infer, inline, policy::Policy, rename, suppress};
 use slop_resolve::{Resolver, ScipResolver};
 
@@ -30,6 +33,32 @@ enum HookEvent {
     UserPromptSubmit,
     SessionStart,
     SubagentStart,
+}
+
+/// Which SCIP indexer `slop index` runs. Mirrors [`Indexer`]; separate only
+/// because deriving clap's `ValueEnum` on the library type would put clap in
+/// the analysis crate.
+#[derive(Clone, Copy, ValueEnum)]
+enum IndexerArg {
+    /// Detect from the repo's project markers.
+    Auto,
+    /// `scip-python`.
+    Python,
+    /// `scip-typescript`.
+    Typescript,
+    /// `rust-analyzer scip`.
+    Rust,
+}
+
+impl From<IndexerArg> for Indexer {
+    fn from(a: IndexerArg) -> Self {
+        match a {
+            IndexerArg::Auto => Indexer::Auto,
+            IndexerArg::Python => Indexer::Python,
+            IndexerArg::Typescript => Indexer::Typescript,
+            IndexerArg::Rust => Indexer::Rust,
+        }
+    }
 }
 
 /// Severity threshold at which `slop gate` fails (exits non-zero).
@@ -248,8 +277,8 @@ enum Command {
         #[arg(long)]
         project_name: Option<String>,
         /// Which SCIP indexer to run (default: auto-detect from project markers)
-        #[arg(long, value_enum, default_value_t = Indexer::Auto)]
-        indexer: Indexer,
+        #[arg(long, value_enum, default_value_t = IndexerArg::Auto)]
+        indexer: IndexerArg,
     },
     /// Wire slop's harness into a repo's agent-host config: merge the MCP
     /// server into `<repo>/.mcp.json` and the read/prompt hooks into
@@ -368,14 +397,10 @@ fn main() -> Result<()> {
             json,
             reindex,
         } => {
-            let index_path = index.clone().unwrap_or_else(|| repo.join("index.scip"));
+            // `check::run` reindexes a stale index itself; --reindex forces
+            // one even when the mtimes say it is current.
             if reindex {
                 run_scip_index(&repo, index.as_deref())?;
-            } else if ensure_index(&repo, &index_path)? {
-                // Just built it, so it cannot be stale.
-            } else if let Some(msg) = index_staleness(&repo, &index_path) {
-                // Advisory only — the check still runs against the old index.
-                eprintln!("warning: {msg}\n  regenerate with `slop check {} --reindex`", repo.display());
             }
             let result = check::run(CheckRequest {
                 repo: repo.clone(),
@@ -680,13 +705,10 @@ fn main() -> Result<()> {
                 }
             });
 
+            // The gate runs through `check::run`, which builds a missing index
+            // and refreshes a stale one; --reindex forces one regardless.
             if reindex {
                 run_scip_index(&work_repo, index.as_deref())?;
-            } else {
-                let path = index
-                    .clone()
-                    .unwrap_or_else(|| work_repo.join("index.scip"));
-                ensure_index(&work_repo, &path)?;
             }
 
             let outcome = gate::evaluate(
@@ -745,7 +767,7 @@ fn main() -> Result<()> {
         } => {
             let out = output.unwrap_or_else(|| repo.join("index.scip"));
             let project = project_name.unwrap_or_else(|| default_project_name(&repo));
-            run_indexer(indexer, &repo, &out, &project)?;
+            run_indexer(indexer.into(), &repo, &out, &project)?;
             // Verify it's usable, not just present (scip-python can exit 0 with
             // a broken, definition-less index).
             let resolver = ScipResolver::load(&out)?;
@@ -778,7 +800,8 @@ fn main() -> Result<()> {
         }
         Command::Baseline { repo, index } => {
             let policy = Policy::load(&repo)?;
-            let check::Analysis { built, facts } = check::load_analysis(&repo, index.as_deref())?;
+            let analysis = check::load_analysis(&repo, index.as_deref())?;
+            let (built, facts) = (&analysis.built, &analysis.facts);
             let raw = detect::run_all(&built, &policy, &facts);
             let suppressions = suppress::scan(&repo, &facts);
             let findings = suppress::filter(raw, &suppressions);
@@ -793,7 +816,8 @@ fn main() -> Result<()> {
         Command::Init { repo, index, write } => {
             let index_path = index.clone().unwrap_or_else(|| repo.join("index.scip"));
             ensure_index(&repo, &index_path)?;
-            let check::Analysis { built, .. } = check::load_analysis(&repo, index.as_deref())?;
+            let analysis = check::load_analysis(&repo, index.as_deref())?;
+            let built = &analysis.built;
             let proposals = infer::infer_channels(&built);
             if proposals.is_empty() {
                 println!("no dominant effect channels found — nothing to propose");
@@ -1164,195 +1188,6 @@ fn wait_for_port(port: u16) -> Result<()> {
         std::thread::sleep(Duration::from_millis(150));
     }
     bail!("slop proxy did not come up on :{port}");
-}
-
-/// The SCIP indexer for a language. slop's graph/effect detectors consume any
-/// SCIP index; picking the right indexer per repo is all the multi-language
-/// index path needs.
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Indexer {
-    /// Detect from project markers (pyproject/setup/*.py vs Cargo.toml vs package.json/tsconfig).
-    Auto,
-    /// `scip-python` (Python).
-    Python,
-    /// `scip-typescript` (JavaScript / TypeScript).
-    Typescript,
-    /// `rust-analyzer scip` (Rust) — the one indexer that needs no npx.
-    Rust,
-}
-
-impl Indexer {
-    /// Resolve `Auto` against the repo's project markers.
-    fn resolve(self, repo: &Path) -> Indexer {
-        if self != Indexer::Auto {
-            return self;
-        }
-        let has = |f: &str| repo.join(f).exists();
-        // Python markers win when several ecosystems are present — slop's
-        // parser-based rules cover Python most fully, so it's the richer target.
-        // Cargo.toml is checked before the JS markers because a Rust repo often
-        // carries a package.json for web assets, but not the reverse.
-        if has("pyproject.toml") || has("setup.py") || has("requirements.txt") || has_top_level_ext(repo, "py") {
-            Indexer::Python
-        } else if has("Cargo.toml") {
-            Indexer::Rust
-        } else if has("tsconfig.json") || has("package.json") {
-            Indexer::Typescript
-        } else {
-            Indexer::Python
-        }
-    }
-}
-
-/// Is there a top-level file with extension `ext` in `repo`? A cheap language
-/// signal for repos without config-file markers.
-fn has_top_level_ext(repo: &Path, ext: &str) -> bool {
-    std::fs::read_dir(repo)
-        .map(|entries| {
-            entries.flatten().any(|e| {
-                e.path().extension().and_then(|s| s.to_str()) == Some(ext)
-            })
-        })
-        .unwrap_or(false)
-}
-
-/// Directories never worth walking for source-file mtimes.
-const SKIP_DIRS: &[&str] = &[".git", "node_modules", ".venv", "venv", "target", "__pycache__"];
-
-/// A human-readable reason the index at `index_path` is out of date, or `None`
-/// if it looks current. "Stale" means a tracked source file has been modified
-/// more recently than the index — the check would then judge yesterday's graph.
-/// Best-effort: any I/O hiccup yields `None` (never block a check on a mtime we
-/// couldn't read).
-fn index_staleness(repo: &Path, index_path: &Path) -> Option<String> {
-    let index_mtime = std::fs::metadata(index_path).ok()?.modified().ok()?;
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-    newest_source_mtime(repo, &mut newest);
-    let (src_mtime, src_path) = newest?;
-    if src_mtime > index_mtime {
-        let rel = src_path.strip_prefix(repo).unwrap_or(&src_path);
-        Some(format!(
-            "SCIP index {} is older than {} — findings may be out of date",
-            index_path.display(),
-            rel.display()
-        ))
-    } else {
-        None
-    }
-}
-
-/// Recursively track the newest-modified source file under `dir`, skipping
-/// vendored/build directories. Best-effort — unreadable entries are ignored.
-fn newest_source_mtime(dir: &Path, newest: &mut Option<(std::time::SystemTime, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            let name = entry.file_name();
-            if SKIP_DIRS.iter().any(|d| name == *d) {
-                continue;
-            }
-            newest_source_mtime(&path, newest);
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| slop_parse::SOURCE_EXTS.contains(&e))
-        {
-            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
-                if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
-                    *newest = Some((mtime, path));
-                }
-            }
-        }
-    }
-}
-
-/// Regenerate the SCIP index for `repo`, writing to `index` (default
-/// `<repo>/index.scip`). Used by `slop gate --reindex`; auto-detects the
-/// indexer.
-fn run_scip_index(repo: &Path, index: Option<&Path>) -> Result<()> {
-    let out = index
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| repo.join("index.scip"));
-    run_indexer(Indexer::Auto, repo, &out, "slop-gate")
-}
-
-/// Build the index if it isn't there yet, so no command dead-ends on a missing
-/// one. Returns whether it built. Every entry point used to fail with "generate
-/// one with: slop index <repo>", which made the first command a new user runs an
-/// error telling them to run a different command.
-///
-/// Only ever builds when the index is *absent* — a stale index still warns
-/// rather than silently costing a rebuild on every invocation.
-fn ensure_index(repo: &Path, index_path: &Path) -> Result<bool> {
-    if index_path.exists() {
-        return Ok(false);
-    }
-    eprintln!("no {} — indexing first...", index_path.display());
-    run_indexer(
-        Indexer::Auto,
-        repo,
-        index_path,
-        &default_project_name(repo),
-    )?;
-    Ok(true)
-}
-
-/// scip-python's `--project-name` default: the repo directory name.
-fn default_project_name(repo: &Path) -> String {
-    repo.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "repo".to_string())
-}
-
-/// Run the resolved SCIP indexer for `repo`, writing to `out`.
-fn run_indexer(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> Result<()> {
-    let indexer = indexer.resolve(repo);
-    let npx = || {
-        let mut cmd = Process::new("npx");
-        cmd.arg("--yes");
-        cmd
-    };
-    let (tool, install_hint, mut cmd) = match indexer {
-        Indexer::Rust => {
-            // rust-analyzer emits SCIP natively, so Rust needs no Node toolchain.
-            let mut cmd = Process::new("rust-analyzer");
-            cmd.arg("scip").arg(repo).arg("--output").arg(out);
-            ("rust-analyzer scip", "install it with: rustup component add rust-analyzer", cmd)
-        }
-        Indexer::Typescript => {
-            // scip-typescript reads the project's tsconfig from its cwd and
-            // takes just an output path.
-            let mut cmd = npx();
-            cmd.args(["@sourcegraph/scip-typescript", "index", "--output"])
-                .arg(out)
-                .current_dir(repo);
-            ("scip-typescript", "is npx on PATH?", cmd)
-        }
-        Indexer::Python | Indexer::Auto => {
-            // scip-python resolves the project from its *cwd*, not from the path
-            // argument, so without this it indexes wherever slop was invoked
-            // from — silently analyzing the wrong codebase for any
-            // `slop check <other-repo>`.
-            let mut cmd = npx();
-            cmd.current_dir(repo);
-            cmd.args(["@sourcegraph/scip-python", "index"])
-                .arg(repo)
-                .args(["--project-name", project, "--output"])
-                .arg(out);
-            ("scip-python", "is npx on PATH?", cmd)
-        }
-    };
-    let status = cmd
-        .status()
-        .with_context(|| format!("running {tool} ({install_hint})"))?;
-    if !status.success() {
-        bail!("{tool} indexing failed for {}", repo.display());
-    }
-    Ok(())
 }
 
 /// Create a detached `git worktree` of `repo` in a temp dir and return its

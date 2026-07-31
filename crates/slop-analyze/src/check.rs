@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use slop_resolve::{Resolver, ScipResolver};
@@ -248,13 +249,73 @@ pub struct Analysis {
     pub facts: Vec<source::FileFacts>,
 }
 
+/// What to do when the index on disk is older than the source it describes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Regenerate it first. For anything whose answer is only meaningful
+    /// against current code — `check`, `gate`, `validate_change`.
+    Reindex,
+    /// Warn on stderr and carry on. For the per-read hooks and the LSP, which
+    /// run too often to spend an indexer subprocess.
+    Warn,
+}
+
+/// The last analysis built, keyed on the index file's identity. The MCP server
+/// and LSP are long-lived and rebuild the whole graph per request otherwise —
+/// ~36ms on this repo but ~1.2s on a 21MB index, paid on every single call.
+/// One slot: a changed index evicts it.
+type CacheKey = (PathBuf, std::time::SystemTime, u64);
+static CACHE: std::sync::Mutex<Option<(CacheKey, Arc<Analysis>)>> = std::sync::Mutex::new(None);
+
+fn cache_key(index_path: &Path) -> Option<CacheKey> {
+    let meta = std::fs::metadata(index_path).ok()?;
+    Some((index_path.to_path_buf(), meta.modified().ok()?, meta.len()))
+}
+
 /// Resolve `index` (default `<repo>/index.scip`), build the effect graph, and
-/// parse the repo's source facts. Errors with the `scip-python` hint when the
-/// index is missing.
-pub fn load_analysis(repo: &Path, index: Option<&Path>) -> Result<Analysis> {
+/// parse the repo's source facts. Errors with an indexing hint when the index
+/// is missing. Defaults to [`Freshness::Warn`]; see [`load_analysis_fresh`].
+pub fn load_analysis(repo: &Path, index: Option<&Path>) -> Result<Arc<Analysis>> {
+    load_analysis_fresh(repo, index, Freshness::Warn)
+}
+
+/// [`load_analysis`] with an explicit staleness policy, returning a shared
+/// handle so repeated calls in one process don't rebuild the graph.
+pub fn load_analysis_fresh(
+    repo: &Path,
+    index: Option<&Path>,
+    freshness: Freshness,
+) -> Result<Arc<Analysis>> {
     let index_path = index
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| repo.join("index.scip"));
+    if freshness == Freshness::Reindex {
+        crate::index::ensure_index(repo, &index_path)?;
+        if let Some(reason) = crate::index::index_staleness(repo, &index_path) {
+            eprintln!("slop: {reason} — reindexing");
+            crate::index::run_scip_index(repo, Some(&index_path))?;
+        }
+    } else if let Some(reason) = crate::index::index_staleness(repo, &index_path) {
+        eprintln!("warning: {reason}");
+    }
+
+    if let Some(key) = cache_key(&index_path) {
+        if let Some((cached_key, analysis)) = CACHE.lock().ok().and_then(|c| c.clone()) {
+            if cached_key == key {
+                return Ok(analysis);
+            }
+        }
+        let analysis = Arc::new(build_analysis(repo, &index_path)?);
+        if let Ok(mut c) = CACHE.lock() {
+            *c = Some((key, analysis.clone()));
+        }
+        return Ok(analysis);
+    }
+    build_analysis(repo, &index_path).map(Arc::new)
+}
+
+fn build_analysis(repo: &Path, index_path: &Path) -> Result<Analysis> {
+    let index_path = index_path.to_path_buf();
     if !index_path.exists() {
         bail!(
             "no SCIP index at {} — generate one with:\n  slop index {}",
@@ -310,7 +371,8 @@ pub struct AuditResult {
 /// real state and let the user choose what to look at.
 pub fn audit(repo: &Path, index: Option<&Path>) -> Result<AuditResult> {
     let policy = Policy::load(repo)?;
-    let Analysis { built, facts } = load_analysis(repo, index)?;
+    let analysis = load_analysis_fresh(repo, index, Freshness::Reindex)?;
+    let (built, facts) = (&analysis.built, &analysis.facts);
     let baseline = Baseline::load(repo)?;
 
     let mut raw = crate::detect::run_all(&built, &policy, &facts);
@@ -369,7 +431,8 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
         None => Policy::load(&req.repo)?,
     };
 
-    let Analysis { built, facts } = load_analysis(&req.repo, req.index.as_deref())?;
+    let analysis = load_analysis_fresh(&req.repo, req.index.as_deref(), Freshness::Reindex)?;
+    let (built, facts) = (&analysis.built, &analysis.facts);
     let baseline = Baseline::load(&req.repo)?;
     let mut raw = crate::detect::run_all(&built, &policy, &facts);
     // Baseline-relative regression: a function that was pure at baseline and

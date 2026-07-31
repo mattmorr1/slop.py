@@ -14,6 +14,7 @@ pub mod fix;
 pub mod gate;
 pub mod harness;
 pub mod health;
+pub mod index;
 pub mod infer;
 pub mod inline;
 pub mod install;
