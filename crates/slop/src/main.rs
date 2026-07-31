@@ -840,8 +840,14 @@ fn run_debug(command: DebugCommand) -> Result<()> {
                 let known = resolver.definition_of(&occ.symbol).is_some()
                     || resolver.local_definition_of(&file, &occ.symbol).is_some();
                 let resolved = if known { "" } else { "  [no definition]" };
+                // The enclosing range is the graph's `source_range`, and what
+                // parser facts join against — print it or the join is opaque.
+                let span = occ
+                    .enclosing_range
+                    .map(|r| format!(" encl={}-{}", r.start_line, r.end_line))
+                    .unwrap_or_default();
                 println!(
-                    "{}:{}-{}:{} {role} {}{resolved}",
+                    "{}:{}-{}:{} {role}{span} {}{resolved}",
                     occ.range.start_line,
                     occ.range.start_col,
                     occ.range.end_line,

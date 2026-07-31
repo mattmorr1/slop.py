@@ -14,6 +14,7 @@
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
+use crate::ts_state::{ControlFlow, HashState};
 use crate::{FunctionFacts, MIN_SIGNIFICANT_TOKENS};
 
 /// Function-like nodes that carry a body worth analyzing.
@@ -71,6 +72,11 @@ pub fn analyze_js(source: &str, typescript: bool) -> Result<Vec<FunctionFacts>> 
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| anyhow!("tree-sitter failed to parse"))?;
+    // tree-sitter always returns a tree, error nodes and all. Callers that gate
+    // a rewrite on "does this still parse" need the failure, not a partial tree.
+    if tree.root_node().has_error() {
+        return Err(anyhow!("source does not parse as JavaScript/TypeScript"));
+    }
 
     let src = source.as_bytes();
     let mut facts = Vec::new();
@@ -132,14 +138,10 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
     let mut hasher = HashState::default();
     hash_walk(body, src, &mut hasher);
 
-    let (body_hash, structural_hash) = if hasher.significant >= MIN_SIGNIFICANT_TOKENS {
-        (
-            hasher.exact.finalize().to_hex().to_string(),
-            hasher.structural.finalize().to_hex().to_string(),
-        )
-    } else {
-        (String::new(), String::new())
-    };
+    let significant_tokens = hasher.significant;
+    let comment_lines = hasher.comment_lines;
+    let code_lines = hasher.code_lines.len() as u32;
+    let (body_hash, structural_hash) = hasher.finish(MIN_SIGNIFICANT_TOKENS);
 
     // Control-flow shape over the body.
     let mut cf = ControlFlow::default();
@@ -162,9 +164,9 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
         deepest_line: cf.deepest_line,
         body_hash,
         structural_hash,
-        significant_tokens: hasher.significant,
-        comment_lines: hasher.comment_lines,
-        code_lines: hasher.code_lines.len() as u32,
+        significant_tokens,
+        comment_lines,
+        code_lines,
         decorated: is_decorated(node),
         param_count,
         returns_value: returns_value(body),
@@ -197,15 +199,6 @@ fn is_decorated(node: Node) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Default)]
-struct HashState {
-    exact: blake3::Hasher,
-    structural: blake3::Hasher,
-    significant: u32,
-    comment_lines: u32,
-    code_lines: std::collections::BTreeSet<u32>,
-}
-
 /// Walk the body's leaf tokens into the hashers, skipping nested function
 /// bodies (their tokens belong to them) and counting comment vs code lines.
 fn hash_walk(node: Node, src: &[u8], st: &mut HashState) {
@@ -220,15 +213,8 @@ fn hash_walk(node: Node, src: &[u8], st: &mut HashState) {
         if kind.trim().is_empty() {
             return;
         }
-        st.code_lines.insert(node.start_position().row as u32);
-        st.significant += 1;
         let text = node.utf8_text(src).unwrap_or("");
-        st.exact.update(format!("{kind}\u{1}{text}\u{2}").as_bytes());
-        if is_atom(kind) {
-            st.structural.update(format!("{kind}\u{2}").as_bytes());
-        } else {
-            st.structural.update(format!("{kind}\u{1}{text}\u{2}").as_bytes());
-        }
+        st.leaf(kind, text, node.start_position().row as u32, is_atom(kind));
         return;
     }
     let mut cursor = node.walk();
@@ -238,23 +224,6 @@ fn hash_walk(node: Node, src: &[u8], st: &mut HashState) {
             continue;
         }
         hash_walk(child, src, st);
-    }
-}
-
-#[derive(Default)]
-struct ControlFlow {
-    complexity: u32,
-    branch_points: u32,
-    max_depth: u32,
-    deepest_line: u32,
-}
-
-impl ControlFlow {
-    fn reached(&mut self, depth: u32, line: u32) {
-        if depth > self.max_depth {
-            self.max_depth = depth;
-            self.deepest_line = line;
-        }
     }
 }
 

@@ -14,6 +14,8 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 
 mod js;
 pub mod names;
+mod rust;
+mod ts_state;
 
 /// A source language slop can produce per-function facts for. The parser-based
 /// detectors (duplication, complexity, over-commenting) need a language-aware
@@ -27,10 +29,6 @@ pub enum Language {
     Python,
     JavaScript,
     TypeScript,
-    /// Recognized for [`names::qualified_names`] (the write-time pre-check).
-    /// [`Language::parse`] yields no facts: the parser-based detectors
-    /// (duplication, complexity, over-commenting) don't cover Rust yet, so its
-    /// findings come from the SCIP-backed graph/effect detectors only.
     Rust,
 }
 
@@ -61,7 +59,7 @@ impl Language {
             Language::Python => analyze_file(source),
             Language::JavaScript => js::analyze_js(source, false),
             Language::TypeScript => js::analyze_js(source, true),
-            Language::Rust => Ok(Vec::new()),
+            Language::Rust => rust::analyze_rust(source),
         }
     }
 }
