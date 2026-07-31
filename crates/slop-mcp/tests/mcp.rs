@@ -72,7 +72,7 @@ fn notifications_get_no_reply() {
 }
 
 #[test]
-fn tools_list_returns_the_three_tools() {
+fn tools_list_returns_every_tool() {
     let out = exchange(
         fixture("toy_repo_slopped"),
         &[serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})],
@@ -85,7 +85,12 @@ fn tools_list_returns_the_three_tools() {
         .collect();
     assert_eq!(
         names,
-        vec!["validate_change", "get_context_envelope", "query_subgraph"]
+        vec![
+            "find_capability",
+            "validate_change",
+            "get_context_envelope",
+            "query_subgraph"
+        ]
     );
 }
 

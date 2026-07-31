@@ -1,4 +1,4 @@
-//! The three additive MCP tools (M4c, D9): `validate_change`,
+//! The additive MCP tools (M4c, D9): `find_capability`, `validate_change`,
 //! `get_context_envelope`, `query_subgraph`. Each is a thin adapter that
 //! runs the *same* analysis the CLI runs (via `slop_analyze::check`) and
 //! serializes the result — never a reimplementation.
@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use slop_analyze::check::{self, CheckRequest};
 use slop_analyze::envelope::{self, EnvelopeConfig};
 use slop_analyze::query;
-use slop_graph::EdgeKind;
+use slop_analyze::search;
+use slop_graph::{EdgeKind, Effect};
 
 /// The server's launch context: the repo (and optional index) the tools
 /// default to when a call omits them.
@@ -39,6 +40,23 @@ impl ToolCtx {
 /// stay readable next to the handlers that consume them.
 pub fn definitions() -> Value {
     json!([
+        {
+            "name": "find_capability",
+            "description": "Find what this codebase ALREADY provides for a described intent, before writing a new implementation. Ranked by name/module/docstring match and how many places call it. This is the entry point to the other graph tools: every id it returns can be fed straight to `query_subgraph` or `get_context_envelope`. Reimplementing something that exists is the most common slop class — ask here first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repo root (defaults to the server's launch repo)"},
+                    "intent": {"type": "string", "description": "What you are about to write, in words, e.g. `parse an ISO date` or `send an HTTP request with retries`"},
+                    "effect": {
+                        "type": "string",
+                        "enum": ["net", "fs_read", "fs_write", "db", "env", "throws", "nondeterminism", "state", "concurrency", "unknown"],
+                        "description": "Restrict to functions carrying this effect — with an empty intent this answers `what owns the network here`"
+                    },
+                    "limit": {"type": "integer", "description": "Max results (default 10)"}
+                }
+            }
+        },
         {
             "name": "validate_change",
             "description": "Run slop's full detector suite over a repo and return findings (blocking/warning/advisory) with machine-readable fix guidance. Defaults to judging the working-tree diff vs a git ref; set all=true for the whole repo. This is the same analysis `slop check` runs.",
@@ -91,11 +109,53 @@ pub fn definitions() -> Value {
 /// `content` item; the transport wraps it in the MCP envelope.
 pub fn call(ctx: &ToolCtx, name: &str, args: &Value) -> Result<String> {
     match name {
+        "find_capability" => find_capability(ctx, args),
         "validate_change" => validate_change(ctx, args),
         "get_context_envelope" => get_context_envelope(ctx, args),
         "query_subgraph" => query_subgraph(ctx, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
+}
+
+/// `slop.toml`'s effect names, so what an agent passes here matches what it
+/// reads in the policy and the world model.
+fn parse_effect(name: &str) -> Option<Effect> {
+    Some(match name {
+        "net" => Effect::Net,
+        "fs_read" => Effect::FsRead,
+        "fs_write" => Effect::FsWrite,
+        "db" => Effect::Db,
+        "env" => Effect::Env,
+        "throws" => Effect::Throws,
+        "nondeterminism" => Effect::Nondeterminism,
+        "state" => Effect::StateMutate,
+        "concurrency" => Effect::Concurrency,
+        "unknown" => Effect::Unknown,
+        _ => return None,
+    })
+}
+
+fn find_capability(ctx: &ToolCtx, args: &Value) -> Result<String> {
+    let repo = ctx.repo(args);
+    let intent = args.get("intent").and_then(Value::as_str).unwrap_or("");
+    let effect = args.get("effect").and_then(Value::as_str).and_then(parse_effect);
+    if intent.trim().is_empty() && effect.is_none() {
+        return Err(anyhow!("give an `intent` to search for, an `effect` to filter by, or both"));
+    }
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+    let analysis = check::load_analysis(&repo, ctx.index(args).as_deref())?;
+    let found = search::find(&analysis.built, intent, effect, limit);
+    if found.is_empty() {
+        return Ok(serde_json::to_string_pretty(&json!({
+            "intent": intent,
+            "capabilities": [],
+            "note": "nothing in this codebase matches — writing it appears to be justified",
+        }))?);
+    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "intent": intent,
+        "capabilities": found,
+    }))?)
 }
 
 fn validate_change(ctx: &ToolCtx, args: &Value) -> Result<String> {

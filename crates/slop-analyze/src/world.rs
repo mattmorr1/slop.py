@@ -15,9 +15,7 @@
 
 use std::collections::HashMap;
 
-use petgraph::graph::NodeIndex;
-use petgraph::visit::EdgeRef;
-use slop_graph::{EdgeKind, Effect, NodeType};
+use slop_graph::{Effect, NodeType};
 
 use crate::build::BuiltGraph;
 use crate::policy::Policy;
@@ -85,12 +83,7 @@ fn layer_lines(policy: &Policy) -> Vec<String> {
 /// these is the redundancy slop class, so naming them up front is the cheapest
 /// prevention available.
 fn capability_lines(built: &BuiltGraph) -> Vec<String> {
-    let mut refs: HashMap<NodeIndex, usize> = HashMap::new();
-    for edge in built.graph.graph.edge_references() {
-        if *edge.weight() == EdgeKind::Calls {
-            *refs.entry(edge.target()).or_default() += 1;
-        }
-    }
+    let refs = crate::search::reference_counts(built);
 
     // Group by effect signature: the pure helpers are as reusable as the
     // effectful ones, so they get their own bucket rather than being dropped.

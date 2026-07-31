@@ -23,6 +23,7 @@ pub mod policy;
 pub mod precheck;
 pub mod query;
 pub mod rename;
+pub mod search;
 pub mod skeleton;
 pub mod source;
 pub mod suppress;

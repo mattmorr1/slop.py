@@ -53,14 +53,31 @@ pub fn serve(config: ProxyConfig) -> Result<()> {
     serve_on(listener, config)
 }
 
+/// The same world model the `SessionStart` hook injects — sanctioned channels,
+/// layer rules, and the capability index — rendered once at startup.
+///
+/// The hook only reaches Claude Code; this is the surface every other
+/// Anthropic client gets, and it used to carry the channel list alone, which
+/// says what to route through but not what already exists. Building the graph
+/// costs one pass at launch rather than one per request, and degrades to
+/// policy-only when the repo has no index (D8: silent when there's nothing to
+/// say). Compression stays on the hook path — the proxy is too late for it
+/// (D10).
+fn world_model(repo: &std::path::Path) -> Option<String> {
+    let policy = slop_analyze::policy::Policy::load(repo).ok()?;
+    let analysis = slop_analyze::check::load_analysis(repo, None).ok();
+    slop_analyze::world::render(
+        &policy,
+        analysis.as_ref().map(|a| &a.built),
+        slop_analyze::world::DEFAULT_BUDGET,
+    )
+}
+
 /// Serve on an already-bound listener. Split out so tests can bind an
 /// ephemeral port and drive the proxy directly.
 pub fn serve_on(listener: TcpListener, config: ProxyConfig) -> Result<()> {
     let steering = if config.steer {
-        config.repo.as_deref().and_then(|repo| {
-            let policy = slop_analyze::policy::Policy::load(repo).ok()?;
-            slop_analyze::harness::channel_steering(&policy)
-        })
+        config.repo.as_deref().and_then(world_model)
     } else {
         None
     };

@@ -156,13 +156,14 @@ slop claude -- --resume      # args after `--` pass through to claude
 
 - **Claude skill** — `slop install` drops a `/slop` skill so the agent knows
   when and how to check, triage, fix, and gate on its own.
-- **MCP tools** — `validate_change`, `get_context_envelope`, `query_subgraph`.
+- **MCP tools** — `find_capability` (what does this repo already have?),
+  `validate_change`, `get_context_envelope`, `query_subgraph`.
 - **Hooks** — read-path steering + zoned graph-distance compression (skeletonize
   code far from what you're editing; keep near context full-fidelity).
 - **Gate** — `slop gate`, a CI/fix-loop entry point that exits non-zero on
   blocking findings and prints a machine-readable verdict.
-- **Proxy** — `slop proxy`, an `ANTHROPIC_BASE_URL` reverse proxy for
-  agent-agnostic steering + token observability.
+- **Proxy** — `slop proxy`, an `ANTHROPIC_BASE_URL` reverse proxy that injects
+  the same world model for *any* Anthropic client, plus token observability.
 
 Full details, config, and the fix-loop shape: **[docs/harness.md](docs/harness.md)**.
 

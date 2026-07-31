@@ -75,9 +75,17 @@ npx --yes @sourcegraph/scip-python index <repo> --project-name <name> --output <
 
 | Tool | Purpose | Key args |
 | --- | --- | --- |
+| `find_capability` | What the codebase already provides for an intent | `intent`, `effect`, `limit` |
 | `validate_change` | Full detector suite → findings + fix guidance | `all`, `base`, `tier3` |
 | `get_context_envelope` | Effect-typed, budget-packed context around an entity | `target_entity`, `token_budget`, `edit_zone_hops` |
 | `query_subgraph` | Callers/callees/imports + effect signature | `entity`, `depth`, `edge_kinds` |
+
+`find_capability` is the entry point: the other two graph tools take an entity
+id, and until now nothing produced one — the graph's only lookup was an exact
+match on an id the agent had no way to guess. Ask it what exists before writing
+a new implementation, then feed any id it returns to `query_subgraph` or
+`get_context_envelope`. Ranking is deterministic (name / module / docstring
+token overlap, ties broken by how many places call it): no embeddings, no LLM.
 
 ---
 
@@ -231,5 +239,11 @@ ANTHROPIC_BASE_URL=http://localhost:8787 <your agent>
 
 - Streams responses through untouched (SSE `stream:true` included).
 - Appends one JSONL record per request to `--log` with model + token usage.
-- `--steer` (with `--repo`) augments the request's system prompt with the
-  repo's sanctioned-channel policy.
+- `--steer` (with `--repo`) augments the request's system prompt with the repo's
+  **world model** — the same sanctioned channels, layer rules and capability
+  index the `SessionStart` hook injects (`world::render`). The hook only reaches
+  Claude Code; this is how every other Anthropic client gets it. Rendered once
+  at startup, so it costs one graph build per launch rather than one per
+  request, and degrades to policy-only when the repo has no index.
+- Compression stays on the hook path. The proxy sees the request after context
+  is assembled, which is too late to compress it (D10).
