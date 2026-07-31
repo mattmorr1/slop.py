@@ -849,6 +849,192 @@ pub fn trivial_wrapper_candidates(
     out
 }
 
+
+/// Distinct callees a function needs before a shared neighborhood means
+/// anything. Two functions that both call one logger are not parallel
+/// implementations of each other.
+const MIN_SHARED_CALLEES: usize = 3;
+
+/// Shared callees that must be *distinctive* (below the frequency cutoff) for a
+/// neighborhood match to count.
+///
+/// Set equality alone has poor precision, and dogfooding showed exactly why: the
+/// false positives shared only generic vocabulary. `doc_uri` and `take_str` both
+/// call `Option::map`/`as_str`/`get`; four `__init__`s all call the same torch
+/// constructors. Sharing ubiquitous calls says nothing about doing the same job,
+/// so a match needs callees that few other functions make.
+const MIN_DISTINCTIVE_CALLEES: usize = 2;
+
+/// A callee called by more than `functions / this` others is common vocabulary,
+/// not a distinguishing feature — inverse document frequency, thresholded.
+const DISTINCTIVE_DF_DIVISOR: usize = 20;
+
+/// The set of things a function calls, as sorted entity IDs. External callees
+/// (`std.fs.read_to_string`, `requests.post`) are included deliberately — they
+/// are the strongest part of the signal, because they say what the function
+/// *does* rather than who it collaborates with.
+fn callee_set(built: &BuiltGraph, idx: petgraph::graph::NodeIndex) -> Vec<String> {
+    let mut ids: Vec<String> = built
+        .graph
+        .graph
+        .edges_directed(idx, Direction::Outgoing)
+        .filter(|e| *e.weight() == EdgeKind::Calls)
+        .map(|e| built.graph.entity(e.target()).id.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Parallel implementation: functions that call the *same set of things* while
+/// their bodies share neither an exact nor a structural hash — independently
+/// written code doing one job twice.
+///
+/// This is duplication detected on **graph shape** rather than token shape, and
+/// the two are near-disjoint. `duplicate-exact`/`duplicate-structural` catch
+/// copy-paste and copy-paste-then-rename: the same text. This catches the case
+/// they structurally cannot — two authors (or two agent sessions) solving the
+/// same problem with different code, which is the redundancy an effect graph is
+/// uniquely placed to see. Any pair whose shape already matches is left to those
+/// rules rather than reported twice.
+///
+/// Set-based, not sequence-based: `Calls` edges carry no call order (they are
+/// deduped on insert), so claiming "same calls in the same order" would
+/// overstate what the graph knows.
+pub fn parallel_implementation(built: &BuiltGraph, facts: &[crate::source::FileFacts]) -> Vec<Finding> {
+    use std::collections::HashMap;
+
+    let members = collect_members(built, facts);
+    let by_label: HashMap<&str, usize> = members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.label.as_str(), i))
+        .collect();
+
+    // Per candidate function: its member row and what it calls. Collected before
+    // grouping so `df` below counts *functions*, not neighborhoods — several
+    // functions sharing one neighborhood must each contribute.
+    let mut candidates: Vec<(usize, petgraph::graph::NodeIndex, Vec<String>)> = Vec::new();
+    let mut df: HashMap<String, usize> = HashMap::new();
+    let mut callers = 0usize;
+    for (idx, entity) in built.graph.entities() {
+        if entity.entity_type != NodeType::Function
+            || crate::source::is_test_file(&entity.file)
+            || crate::source::is_test_entity(&entity.id)
+        {
+            continue;
+        }
+        let callees = callee_set(built, idx);
+        if !callees.is_empty() {
+            callers += 1;
+        }
+        // Every function contributes to callee frequency, including the ones too
+        // small to be candidates themselves.
+        for callee in &callees {
+            *df.entry(callee.clone()).or_default() += 1;
+        }
+        let Some(&member) = by_label.get(entity.id.as_str()) else {
+            continue; // no parser facts => no hashes to compare
+        };
+        if callees.len() >= MIN_SHARED_CALLEES {
+            candidates.push((member, idx, callees));
+        }
+    }
+    // A callee this many callers share is common vocabulary, not a feature —
+    // a fraction of the calling functions, not of the distinct callees.
+    let common_df = (callers / DISTINCTIVE_DF_DIVISOR).max(MIN_DISTINCTIVE_CALLEES);
+
+    let mut by_neighborhood: HashMap<String, Vec<(usize, petgraph::graph::NodeIndex)>> =
+        HashMap::new();
+    for (member, idx, callees) in &candidates {
+        by_neighborhood
+            .entry(callees.join("\u{1}"))
+            .or_default()
+            .push((*member, *idx));
+    }
+
+    let mut findings = Vec::new();
+    for (key, entries) in &by_neighborhood {
+        let group: Vec<usize> = entries.iter().map(|&(m, _)| m).collect();
+        let group = group.as_slice();
+        // A neighborhood shared by many functions is a codebase pattern by
+        // design (every handler calls the same four things), same reasoning as
+        // `duplicate-structural`'s convention families.
+        if group.len() < 2 || group.len() > CONVENTION_FAMILY_MAX {
+            continue;
+        }
+        let distinctive = key
+            .split('\u{1}')
+            .filter(|c| df.get(*c).is_some_and(|&n| n <= common_df))
+            .count();
+        if distinctive < MIN_DISTINCTIVE_CALLEES {
+            continue;
+        }
+        // Sibling methods of one type sharing a callee set is a dispatch table
+        // (`Filter::next` and `Filter::label` both match over the same variants)
+        // — parallel *roles* of that type, deliberately, not one job done twice.
+        // Read from the id prefix, not the `Contains` edge: for Rust methods that
+        // edge points at the enclosing *module* rather than the type.
+        let owning_type = |m: &Member| {
+            let prefix = m.label.rsplit_once("::")?.0;
+            built
+                .graph
+                .node(prefix)
+                .filter(|&c| built.graph.entity(c).entity_type == NodeType::Class)
+                .map(|_| prefix.to_string())
+        };
+        let owners: Vec<Option<String>> = group.iter().map(|&i| owning_type(&members[i])).collect();
+        if owners[0].is_some() && owners.iter().all(|o| *o == owners[0]) {
+            continue;
+        }
+        // One shared *name* across the group is a role, not a coincidence:
+        // every `__init__` builds a thing, every `_check_x` checks one. That is
+        // the codebase's vocabulary, and unifying them is not the ask.
+        let simple = |m: &Member| m.label.rsplit("::").next().unwrap_or(&m.label).to_string();
+        let names: std::collections::HashSet<String> =
+            group.iter().map(|&i| simple(&members[i])).collect();
+        if names.len() < group.len() {
+            continue;
+        }
+        let rep = canonical(&members, group);
+        let peers: Vec<&Member> = group
+            .iter()
+            .map(|&i| &members[i])
+            .filter(|m| {
+                m.label != members[rep].label
+                    && m.body_hash != members[rep].body_hash
+                    && m.structural_hash != members[rep].structural_hash
+            })
+            .collect();
+        if peers.is_empty() {
+            continue;
+        }
+        let shared = key.split('\u{1}').count();
+        let names = peers.iter().map(|m| format!("`{}`", m.label)).collect::<Vec<_>>().join(", ");
+        let rep_m = &members[rep];
+        findings.push(Finding {
+            rule: "parallel-implementation",
+            // Advisory: a shared neighborhood is strong evidence of one job done
+            // twice, but whether they *should* be unified is a judgement about
+            // intent. `--tier3` is the promotion path, as with duplicate-structural.
+            severity: Severity::Advisory,
+            entity: rep_m.label.clone(),
+            file: rep_m.file.clone(),
+            lines: rep_m.lines,
+            message: format!(
+                "`{}` and {names} call the same {shared} things but share no code — likely the same job implemented more than once",
+                rep_m.label
+            ),
+            fix_guidance: format!(
+                "Compare `{}` with {names}: if they serve one purpose, keep the clearest and route the others to it",
+                rep_m.label
+            ),
+        });
+    }
+    findings.sort_by(|a, b| a.file.cmp(&b.file).then(a.lines.0.cmp(&b.lines.0)));
+    findings
+}
+
 /// All detectors, sorted by severity then location.
 pub fn run_all(
     built: &BuiltGraph,
@@ -882,6 +1068,7 @@ pub fn run_all(
     findings.extend(purity_lie(built));
     findings.extend(effect_layer_violation(built, policy));
     findings.extend(source_detectors(built, facts));
+    findings.extend(parallel_implementation(built, facts));
     findings.extend(crate::coverage::untested_effect(built, policy, &branching, &decorated));
     findings.extend(crate::naming::naming_convention(built));
     findings.sort_by(|a, b| {
@@ -1071,4 +1258,119 @@ mod tests {
         let built = built_with(vec![func("m::f", &[Effect::Net])]);
         assert!(effect_creep(&built, &Baseline::default()).is_empty());
     }
+
+    /// Two functions in different modules, calling the same distinctive things,
+    /// with bodies that share neither hash: one job implemented twice.
+    fn parallel_fixture(a_body: &str, b_body: &str) -> (BuiltGraph, Vec<crate::source::FileFacts>) {
+        let facts = vec![
+            py_facts("a.py", &format!("def make_report(rows):\n{a_body}")),
+            py_facts("b.py", &format!("def build_summary(rows):\n{b_body}")),
+        ];
+        let mut built = built_with(vec![
+            func("a::make_report", &[]),
+            func("b::build_summary", &[]),
+            func("shared::fetch_rows", &[]),
+            func("shared::render_table", &[]),
+            func("shared::write_out", &[]),
+        ]);
+        for caller in ["a::make_report", "b::build_summary"] {
+            let from = built.graph.node(caller).unwrap();
+            for callee in ["shared::fetch_rows", "shared::render_table", "shared::write_out"] {
+                let to = built.graph.node(callee).unwrap();
+                built.graph.add_edge(from, to, EdgeKind::Calls);
+            }
+        }
+        (built, facts)
+    }
+
+    // Both bodies must clear the parser's significance floor, or they get no
+    // hashes and never become members at all.
+    const BODY_A: &str = "    out = []\n    for r in rows:\n        if r is not None:\n            out.append(str(r).strip())\n        else:\n            out.append(\"\")\n    return sorted(out)\n";
+    const BODY_B: &str = "    total = 0\n    seen = {}\n    while total < len(rows):\n        seen[total] = rows[total] * 2\n        total += 1\n    return (seen, total)\n";
+
+    #[test]
+    fn same_callees_different_code_is_a_parallel_implementation() {
+        let (built, facts) = parallel_fixture(BODY_A, BODY_B);
+        let found = parallel_implementation(&built, &facts);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].rule, "parallel-implementation");
+        assert!(found[0].message.contains("build_summary"), "{}", found[0].message);
+    }
+
+    #[test]
+    fn an_identical_shape_is_left_to_the_duplicate_rules() {
+        // Same body => duplicate-exact already reports it; reporting here too
+        // would double-count one fact.
+        let (built, facts) = parallel_fixture(BODY_A, BODY_A);
+        assert!(parallel_implementation(&built, &facts).is_empty());
+    }
+
+    #[test]
+    fn sharing_only_common_vocabulary_is_not_a_match() {
+        // Every function in the repo calls these three, so calling them says
+        // nothing about doing the same job.
+        let (mut built, facts) = parallel_fixture(BODY_A, BODY_B);
+        for i in 0..40 {
+            let id = format!("noise::f{i}");
+            built.graph.add_entity(CodeEntity { ..func(&id, &[]) });
+            let from = built.graph.node(&id).unwrap();
+            for callee in ["shared::fetch_rows", "shared::render_table", "shared::write_out"] {
+                let to = built.graph.node(callee).unwrap();
+                built.graph.add_edge(from, to, EdgeKind::Calls);
+            }
+        }
+        assert!(parallel_implementation(&built, &facts).is_empty());
+    }
+
+    #[test]
+    fn one_shared_name_across_the_group_is_a_role_not_a_duplicate() {
+        let facts = vec![
+            py_facts("a.py", &format!("def render(rows):\n{BODY_A}")),
+            py_facts("b.py", &format!("def render(rows):\n{BODY_B}")),
+        ];
+        let mut built = built_with(vec![
+            func("a::render", &[]),
+            func("b::render", &[]),
+            func("shared::one", &[]),
+            func("shared::two", &[]),
+            func("shared::three", &[]),
+        ]);
+        for caller in ["a::render", "b::render"] {
+            let from = built.graph.node(caller).unwrap();
+            for callee in ["shared::one", "shared::two", "shared::three"] {
+                let to = built.graph.node(callee).unwrap();
+                built.graph.add_edge(from, to, EdgeKind::Calls);
+            }
+        }
+        assert!(parallel_implementation(&built, &facts).is_empty());
+    }
+
+    #[test]
+    fn sibling_methods_of_one_type_are_a_dispatch_table() {
+        let facts = vec![py_facts(
+            "a.py",
+            &format!("def to_label(self):\n{BODY_A}\ndef to_code(self):\n{BODY_B}"),
+        )];
+        let mut built = built_with(vec![
+            func("a::Filter::to_label", &[]),
+            func("a::Filter::to_code", &[]),
+            func("shared::one", &[]),
+            func("shared::two", &[]),
+            func("shared::three", &[]),
+        ]);
+        // The owning type must exist as a Class node for the rule to see it.
+        built.graph.add_entity(CodeEntity {
+            entity_type: NodeType::Class,
+            ..func("a::Filter", &[])
+        });
+        for caller in ["a::Filter::to_label", "a::Filter::to_code"] {
+            let from = built.graph.node(caller).unwrap();
+            for callee in ["shared::one", "shared::two", "shared::three"] {
+                let to = built.graph.node(callee).unwrap();
+                built.graph.add_edge(from, to, EdgeKind::Calls);
+            }
+        }
+        assert!(parallel_implementation(&built, &facts).is_empty());
+    }
+
 }

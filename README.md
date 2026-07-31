@@ -106,6 +106,7 @@ baselined repo doesn't look falsely pristine.
 | `effect-creep` | Blocking | A function that was **pure** at `slop baseline` time now performs I/O — a purity regression (delta vs baseline) |
 | `duplicate-exact` | Warning | Functions with identical bodies (modulo comments/whitespace) |
 | `duplicate-structural` | Advisory → Warning | Same control-flow shape, renamed vars/literals — a *candidate*; `--tier3` promotes ones an LLM judge confirms |
+| `parallel-implementation` | Advisory | Functions calling the same *distinctive* set of things while sharing no code — one job implemented twice, in different words. Duplication found on graph shape, where the `duplicate-*` rules find it on token shape |
 | `complexity-spike` | Warning | Genuinely tangled functions — deep nesting or many independent branches, not just a fat boolean guard |
 | `purity-lie` | Warning | A `compute_`/`parse_`/`is_`-named function that actually does I/O |
 | `untested-effect` | Advisory | A branching function that performs I/O and no test reaches, in a codebase that tests most of its effectful functions |
