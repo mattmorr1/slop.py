@@ -1,6 +1,11 @@
 # The modularity engine — running plan
 
-> **Status: M0 ran, and signal (1) failed its kill criterion.** Built on SCIP
+> **Status: prospective retrieval built and passing; signal (1) killed.**
+> `retrieve.rs` / `slop suggest` answers extend-vs-create *before* code exists —
+> the original question — and found real cross-package duplication in both
+> dogfood repos. One free parameter left (the score threshold) and then placement.
+>
+> **Signal (1) failed its kill criterion.** Built on SCIP
 > def-use (D20), tri-lingual, and adjudicated against 1184 Python functions in
 > vigil plus slop.py's own Rust: **60 findings → 29 non-interleaved → 5 past a
 > guard filter → ~1 worth acting on.** Not wired into `run_all`. The mechanism is
@@ -221,12 +226,36 @@ boundaries, one scale down.
 **Co-change gate (D16)** applies to (3), and to any retrieval that proposes
 reusing an existing module.
 
-**Prospective retrieval — the write-time half.** Signals 1–3 all need a body to
-analyse, so none of them answers extend-vs-create *before* the code exists. That
-half is neighborhood retrieval: take the proposed content's callee set and effect
-row, compare against existing functions' neighborhoods with the IDF machinery
-`parallel-implementation` already has, and name the function it belongs in.
-Computable today, needs no PDG, runs parallel to everything above.
+**Prospective retrieval — BUILT, and it works.** Signals 1–3 all need a body to
+analyse, so none of them answers extend-vs-create *before* the code exists. This
+does: take the proposed content's callee set, compare against existing functions'
+neighborhoods with the IDF machinery `parallel-implementation` already has, and
+name the function it belongs in. `crates/slop-analyze/src/retrieve.rs`, exposed as
+`slop suggest` (stdin) and `slop suggest --eval` (leave-one-out over a repo).
+
+Measured leave-one-out on two corpora. Three fixes, each removing a whole class of
+false positive, each found by reading output rather than by reasoning:
+
+| Fix | Why | Effect |
+| --- | --- | --- |
+| Only `Function`-typed callees | Constructing an enum variant is a `Calls` edge, so three functions that merely mention one enum's variants scored like three sharing real work | 21.7% → 4.1% of functions matched |
+| Cosine, not raw overlap count | `slop::main` is a 19-arm dispatcher, calls everything, and outranked every real match | `main` fell to one appearance, last |
+| Drop names the source *defines* | `qualified_names` reports a function's own name from its `def` line, so every caller/callee pair looked like a duplicate | vigil 560 → 508 |
+
+Precision after all three, adjudicated by reading: **~7 of 9 unique pairs at
+score ≥0.55 on vigil**, ~12 of 19 on slop.py. Above the 50% bar M0 failed, and
+unlike M0 the residual false positives cluster at *low* scores, so a threshold
+works — that is the structural difference between a calibratable signal and a
+dead one.
+
+What it found, which is the real evidence: vigil duplicates `get_secret` /
+`set_secret` / `delete_secret`, `init_database` and `get_db_session` between
+`backend/` and `deeptempo-core/`. In slop.py it found the `location_index` +
+`entity_for` join written **seven** times, and `check::run` ↔ `check::audit`
+sharing 8 distinctive callees while differing in one policy decision.
+
+It also strictly extends `parallel-implementation`, which keys on *exact* callee-set
+equality and therefore cannot see partial overlap at all.
 
 ---
 
@@ -412,4 +441,5 @@ benchmark shows inlining wins here") rather than a bare pragma.
 | 2026-07-30 | **M0(b) written** — `FunctionFacts.stmt_spans`, one shared `ts_state::stmt_spans` for the two tree-sitter frontends plus the ruff path, with a multi-line-RHS test per language. Expression-bodied arrows are one statement, not a partition of their subexpressions. |
 | 2026-07-31 | **M0(c) written and M0 adjudicated. Signal (1) is dead.** 243 tests green. The oracle earned its place immediately: interleaved components were visible only in its line ranges, and reading three findings against real source identified guard chains as the dominant cause — confirmed at 31 of 60. Rust reproduced the failure with a fourth cause (recursive traversal). `split.rs` is retained but unwired; `run_all`'s signature was reverted rather than left carrying an unused parameter. |
 | 2026-07-31 | D13 qualified: minimum cut is only as good as the edge set, and intra-procedural dataflow omits control transfer, shared mutable state and required ordering. The thesis holds at module scale, where the graph carries effects, and fails one scale down — losing exactly the scale-freeness that motivated it. Signal (2) inherits three of the four causes and should not be built as specified. |
-| | **NEXT: user's call between the three options in §6.1 — reformulate (1) with effect-disjointness, jump to signal (3)/prospective retrieval, or stop the modularity engine and bank the plumbing.** |
+| 2026-07-31 | Option 2 chosen: skip to prospective retrieval. **Built and it passes** — `retrieve.rs` + `slop suggest`. See §5. Three false-positive classes found by reading output and each removed by a principled fix, not a tuned threshold. Found real duplication in both dogfood repos, including cross-package duplication of secrets and database init in vigil. |
+| | **NEXT: pick a score threshold (the one free parameter), then wire it. `PreToolUse` needs a callee sidecar first — retrieval reads the graph, and a 1.2s build has no place on the write path. `validate_change` and the `Stop` sieve can have it today.** |
