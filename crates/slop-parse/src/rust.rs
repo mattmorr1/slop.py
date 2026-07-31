@@ -10,7 +10,7 @@
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
-use crate::ts_state::{ControlFlow, HashState};
+use crate::ts_state::{collect_bound, ControlFlow, HashState, Tok};
 use crate::{FunctionFacts, MIN_SIGNIFICANT_TOKENS};
 
 const FN_KINDS: &[&str] = &["function_item"];
@@ -23,21 +23,22 @@ fn is_branch_stmt(kind: &str) -> bool {
     )
 }
 
-/// Leaf kinds that are identifiers/literals — collapsed in the structural hash.
-fn is_atom(kind: &str) -> bool {
-    matches!(
-        kind,
-        "identifier"
-            | "field_identifier"
-            | "type_identifier"
-            | "shorthand_field_identifier"
-            | "primitive_type"
-            | "integer_literal"
-            | "float_literal"
-            | "string_content"
-            | "char_literal"
-            | "boolean_literal"
-    )
+
+/// Node kinds that bind a name, paired with the field holding their pattern.
+const BINDERS: &[(&str, &str)] =
+    &[("parameter", "pattern"), ("let_declaration", "pattern"), ("for_expression", "pattern")];
+
+/// Classify a leaf for the three hashes. Field and type names stay free: they
+/// are named by their owner, not bound by this function.
+fn classify<'a>(kind: &str, text: &'a str, bound: &std::collections::HashSet<String>) -> Tok<'a> {
+    match kind {
+        "identifier" if bound.contains(text) => Tok::Bound(text),
+        "identifier" | "field_identifier" | "type_identifier" | "shorthand_field_identifier"
+        | "primitive_type" => Tok::Free,
+        "integer_literal" | "float_literal" | "string_content" | "char_literal"
+        | "boolean_literal" => Tok::Literal,
+        _ => Tok::Other,
+    }
 }
 
 fn is_comment(kind: &str) -> bool {
@@ -95,12 +96,14 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
         .trim_end()
         .to_string();
 
+    let mut bound = std::collections::HashSet::new();
+    collect_bound(node, src, BINDERS, &mut bound);
     let mut hasher = HashState::default();
-    hash_walk(body, src, &mut hasher);
+    hash_walk(body, src, &bound, &mut hasher);
     let significant_tokens = hasher.significant;
     let comment_lines = hasher.comment_lines;
     let code_lines = hasher.code_lines.len() as u32;
-    let (body_hash, structural_hash) = hasher.finish(MIN_SIGNIFICANT_TOKENS);
+    let (body_hash, structural_hash, alpha_hash) = hasher.finish(MIN_SIGNIFICANT_TOKENS);
 
     let mut cf = ControlFlow::default();
     cf_walk(body, 1, &mut cf);
@@ -121,6 +124,7 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
         deepest_line: cf.deepest_line,
         body_hash,
         structural_hash,
+        alpha_hash,
         significant_tokens,
         comment_lines,
         code_lines,
@@ -178,7 +182,7 @@ fn is_attributed(node: Node, src: &[u8]) -> bool {
         .any(|n| n.kind() == "attribute_item")
 }
 
-fn hash_walk(node: Node, src: &[u8], st: &mut HashState) {
+fn hash_walk(node: Node, src: &[u8], bound: &std::collections::HashSet<String>, st: &mut HashState) {
     let kind = node.kind();
     if is_comment(kind) {
         st.comment_lines += node.end_position().row as u32 - node.start_position().row as u32 + 1;
@@ -189,7 +193,7 @@ fn hash_walk(node: Node, src: &[u8], st: &mut HashState) {
             return;
         }
         let text = node.utf8_text(src).unwrap_or("");
-        st.leaf(kind, text, node.start_position().row as u32, is_atom(kind));
+        st.leaf(kind, text, node.start_position().row as u32, classify(kind, text, bound));
         return;
     }
     let mut cursor = node.walk();
@@ -197,7 +201,7 @@ fn hash_walk(node: Node, src: &[u8], st: &mut HashState) {
         if FN_KINDS.contains(&child.kind()) {
             continue;
         }
-        hash_walk(child, src, st);
+        hash_walk(child, src, bound, st);
     }
 }
 

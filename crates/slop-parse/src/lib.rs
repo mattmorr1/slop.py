@@ -6,11 +6,15 @@
 //! Tier-2 hash = token kinds only, with names/literals collapsed to
 //! placeholders: "same shape, renamed variables / different constants."
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use ruff_python_ast::token::{Token, TokenKind};
 use ruff_python_ast::{self as ast, Expr, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_text_size::{Ranged, TextRange, TextSize};
+
+use ts_state::Tok;
 
 mod js;
 pub mod names;
@@ -105,6 +109,17 @@ pub struct FunctionFacts {
     /// Blake3, hex. Empty when the body is below the significance floor.
     pub body_hash: String,
     pub structural_hash: String,
+    /// α-equivalence: identical when two bodies differ *only* in the names they
+    /// bind locally. Literals and free names (callees, imports, globals,
+    /// attributes) are preserved, so a differing constant or a different callee
+    /// makes two bodies distinct — which is what lets this hash, and only this
+    /// hash, justify refusing a write (ADR 0001).
+    ///
+    /// Sits between the other two: `body_hash` is defeated by any rename,
+    /// `structural_hash` erases literals as well as names. Conservative by
+    /// design — a name we cannot prove is locally bound stays verbatim, so the
+    /// hash under-matches rather than over-matching.
+    pub alpha_hash: String,
     /// Number of body tokens that fed the hashes (significance measure).
     pub significant_tokens: u32,
     pub comment_lines: u32,
@@ -153,19 +168,84 @@ fn is_trivia(kind: TokenKind) -> bool {
     ) || kind == TokenKind::EndOfFile
 }
 
-fn is_atom(kind: TokenKind) -> bool {
+/// Assignment operators: the token after a name that binds it.
+fn is_assign_op(kind: TokenKind) -> bool {
     matches!(
         kind,
-        TokenKind::Name
-            | TokenKind::Int
-            | TokenKind::Float
-            | TokenKind::Complex
-            | TokenKind::String
-            | TokenKind::FStringStart
-            | TokenKind::FStringMiddle
-            | TokenKind::FStringEnd
+        TokenKind::Equal
+            | TokenKind::PlusEqual
+            | TokenKind::MinusEqual
+            | TokenKind::StarEqual
+            | TokenKind::SlashEqual
+            | TokenKind::DoubleSlashEqual
+            | TokenKind::PercentEqual
+            | TokenKind::DoubleStarEqual
+            | TokenKind::AmperEqual
+            | TokenKind::VbarEqual
+            | TokenKind::CircumflexEqual
+            | TokenKind::LeftShiftEqual
+            | TokenKind::RightShiftEqual
+            | TokenKind::ColonEqual
+            | TokenKind::AtEqual
     )
 }
+
+/// Names this function binds locally: its parameters, plus anything it assigns,
+/// iterates or aliases. Deliberately incomplete — a name we cannot prove is
+/// bound is treated as free, which makes the α-hash under-match rather than
+/// over-match, and under-matching a *deny* gate is the safe direction.
+fn bound_names(func: &ast::StmtFunctionDef, body: &[&Token], source: &str) -> HashSet<String> {
+    let p = &func.parameters;
+    let mut out: HashSet<String> = p
+        .posonlyargs
+        .iter()
+        .chain(p.args.iter())
+        .chain(p.kwonlyargs.iter())
+        .map(|a| a.parameter.name.to_string())
+        .collect();
+    for extra in [p.vararg.as_deref(), p.kwarg.as_deref()].into_iter().flatten() {
+        out.insert(extra.name.to_string());
+    }
+    for (i, token) in body.iter().enumerate() {
+        if token.kind() != TokenKind::Name {
+            continue;
+        }
+        // `obj.attr = x` binds nothing local: `attr` belongs to `obj`.
+        let after_dot = i > 0 && body[i - 1].kind() == TokenKind::Dot;
+        let binds = body
+            .get(i + 1)
+            .is_some_and(|t| is_assign_op(t.kind()))
+            || (i > 0 && matches!(body[i - 1].kind(), TokenKind::For | TokenKind::As));
+        if binds && !after_dot {
+            out.insert(source[token.range()].to_string());
+        }
+    }
+    out
+}
+
+/// Classify a body token for the three hashes.
+fn classify<'a>(
+    kind: TokenKind,
+    text: &'a str,
+    after_dot: bool,
+    bound: &HashSet<String>,
+) -> Tok<'a> {
+    match kind {
+        // An attribute is named by its owner, not by this scope, so it stays
+        // free even when a local happens to share the name.
+        TokenKind::Name if !after_dot && bound.contains(text) => Tok::Bound(text),
+        TokenKind::Name => Tok::Free,
+        TokenKind::Int
+        | TokenKind::Float
+        | TokenKind::Complex
+        | TokenKind::String
+        | TokenKind::FStringStart
+        | TokenKind::FStringMiddle
+        | TokenKind::FStringEnd => Tok::Literal,
+        _ => Tok::Other,
+    }
+}
+
 
 fn is_branch(kind: TokenKind) -> bool {
     matches!(
@@ -331,19 +411,19 @@ fn function_facts(
     tokens: &[Token],
 ) -> FunctionFacts {
     let body = body_range(func);
-    let mut exact = blake3::Hasher::new();
-    let mut structural = blake3::Hasher::new();
-    let mut significant = 0u32;
     let mut complexity = 1u32;
     let mut comment_lines = 0u32;
     let mut code_line_set: Vec<u32> = Vec::new();
 
-    for token in tokens {
-        if token.range().start() < body.start() || token.range().end() > body.end() {
-            // Comments inside the function but outside statement ranges
-            // (e.g. trailing) still count toward density via the full span.
-            continue;
-        }
+    // Body tokens once, so binding positions can be read from neighbours.
+    let body_tokens: Vec<&Token> = tokens
+        .iter()
+        .filter(|t| t.range().start() >= body.start() && t.range().end() <= body.end())
+        .collect();
+    let bound = bound_names(func, &body_tokens, source);
+    let mut hasher = ts_state::HashState::default();
+
+    for (i, token) in body_tokens.iter().enumerate() {
         let kind = token.kind();
         if kind == TokenKind::Comment {
             comment_lines += 1;
@@ -359,15 +439,11 @@ fn function_facts(
         if is_branch(kind) {
             complexity += 1;
         }
-        significant += 1;
         let text = &source[token.range()];
-        exact.update(format!("{kind:?}\u{1}{text}\u{2}").as_bytes());
-        if is_atom(kind) {
-            structural.update(format!("{kind:?}\u{2}").as_bytes());
-        } else {
-            structural.update(format!("{kind:?}\u{1}{text}\u{2}").as_bytes());
-        }
+        let after_dot = i > 0 && body_tokens[i - 1].kind() == TokenKind::Dot;
+        hasher.leaf(&format!("{kind:?}"), text, line, classify(kind, text, after_dot, &bound));
     }
+    let significant = hasher.significant;
 
     // Comments attached to the function but between statements/before the
     // body start on their own lines: count those within the whole fn span.
@@ -382,14 +458,7 @@ fn function_facts(
         }
     }
 
-    let (body_hash, structural_hash) = if significant >= MIN_SIGNIFICANT_TOKENS {
-        (
-            exact.finalize().to_hex().to_string(),
-            structural.finalize().to_hex().to_string(),
-        )
-    } else {
-        (String::new(), String::new())
-    };
+    let (body_hash, structural_hash, alpha_hash) = hasher.finish(MIN_SIGNIFICANT_TOKENS);
 
     let params = &func.parameters;
     let param_count = (params.posonlyargs.len()
@@ -419,6 +488,7 @@ fn function_facts(
         deepest_line: cf.deepest_line,
         body_hash,
         structural_hash,
+        alpha_hash,
         significant_tokens: significant,
         comment_lines,
         code_lines: code_line_set.len() as u32,
@@ -529,6 +599,76 @@ mod tests {
         let mut f = analyze_file(src).unwrap();
         assert_eq!(f.len(), 1, "expected exactly one function");
         f.pop().unwrap()
+    }
+
+    /// Bodies must clear the significance floor or every hash is empty and the
+    /// comparison passes vacuously.
+    fn alpha(src: &str) -> String {
+        let f = only(src);
+        assert!(!f.alpha_hash.is_empty(), "body is below the significance floor");
+        f.alpha_hash
+    }
+
+    /// Written out rather than substring-replaced: a naive replace turned
+    /// `FILLER` into `FILLEx` and made the rename test fail for the right reason
+    /// on the wrong input.
+    const CLEAN: &str = "def clean(rows):\n    out = []\n    for item in rows:\n        if item is not None:\n            out.append(str(item).strip().lower())\n        else:\n            out.append(FILLER)\n    return sorted(out, key=len)\n";
+    const CLEAN_RENAMED: &str = "def clean(records):\n    acc = []\n    for entry in records:\n        if entry is not None:\n            acc.append(str(entry).strip().lower())\n        else:\n            acc.append(FILLER)\n    return sorted(acc, key=len)\n";
+
+    /// The property that lets h2 justify a deny: a consistent rename of locals
+    /// and parameters is the *same* function.
+    #[test]
+    fn alpha_hash_is_invariant_under_consistent_rename() {
+        let a = only(CLEAN);
+        let b = only(CLEAN_RENAMED);
+        assert!(!a.alpha_hash.is_empty());
+        assert_eq!(a.alpha_hash, b.alpha_hash);
+        // Stronger than the shape hash, which also erases literals; weaker than
+        // exact text, which any rename defeats.
+        assert_ne!(a.body_hash, b.body_hash);
+        assert_eq!(a.structural_hash, b.structural_hash);
+    }
+
+    /// Why structural_hash cannot be used to deny: it erases constants.
+    #[test]
+    fn a_different_constant_is_a_different_function() {
+        let a = only(&CLEAN.replace("key=len", "key=30"));
+        let b = only(&CLEAN.replace("key=len", "key=60"));
+        assert!(!a.alpha_hash.is_empty());
+        assert_ne!(a.alpha_hash, b.alpha_hash, "30 and 60 are not alpha-equivalent");
+        assert_eq!(a.structural_hash, b.structural_hash, "the shape hash erases them");
+    }
+
+    /// The catastrophic case for a deny gate: collapsing free names would make
+    /// two functions with different callees look identical.
+    #[test]
+    fn a_different_callee_is_a_different_function() {
+        assert_ne!(
+            alpha(&CLEAN.replace("strip()", "validate()")),
+            alpha(&CLEAN.replace("strip()", "sanitize()")),
+            "validate and sanitize are not the same function"
+        );
+    }
+
+    /// An attribute is named by its owner, so it stays free even when a local
+    /// happens to share the name.
+    #[test]
+    fn an_attribute_name_is_not_a_bound_name() {
+        assert_ne!(
+            alpha(&CLEAN.replace("str(item)", "item.width")),
+            alpha(&CLEAN.replace("str(item)", "item.height")),
+            "width and height are different fields"
+        );
+    }
+
+    /// Under-matching is the safe direction: a global we cannot prove is local
+    /// stays verbatim, so two functions reading different globals stay distinct.
+    #[test]
+    fn an_unprovable_binding_stays_free() {
+        assert_ne!(
+            alpha(&CLEAN.replace("FILLER", "SCALE")),
+            alpha(&CLEAN.replace("FILLER", "OFFSET"))
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
-use crate::ts_state::{ControlFlow, HashState};
+use crate::ts_state::{collect_bound, ControlFlow, HashState, Tok};
 use crate::{FunctionFacts, MIN_SIGNIFICANT_TOKENS};
 
 /// Function-like nodes that carry a body worth analyzing.
@@ -41,22 +41,27 @@ fn is_branch_stmt(kind: &str) -> bool {
     )
 }
 
-/// Leaf kinds that are identifiers/literals — collapsed in the structural hash.
-fn is_atom(kind: &str) -> bool {
-    matches!(
-        kind,
-        "identifier"
-            | "property_identifier"
-            | "shorthand_property_identifier"
-            | "shorthand_property_identifier_pattern"
-            | "private_property_identifier"
-            | "statement_identifier"
-            | "type_identifier"
-            | "number"
-            | "string_fragment"
-            | "template_string"
-            | "regex_pattern"
-    )
+
+/// Node kinds that bind a name, paired with the field holding their pattern.
+const BINDERS: &[(&str, &str)] = &[
+    ("variable_declarator", "name"),
+    ("required_parameter", "pattern"),
+    ("optional_parameter", "pattern"),
+    ("formal_parameters", ""),
+    ("for_in_statement", "left"),
+];
+
+/// Classify a leaf for the three hashes. Property names stay free: they are
+/// named by the object, not bound by this function.
+fn classify<'a>(kind: &str, text: &'a str, bound: &std::collections::HashSet<String>) -> Tok<'a> {
+    match kind {
+        "identifier" if bound.contains(text) => Tok::Bound(text),
+        "identifier" | "property_identifier" | "shorthand_property_identifier"
+        | "shorthand_property_identifier_pattern" | "private_property_identifier"
+        | "statement_identifier" | "type_identifier" => Tok::Free,
+        "number" | "string_fragment" | "template_string" | "regex_pattern" => Tok::Literal,
+        _ => Tok::Other,
+    }
 }
 
 pub fn analyze_js(source: &str, typescript: bool) -> Result<Vec<FunctionFacts>> {
@@ -135,13 +140,15 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
         .to_string();
 
     // Hashing + token/line counts over the body, skipping nested functions.
+    let mut bound = std::collections::HashSet::new();
+    collect_bound(node, src, BINDERS, &mut bound);
     let mut hasher = HashState::default();
-    hash_walk(body, src, &mut hasher);
+    hash_walk(body, src, &bound, &mut hasher);
 
     let significant_tokens = hasher.significant;
     let comment_lines = hasher.comment_lines;
     let code_lines = hasher.code_lines.len() as u32;
-    let (body_hash, structural_hash) = hasher.finish(MIN_SIGNIFICANT_TOKENS);
+    let (body_hash, structural_hash, alpha_hash) = hasher.finish(MIN_SIGNIFICANT_TOKENS);
 
     // Control-flow shape over the body.
     let mut cf = ControlFlow::default();
@@ -164,6 +171,7 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
         deepest_line: cf.deepest_line,
         body_hash,
         structural_hash,
+        alpha_hash,
         significant_tokens,
         comment_lines,
         code_lines,
@@ -201,7 +209,7 @@ fn is_decorated(node: Node) -> bool {
 
 /// Walk the body's leaf tokens into the hashers, skipping nested function
 /// bodies (their tokens belong to them) and counting comment vs code lines.
-fn hash_walk(node: Node, src: &[u8], st: &mut HashState) {
+fn hash_walk(node: Node, src: &[u8], bound: &std::collections::HashSet<String>, st: &mut HashState) {
     let kind = node.kind();
     if kind == "comment" {
         // A block comment spans multiple lines; a line comment is one.
@@ -214,7 +222,7 @@ fn hash_walk(node: Node, src: &[u8], st: &mut HashState) {
             return;
         }
         let text = node.utf8_text(src).unwrap_or("");
-        st.leaf(kind, text, node.start_position().row as u32, is_atom(kind));
+        st.leaf(kind, text, node.start_position().row as u32, classify(kind, text, bound));
         return;
     }
     let mut cursor = node.walk();
@@ -223,7 +231,7 @@ fn hash_walk(node: Node, src: &[u8], st: &mut HashState) {
         if FN_KINDS.contains(&child.kind()) {
             continue;
         }
-        hash_walk(child, src, st);
+        hash_walk(child, src, bound, st);
     }
 }
 
