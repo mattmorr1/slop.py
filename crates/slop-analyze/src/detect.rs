@@ -1073,6 +1073,8 @@ pub fn run_all(
     findings.extend(crate::config::config_sprawl(repo, facts));
     findings.extend(crate::coverage::untested_effect(built, policy, &branching, &decorated));
     findings.extend(crate::naming::naming_convention(built));
+    // `split::split_candidate` is deliberately absent: adjudicated at ~1 useful
+    // finding in 1184 functions, so it does not ship. See the module header.
     findings.sort_by(|a, b| {
         b.severity
             .cmp(&a.severity)
