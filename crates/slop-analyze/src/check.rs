@@ -414,7 +414,8 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
         let output = Process::new("git")
             .args(["-C"])
             .arg(&req.repo)
-            .args(["diff", "-U0", "--no-color", &req.base, "--", "*.py"])
+            .args(["diff", "-U0", "--no-color", &req.base, "--"])
+            .args(slop_parse::SOURCE_EXTS.iter().map(|e| format!("*.{e}")))
             .output()
             .context("running git diff (use all=true for a non-git tree)")?;
         if !output.status.success() {

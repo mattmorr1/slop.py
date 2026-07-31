@@ -34,6 +34,13 @@ pub enum Language {
     Rust,
 }
 
+/// Every extension [`Language::from_path`] recognizes. The one list callers
+/// outside this crate filter paths by — a diff pathspec, a staleness walk —
+/// so a new language can't be supported here and invisible there.
+pub const SOURCE_EXTS: &[&str] = &[
+    "py", "pyi", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "rs",
+];
+
 impl Language {
     /// The language of a repo-relative path by extension, or `None` when no
     /// parser exists for it (the file's graph/effect facts still come from
@@ -512,6 +519,17 @@ mod tests {
         let mut f = analyze_file(src).unwrap();
         assert_eq!(f.len(), 1, "expected exactly one function");
         f.pop().unwrap()
+    }
+
+    #[test]
+    fn source_exts_and_from_path_agree() {
+        for ext in SOURCE_EXTS {
+            assert!(
+                Language::from_path(&format!("a.{ext}")).is_some(),
+                "SOURCE_EXTS lists {ext} but from_path rejects it"
+            );
+        }
+        assert!(Language::from_path("a.go").is_none());
     }
 
     #[test]

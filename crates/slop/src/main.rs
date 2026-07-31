@@ -1210,9 +1210,6 @@ fn has_top_level_ext(repo: &Path, ext: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Source-file extensions slop indexes — the staleness check watches these.
-const SOURCE_EXTS: &[&str] = &["py", "js", "jsx", "ts", "tsx", "mjs", "cjs", "rs"];
-
 /// Directories never worth walking for source-file mtimes.
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", ".venv", "venv", "target", "__pycache__"];
 
@@ -1256,7 +1253,7 @@ fn newest_source_mtime(dir: &Path, newest: &mut Option<(std::time::SystemTime, P
         } else if path
             .extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|e| SOURCE_EXTS.contains(&e))
+            .is_some_and(|e| slop_parse::SOURCE_EXTS.contains(&e))
         {
             if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
                 if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {

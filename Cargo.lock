@@ -1349,6 +1349,7 @@ dependencies = [
  "slop-llm",
  "slop-lsp",
  "slop-mcp",
+ "slop-parse",
  "slop-proxy",
  "slop-resolve",
  "slop-tui",
