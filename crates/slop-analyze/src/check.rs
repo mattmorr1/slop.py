@@ -247,6 +247,9 @@ fn tier3_structural_verdicts(
 pub struct Analysis {
     pub built: build::BuiltGraph,
     pub facts: Vec<source::FileFacts>,
+    /// Kept rather than dropped after the graph build: occurrence-level data is
+    /// the def-use relation (D20), which the graph itself does not carry.
+    pub resolver: ScipResolver,
 }
 
 /// What to do when the index on disk is older than the source it describes.
@@ -338,7 +341,7 @@ fn build_analysis(repo: &Path, index_path: &Path) -> Result<Analysis> {
     let mut built = build::build_graph(&resolver);
     effects::infer_effects(&mut built);
     let facts = source::parse_repo(repo, &resolver.files());
-    Ok(Analysis { built, facts })
+    Ok(Analysis { built, facts, resolver })
 }
 
 /// One finding plus whether the baseline already grandfathers it. The
