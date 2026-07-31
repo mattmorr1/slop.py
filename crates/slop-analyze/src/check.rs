@@ -375,9 +375,9 @@ pub fn audit(repo: &Path, index: Option<&Path>) -> Result<AuditResult> {
     let (built, facts) = (&analysis.built, &analysis.facts);
     let baseline = Baseline::load(repo)?;
 
-    let mut raw = crate::detect::run_all(&built, &policy, &facts);
-    raw.extend(crate::detect::effect_creep(&built, &baseline));
-    let suppressions = suppress::scan(repo, &facts);
+    let mut raw = crate::detect::run_all(built, &policy, facts);
+    raw.extend(crate::detect::effect_creep(built, &baseline));
+    let suppressions = suppress::scan(repo, facts);
     let submodules = source::submodule_paths(repo);
     let all: Vec<_> = suppress::filter(raw, &suppressions)
         .into_iter()
@@ -391,13 +391,13 @@ pub fn audit(repo: &Path, index: Option<&Path>) -> Result<AuditResult> {
         .map(|e| (e.rule.as_str(), e.entity.as_str()))
         .collect();
 
-    let health_all = health::score(&all, &built);
+    let health_all = health::score(&all, built);
     let new_only: Vec<Finding> = all
         .iter()
         .filter(|f| !grandfathered_set.contains(&(f.rule, f.entity.as_str())))
         .cloned()
         .collect();
-    let health_new = health::score(&new_only, &built);
+    let health_new = health::score(&new_only, built);
 
     let mut findings: Vec<AuditFinding> = all
         .into_iter()
@@ -434,13 +434,13 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
     let analysis = load_analysis_fresh(&req.repo, req.index.as_deref(), Freshness::Reindex)?;
     let (built, facts) = (&analysis.built, &analysis.facts);
     let baseline = Baseline::load(&req.repo)?;
-    let mut raw = crate::detect::run_all(&built, &policy, &facts);
+    let mut raw = crate::detect::run_all(built, &policy, facts);
     // Baseline-relative regression: a function that was pure at baseline and
     // now does I/O. Lives here, not in run_all, because it needs the baseline
     // (run_all is the baseline-free set fix/baseline/tests share).
-    raw.extend(crate::detect::effect_creep(&built, &baseline));
+    raw.extend(crate::detect::effect_creep(built, &baseline));
     if req.tier3 {
-        for (entity, redundant, reason) in tier3_structural_verdicts(&built, &facts, &req.repo)? {
+        for (entity, redundant, reason) in tier3_structural_verdicts(built, facts, &req.repo)? {
             let Some(f) = raw.iter_mut().find(|f| f.rule == "duplicate-structural" && f.entity == entity)
             else {
                 continue;
@@ -457,10 +457,10 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
                 );
             }
         }
-        raw.extend(tier3_findings(&built, &facts, &req.repo)?);
-        raw.extend(tier3_wrapper_findings(&built, &policy, &facts, &req.repo)?);
+        raw.extend(tier3_findings(built, facts, &req.repo)?);
+        raw.extend(tier3_wrapper_findings(built, &policy, facts, &req.repo)?);
     }
-    let suppressions = suppress::scan(&req.repo, &facts);
+    let suppressions = suppress::scan(&req.repo, facts);
     let unsuppressed = suppress::filter(raw, &suppressions);
     // Git submodules are separate projects vendored in — not this repo's to fix.
     let submodules = source::submodule_paths(&req.repo);
@@ -471,7 +471,7 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
     let effective = baseline.filter(unsuppressed);
 
     let (findings, health_line) = if req.all {
-        let s = health::score(&effective, &built);
+        let s = health::score(&effective, built);
         (effective, format!("health: {s}/100"))
     } else {
         let output = Process::new("git")
@@ -498,8 +498,8 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
             .collect();
         let line = format!(
             "health: {} -> {}",
-            health::score(&before, &built),
-            health::score(&effective, &built)
+            health::score(&before, built),
+            health::score(&effective, built)
         );
         (new, line)
     };

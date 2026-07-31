@@ -802,10 +802,10 @@ fn main() -> Result<()> {
             let policy = Policy::load(&repo)?;
             let analysis = check::load_analysis(&repo, index.as_deref())?;
             let (built, facts) = (&analysis.built, &analysis.facts);
-            let raw = detect::run_all(&built, &policy, &facts);
-            let suppressions = suppress::scan(&repo, &facts);
+            let raw = detect::run_all(built, &policy, facts);
+            let suppressions = suppress::scan(&repo, facts);
             let findings = suppress::filter(raw, &suppressions);
-            let baseline = Baseline::from_findings(&findings).with_effects(&built);
+            let baseline = Baseline::from_findings(&findings).with_effects(built);
             let count = baseline.findings.len();
             baseline.save(&repo)?;
             println!(
@@ -818,7 +818,7 @@ fn main() -> Result<()> {
             ensure_index(&repo, &index_path)?;
             let analysis = check::load_analysis(&repo, index.as_deref())?;
             let built = &analysis.built;
-            let proposals = infer::infer_channels(&built);
+            let proposals = infer::infer_channels(built);
             if proposals.is_empty() {
                 println!("no dominant effect channels found — nothing to propose");
                 return Ok(());
