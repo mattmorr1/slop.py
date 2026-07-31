@@ -10,8 +10,9 @@
 
 use crate::build::BuiltGraph;
 use crate::envelope::proximity_distances;
-use crate::skeleton::{skeleton_for, strip_noise};
+use crate::skeleton::{annotation_prefix, skeleton_for, strip_noise};
 use crate::source::{entity_for, location_index, FileFacts};
+use slop_parse::Language;
 
 /// The leading-whitespace prefix of `line` (spaces or tabs), verbatim.
 fn indent_prefix(line: &str) -> &str {
@@ -101,8 +102,9 @@ pub fn compress_file(
     densify: Option<&Densifier>,
 ) -> (String, CompressStats) {
     let lines: Vec<&str> = source.lines().collect();
+    let lang = Language::from_path(file);
     let plain = |reason_stats: usize| {
-        let out = strip_noise(source);
+        let out = strip_noise(source, lang);
         (
             out.clone(),
             CompressStats {
@@ -156,7 +158,7 @@ pub fn compress_file(
             if let Some(summary) = densify.and_then(|f| f(entity)) {
                 let summary = summary.trim();
                 if !summary.is_empty() {
-                    sk = format!("# summary: {summary}\n{sk}");
+                    sk = format!("{} summary: {summary}\n{sk}", annotation_prefix(lang));
                 }
             }
             regions.push((start, fact.end_line as usize, indent_block(&sk, pad)));
@@ -188,13 +190,13 @@ pub fn compress_file(
         let s = *s;
         let e = (*e).min(last);
         if s > cursor && s <= lines.len() {
-            out.push_str(&strip_noise(&lines[cursor..s].join("\n")));
+            out.push_str(&strip_noise(&lines[cursor..s].join("\n"), lang));
         }
         out.push_str(sk);
         cursor = e + 1;
     }
     if cursor < lines.len() {
-        out.push_str(&strip_noise(&lines[cursor..].join("\n")));
+        out.push_str(&strip_noise(&lines[cursor..].join("\n"), lang));
     }
 
     let stats = CompressStats {
@@ -256,7 +258,7 @@ mod tests {
             None,
         );
         assert_eq!(stats.skeletonized, 0);
-        assert_eq!(out, strip_noise(&src));
+        assert_eq!(out, strip_noise(&src, Some(Language::Python)));
     }
 
     #[test]

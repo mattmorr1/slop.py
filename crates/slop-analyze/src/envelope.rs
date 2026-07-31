@@ -150,7 +150,10 @@ fn render_full(repo_root: &Path, entity: &CodeEntity) -> Option<String> {
     if start > end || start >= lines.len() {
         return None;
     }
-    Some(strip_noise(&lines[start..=end].join("\n")))
+    Some(strip_noise(
+        &lines[start..=end].join("\n"),
+        slop_parse::Language::from_path(&entity.file),
+    ))
 }
 
 /// Build the envelope around `target_entity` (a dotted `id`, `::`-joined).
