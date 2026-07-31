@@ -53,6 +53,17 @@ impl Language {
         }
     }
 
+    /// The line-comment prefix, plus the prefixes that start with it but carry
+    /// meaning (doc comments) and must survive a comment strip. Rust's `#` is
+    /// deliberately absent: `#[derive]` is code, not a comment.
+    pub fn line_comment(self) -> (&'static str, &'static [&'static str]) {
+        match self {
+            Language::Python => ("#", &[]),
+            Language::Rust => ("//", &["///", "//!"]),
+            Language::JavaScript | Language::TypeScript => ("//", &["///"]),
+        }
+    }
+
     /// Per-function facts for `source` in this language.
     pub fn parse(self, source: &str) -> Result<Vec<FunctionFacts>> {
         match self {

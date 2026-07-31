@@ -117,7 +117,7 @@ pub(crate) fn verdict_schema() -> Value {
 
 pub(crate) fn render_prompt(pairs: &[JudgeInput]) -> String {
     let mut prompt = String::from(
-        "You are reviewing a Python codebase for semantic redundancy: pairs of functions that \
+        "You are reviewing a codebase for semantic redundancy: pairs of functions that \
          serve the same purpose and should be unified, even if implemented differently. \
          Sharing a helper or theme is NOT redundancy — only judge a pair redundant if one \
          function could replace the other (possibly with a small parameter change) and the \
@@ -139,7 +139,7 @@ pub(crate) fn render_prompt(pairs: &[JudgeInput]) -> String {
 /// inlined; `false` means the name states intent the callee doesn't.
 pub(crate) fn render_wrapper_prompt(wrappers: &[JudgeInput]) -> String {
     let mut prompt = String::from(
-        "You are reviewing a Python codebase for trivial wrapper functions: one-line functions \
+        "You are reviewing a codebase for trivial wrapper functions: one-line functions \
          whose entire body forwards their arguments to a single other call. Some are slop and \
          should be inlined at their few call sites; others earn their place because the NAME \
          expresses a domain concept, a policy, or an abstraction boundary the raw call would \

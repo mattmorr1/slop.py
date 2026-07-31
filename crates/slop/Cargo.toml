@@ -3,7 +3,7 @@ name = "slop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Codebase-relative AI-slop analyzer for Python, with an agent harness"
+description = "Codebase-relative AI-slop analyzer for Python, JS/TS and Rust, with an agent harness"
 repository.workspace = true
 
 [[bin]]

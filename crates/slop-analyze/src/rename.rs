@@ -138,7 +138,15 @@ pub fn rewrite_occurrences(
             out.replace_range(start..end, new_name);
         }
 
-        if slop_parse::analyze_file(&out).is_err() {
+        // Re-parse in the file's own language. This used to always run the
+        // Python parser, so the guard was meaningless off Python: it rejected
+        // every valid `.ts`/`.rs` rewrite and would have accepted anything the
+        // Python grammar happened to admit.
+        let reparses = match slop_parse::Language::from_path(file) {
+            Some(lang) => lang.parse(&out).is_ok(),
+            None => false,
+        };
+        if !reparses {
             return Err(format!(
                 "rewriting {file} produced source that no longer parses — rename aborted"
             ));

@@ -9,14 +9,10 @@
 use slop_graph::{CodeEntity, EffectSet, NodeType};
 use slop_parse::Language;
 
-/// The line-comment prefix to strip, and the prefixes that look like it but
-/// carry meaning. Rust's `#` is deliberately absent: `#[derive]` is code.
 fn comment_syntax(lang: Option<Language>) -> (Option<&'static str>, &'static [&'static str]) {
-    match lang {
-        Some(Language::Python) => (Some("#"), &[]),
-        Some(Language::Rust) => (Some("//"), &["///", "//!"]),
-        Some(Language::JavaScript | Language::TypeScript) => (Some("//"), &["///"]),
-        _ => (None, &[]),
+    match lang.map(Language::line_comment) {
+        Some((prefix, keep)) => (Some(prefix), keep),
+        None => (None, &[]),
     }
 }
 

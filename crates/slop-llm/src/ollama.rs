@@ -51,7 +51,7 @@ impl Ollama {
     /// densification. Returns a single trimmed line.
     pub fn summarize(&self, code: &str) -> Result<String> {
         let prompt = format!(
-            "In 10 words or fewer, say what this Python code does. Reply with only the phrase, \
+            "In 10 words or fewer, say what this code does. Reply with only the phrase, \
              no punctuation, no preamble.\n\n{code}"
         );
         let raw = self.generate(&prompt)?;

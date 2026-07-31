@@ -51,10 +51,19 @@ pub fn naming_convention(built: &BuiltGraph) -> Vec<Finding> {
                 (name, case_style(name))
             })
             .collect();
+        // Whichever style dominates is the house style — a camelCase codebase
+        // (JS/TS) is as much a convention as a snake_case one, and checking
+        // only for snake made the rule silent on half the languages slop reads.
         let snake = named.iter().filter(|(_, s)| *s == CaseStyle::Snake).count();
-        if snake as f64 / named.len() as f64 >= DOMINANCE {
+        let camel = named.iter().filter(|(_, s)| *s == CaseStyle::Camel).count();
+        let dominant = if snake >= camel { CaseStyle::Snake } else { CaseStyle::Camel };
+        let (count, style_name) = match dominant {
+            CaseStyle::Snake => (snake, "snake_case"),
+            _ => (camel, "camelCase"),
+        };
+        if count as f64 / named.len() as f64 >= DOMINANCE {
             for (entity, (name, style)) in functions.iter().zip(&named) {
-                if *style != CaseStyle::Snake && !name.starts_with("__") {
+                if *style != dominant && !name.starts_with("__") {
                     findings.push(Finding {
                         rule: "naming-convention",
                         severity: Severity::Advisory,
@@ -62,10 +71,10 @@ pub fn naming_convention(built: &BuiltGraph) -> Vec<Finding> {
                         file: entity.file.clone(),
                         lines: entity.source_range,
                         message: format!(
-                            "`{name}` deviates from this codebase's dominant snake_case style ({snake}/{} functions)",
+                            "`{name}` deviates from this codebase's dominant {style_name} style ({count}/{} functions)",
                             named.len()
                         ),
-                        fix_guidance: format!("Rename `{name}` to snake_case"),
+                        fix_guidance: format!("Rename `{name}` to {style_name}"),
                     });
                 }
             }
@@ -115,5 +124,39 @@ mod tests {
         assert!(matches!(case_style("main"), CaseStyle::Snake));
         assert!(matches!(case_style("fetchData"), CaseStyle::Camel));
         assert!(matches!(case_style("fetch_Data"), CaseStyle::Other));
+    }
+
+    fn built_of(names: &[&str]) -> BuiltGraph {
+        let mut graph = slop_graph::CodeGraph::new();
+        for n in names {
+            graph.add_entity(slop_graph::CodeEntity {
+                id: format!("m::{n}"),
+                entity_type: NodeType::Function,
+                name: (*n).into(),
+                signature: String::new(),
+                docstring: None,
+                file: "m.ts".into(),
+                source_range: (0, 1),
+                body_hash: String::new(),
+                effect_signature: slop_graph::EffectSet::pure(),
+            });
+        }
+        BuiltGraph {
+            graph,
+            by_symbol: Default::default(),
+            referenced: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_camelcase_codebase_is_judged_against_camelcase() {
+        let mut names: Vec<String> = (0..19).map(|i| format!("fetchThing{i}")).collect();
+        names.push("parse_date".into());
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let found = naming_convention(&built_of(&refs));
+        let convention: Vec<_> = found.iter().filter(|f| f.rule == "naming-convention").collect();
+        assert_eq!(convention.len(), 1, "{convention:#?}");
+        assert!(convention[0].message.contains("camelCase"), "{}", convention[0].message);
+        assert!(convention[0].entity.ends_with("parse_date"));
     }
 }

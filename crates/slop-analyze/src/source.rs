@@ -50,17 +50,32 @@ pub fn is_test_entity(entity_id: &str) -> bool {
 /// Is `path` a test file? Test doubles, mocks, and fixtures are called
 /// dynamically by the test framework (collection, dependency injection), which
 /// SCIP can't resolve — so `dead-island` there is almost always a false
-/// positive. Matches the near-universal Python conventions (pytest/unittest).
+/// positive. Covers pytest/unittest (`test_x.py`, `x_test.py`, `conftest.py`),
+/// the JS/TS `x.test.ts` / `x.spec.js` convention, and Rust's `tests/` dir.
 pub fn is_test_file(path: &str) -> bool {
     let p = path.replace('\\', "/");
     let base = p.rsplit('/').next().unwrap_or(&p);
+    let stem = base.split('.').next().unwrap_or(base);
     p.starts_with("tests/")
         || p.starts_with("test/")
         || p.contains("/tests/")
         || p.contains("/test/")
         || base.starts_with("test_")
-        || base.ends_with("_test.py")
+        || stem.ends_with("_test")
+        || base.contains(".test.")
+        || base.contains(".spec.")
         || base == "conftest.py"
+}
+
+/// A dotted module-ish label for a file, used when a fact has no graph entity
+/// to name it. Strips the source extension so a `.ts` file doesn't render as
+/// `src.foo.ts::bar`.
+pub fn module_label(file: &str) -> String {
+    let stem = slop_parse::SOURCE_EXTS
+        .iter()
+        .find_map(|e| file.strip_suffix(&format!(".{e}")))
+        .unwrap_or(file);
+    stem.replace('/', ".")
 }
 
 /// Repo-relative paths of git submodules, parsed from `<repo>/.gitmodules`.

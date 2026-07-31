@@ -1,7 +1,8 @@
 # slop
 
-A **codebase-relative AI-slop analyzer** for Python, plus an agent harness that
-steers a coding agent away from slop as it writes.
+A **codebase-relative AI-slop analyzer** for Python, JavaScript/TypeScript and
+Rust, plus an agent harness that steers a coding agent away from slop as it
+writes.
 
 Most linters judge a file against absolute rules. `slop` judges code against
 *the codebase it lives in*: it builds an effect-typed graph of the whole repo
@@ -11,14 +12,15 @@ hallucinated dead code, functions whose names lie about what they do, and
 tangled control flow — then either fixes them mechanically or hands an agent
 precise, located guidance.
 
-> Status: **v0**, Python-only, and built on a `scip-python` index. The
+> Status: **v0**, built on a SCIP index. The
 > detectors and harness are dogfooded on real repos (see below); the
 > token/quality *value* of the read-path harness is measured but not yet
 > rigorously proven. See [Limitations](#limitations).
 
 ## Install
 
-Requires a recent Rust toolchain and `npx` (for the Python indexer).
+Requires a recent Rust toolchain, plus `npx` for the Python/TypeScript
+indexers (Rust uses `rust-analyzer`, which needs no npx).
 
 ```sh
 cargo install --path crates/slop     # installs the `slop` binary
@@ -32,7 +34,7 @@ cargo build --release                # -> target/release/slop
 Generate one, then check:
 
 ```sh
-slop index              # runs scip-python and verifies the index isn't empty
+slop index              # auto-selects the indexer; verifies the index isn't empty
 slop check              # judges the working-tree diff vs HEAD (cwd)
 slop check --all        # audits the whole repo
 slop check --reindex    # regenerate the index first (else a stale one warns)
@@ -40,8 +42,9 @@ slop check --json       # machine-readable output for editors / CI
 ```
 
 Every command defaults its repo argument to the current directory. (`slop index`
-wraps `npx @sourcegraph/scip-python`; run that directly if you prefer. A
-broken/empty index fails loudly rather than silently passing.)
+wraps `scip-python`, `scip-typescript` or `rust-analyzer scip`, picked from the
+repo's project markers; `--indexer` overrides. A broken/empty index fails loudly
+rather than silently passing.)
 
 ```
 WARNING (1)
@@ -177,17 +180,14 @@ slop lsp                # serve over stdio for the cwd (what an editor launches)
 
 ## Limitations
 
-- **Python is the fully-supported language.** The graph/effect detectors
-  (`infra-bypass`, `circular-import`, `dead-island`, `purity-lie`,
-  `effect-layer-violation`, `effect-creep`) work over *any* SCIP-indexed
-  language — `slop index` auto-selects `scip-python` or `scip-typescript`, and
-  the effect seed table has a JavaScript/Node set validated against a real
-  `scip-typescript` index (`axios`, `fs`, `child_process`, `process.env` all
-  resolve; see the `ts_probe` fixture). The parser-based rules (duplication,
-  complexity, over-commenting) work on **Python and JavaScript/TypeScript** —
-  Python via ruff, JS/TS via tree-sitter (the `Language` seam in `slop-parse`).
-  Resolution is only as good as the SCIP index (dynamic dispatch, `getattr`,
-  duck typing can be missed).
+- **Python, JavaScript/TypeScript and Rust are supported**, through one seam
+  (`Language` in `slop-parse`): Python via ruff, the rest via tree-sitter.
+  `slop index` auto-selects `scip-python`, `scip-typescript` or
+  `rust-analyzer scip`, and the effect seed table carries a validated set for
+  each. Every rule runs on all three. Resolution is only as good as the SCIP
+  index — dynamic dispatch, `getattr` and duck typing can be missed, and a
+  *stale* index is worse than a missing one, so `check`/`gate` regenerate it
+  rather than judging a diff against yesterday's graph.
 - The read-path harness's **token wins are measured** (~−61% on dogfood repos);
   whether it preserves *output quality* is not yet rigorously proven.
 - `slop fix` renames are SCIP-*verified*, not behaviour-inert — dry-run and

@@ -121,7 +121,7 @@ enum Command {
     Compress {
         /// Repo root
         repo: PathBuf,
-        /// Repo-relative .py file to compress
+        /// Repo-relative source file to compress (Python, JS/TS, or Rust)
         file: String,
         /// Path to index.scip (default: <repo>/index.scip)
         #[arg(long)]
@@ -476,7 +476,7 @@ fn main() -> Result<()> {
                 let Ok(src) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                let (new_src, n) = fix::fix_over_commenting(&src, &ranges);
+                let (new_src, n) = fix::fix_over_commenting(&src, &ranges, slop_parse::Language::from_path(&file));
                 if n == 0 {
                     continue;
                 }

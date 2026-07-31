@@ -1,11 +1,11 @@
 ---
 name: slop
-description: Find and clean AI-slop in a Python codebase with the `slop` engine — codebase-relative duplication, infra-bypass, effect-layer violations, effect-creep, complexity spikes, dead code, purity lies, and naming drift. Use when the user wants to check code quality, find or clean AI-generated slop, validate that a change introduced no new slop before committing, or explicitly says to run slop.
+description: Find and clean AI-slop in a Python, JS/TS or Rust codebase with the `slop` engine — codebase-relative duplication, infra-bypass, effect-layer violations, effect-creep, complexity spikes, dead code, purity lies, and naming drift. Use when the user wants to check code quality, find or clean AI-generated slop, validate that a change introduced no new slop before committing, or explicitly says to run slop.
 ---
 
 # slop — codebase-relative AI-slop analysis
 
-`slop` judges Python against *the codebase it lives in* — an effect-typed graph
+`slop` judges your code against *the codebase it lives in* — an effect-typed graph
 of the whole repo — not against absolute style rules. Reach for it to catch the
 ways AI-generated code rots: reimplementing code that already exists, bypassing
 the infrastructure everyone else routes through, hallucinated dead code,

@@ -3,16 +3,20 @@
 //! `over-commenting`: delete full-line comments that merely restate the
 //! adjacent line of code.
 //!
-//! Deleting a comment can never change Python behavior, so this is safe *by
-//! construction*. The only judgment is which comments are pure restatement;
-//! that's kept deliberately conservative (high word-overlap required) so it
-//! favors keeping a comment over wrongly deleting an explanatory one.
+//! Deleting a comment can never change behavior, so this is safe *by
+//! construction* — but only once "is a comment" is answered per language. A
+//! `#`-prefixed line is a comment in Python and an attribute in Rust, and doc
+//! comments are a contract rather than noise, so both are left alone. The only
+//! remaining judgment is which comments are pure restatement; that's kept
+//! deliberately conservative (high word-overlap required) so it favors keeping
+//! a comment over wrongly deleting an explanatory one.
 
 use std::collections::HashSet;
 
 use crate::build::BuiltGraph;
 use crate::findings::{Finding, Severity};
 use crate::source::{self, FileFacts};
+use slop_parse::Language;
 
 /// Common words that carry no restatement signal.
 const STOPWORDS: &[&str] = &[
@@ -52,7 +56,7 @@ fn words(s: &str) -> HashSet<String> {
     out
 }
 
-/// Does `comment` (a `# ...` line) merely restate `code`?
+/// Does `comment` (a comment line, marker already stripped) restate `code`?
 fn restates(comment: &str, code: &str) -> bool {
     let stop: HashSet<&str> = STOPWORDS.iter().copied().collect();
     let cw: HashSet<String> = words(comment)
@@ -69,7 +73,17 @@ fn restates(comment: &str, code: &str) -> bool {
 
 /// Remove restating full-line comments inside each `(start, end)` line range
 /// (0-based, inclusive). Returns the rewritten source and the count removed.
-pub fn fix_over_commenting(source: &str, ranges: &[(usize, usize)]) -> (String, usize) {
+pub fn fix_over_commenting(
+    source: &str,
+    ranges: &[(usize, usize)],
+    lang: Option<Language>,
+) -> (String, usize) {
+    // No parser for the file means no reliable comment syntax, and a wrong
+    // guess deletes code.
+    let Some((marker, keep)) = lang.map(Language::line_comment) else {
+        return (source.to_string(), 0);
+    };
+    let is_comment = |t: &str| t.starts_with(marker) && !keep.iter().any(|k| t.starts_with(k));
     let lines: Vec<&str> = source.lines().collect();
     let trailing_newline = source.ends_with('\n');
 
@@ -78,7 +92,7 @@ pub fn fix_over_commenting(source: &str, ranges: &[(usize, usize)]) -> (String, 
         lines[i + 1..]
             .iter()
             .map(|l| l.trim())
-            .find(|t| !t.is_empty() && !t.starts_with('#'))
+            .find(|t| !t.is_empty() && !is_comment(t))
     };
 
     let mut remove: HashSet<usize> = HashSet::new();
@@ -87,10 +101,10 @@ pub fn fix_over_commenting(source: &str, ranges: &[(usize, usize)]) -> (String, 
         for i in s..=end {
             let Some(line) = lines.get(i) else { continue };
             let t = line.trim_start();
-            if !t.starts_with('#') {
+            if !is_comment(t) {
                 continue;
             }
-            let comment = t.trim_start_matches('#');
+            let comment = t.trim_start_matches(marker);
             if let Some(code) = next_code(i) {
                 if restates(comment, code) {
                     remove.insert(i);
@@ -221,7 +235,7 @@ mod tests {
     #[test]
     fn removes_pure_restatement() {
         let src = "def f():\n    # return the result\n    return result\n";
-        let (out, n) = fix_over_commenting(src, &[(0, 2)]);
+        let (out, n) = fix_over_commenting(src, &[(0, 2)], Some(Language::Python));
         assert_eq!(n, 1);
         assert!(!out.contains('#'), "{out}");
         assert!(out.contains("return result"));
@@ -231,15 +245,33 @@ mod tests {
     fn keeps_explanatory_comments() {
         // Domain rationale the code can't express — must survive.
         let src = "def f():\n    # WHOOP weights HRV at 65 percent\n    x = 0.65 * hrv\n";
-        let (out, n) = fix_over_commenting(src, &[(0, 2)]);
+        let (out, n) = fix_over_commenting(src, &[(0, 2)], Some(Language::Python));
         assert_eq!(n, 0);
         assert!(out.contains("WHOOP"));
     }
 
     #[test]
+    fn rust_attributes_and_doc_comments_are_never_touched() {
+        // `#[derive]` is code; `///` is the contract. Only the plain restating
+        // `//` line may go.
+        let src = "#[derive(Debug)]\n/// Returns the result.\nfn f() -> R {\n    // return result\n    return result;\n}\n";
+        let (out, n) = fix_over_commenting(src, &[(0, 5)], Some(Language::Rust));
+        assert_eq!(n, 1, "{out}");
+        assert!(out.contains("#[derive(Debug)]"), "{out}");
+        assert!(out.contains("/// Returns the result."), "{out}");
+        assert!(!out.contains("// return result"), "{out}");
+    }
+
+    #[test]
+    fn an_unknown_language_is_left_alone() {
+        let src = "# could be anything\nvalue\n";
+        assert_eq!(fix_over_commenting(src, &[(0, 1)], None), (src.to_string(), 0));
+    }
+
+    #[test]
     fn keeps_comments_outside_ranges() {
         let src = "# module header restating module\ndef f():\n    pass\n";
-        let (out, n) = fix_over_commenting(src, &[(1, 2)]);
+        let (out, n) = fix_over_commenting(src, &[(1, 2)], Some(Language::Python));
         assert_eq!(n, 0);
         assert_eq!(out, src);
     }

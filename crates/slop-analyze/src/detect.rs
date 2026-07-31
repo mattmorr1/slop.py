@@ -361,6 +361,8 @@ pub fn effect_layer_violation(built: &BuiltGraph, policy: &Policy) -> Vec<Findin
     findings
 }
 
+/// Matched against the snake_case-normalized name, so `calculateTotal` in a
+/// JS/TS codebase is caught the same as `calculate_total`.
 const PURE_NAME_PREFIXES: &[&str] = &[
     "calculate_", "compute_", "parse_", "format_", "validate_", "normalize_", "convert_",
     "is_", "to_", "as_",
@@ -437,6 +439,7 @@ pub fn purity_lie(built: &BuiltGraph) -> Vec<Finding> {
             continue;
         }
         let name = entity.id.rsplit("::").next().unwrap_or(&entity.id);
+        let name = crate::rename::to_snake_case(name);
         if !PURE_NAME_PREFIXES.iter().any(|p| name.starts_with(p)) {
             continue;
         }
@@ -492,7 +495,7 @@ fn label(
 ) -> String {
     crate::source::entity_for(built, index, file, fact)
         .map(|e| e.id.clone())
-        .unwrap_or_else(|| format!("{}::{}", file.trim_end_matches(".py").replace('/', "."), fact.name))
+        .unwrap_or_else(|| format!("{}::{}", crate::source::module_label(file), fact.name))
 }
 
 struct Member {
@@ -515,7 +518,7 @@ fn collect_members(built: &BuiltGraph, facts: &[crate::source::FileFacts]) -> Ve
             let entity = crate::source::entity_for(built, &index, &ff.file, fact);
             members.push(Member {
                 label: entity.map(|e| e.id.clone()).unwrap_or_else(|| {
-                    format!("{}::{}", ff.file.trim_end_matches(".py").replace('/', "."), fact.name)
+                    format!("{}::{}", crate::source::module_label(&ff.file), fact.name)
                 }),
                 file: ff.file.clone(),
                 lines: (fact.start_line as usize, fact.end_line as usize),
