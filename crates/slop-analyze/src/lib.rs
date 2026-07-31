@@ -4,6 +4,7 @@ pub mod baseline;
 pub mod build;
 pub mod check;
 pub mod compress;
+pub mod coverage;
 pub mod detect;
 pub mod diff;
 pub mod effects;

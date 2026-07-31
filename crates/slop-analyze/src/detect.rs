@@ -367,7 +367,7 @@ const PURE_NAME_PREFIXES: &[&str] = &[
     "calculate_", "compute_", "parse_", "format_", "validate_", "normalize_", "convert_",
     "is_", "to_", "as_",
 ];
-const IO_EFFECTS: &[Effect] = &[
+pub(crate) const IO_EFFECTS: &[Effect] = &[
     Effect::Net,
     Effect::FsRead,
     Effect::FsWrite,
@@ -865,6 +865,16 @@ pub fn run_all(
                 .map(|f| label(built, &index, &ff.file, f))
         })
         .collect();
+    // Functions with a branch to get wrong, for `untested-effect`.
+    let branching: std::collections::HashSet<String> = facts
+        .iter()
+        .flat_map(|ff| {
+            ff.functions
+                .iter()
+                .filter(|f| f.branch_points >= crate::coverage::MIN_BRANCH_POINTS)
+                .map(|f| label(built, &index, &ff.file, f))
+        })
+        .collect();
 
     let mut findings = infra_bypass(built, policy);
     findings.extend(circular_import(built));
@@ -872,6 +882,7 @@ pub fn run_all(
     findings.extend(purity_lie(built));
     findings.extend(effect_layer_violation(built, policy));
     findings.extend(source_detectors(built, facts));
+    findings.extend(crate::coverage::untested_effect(built, policy, &branching, &decorated));
     findings.extend(crate::naming::naming_convention(built));
     findings.sort_by(|a, b| {
         b.severity

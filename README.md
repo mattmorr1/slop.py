@@ -108,6 +108,7 @@ baselined repo doesn't look falsely pristine.
 | `duplicate-structural` | Advisory → Warning | Same control-flow shape, renamed vars/literals — a *candidate*; `--tier3` promotes ones an LLM judge confirms |
 | `complexity-spike` | Warning | Genuinely tangled functions — deep nesting or many independent branches, not just a fat boolean guard |
 | `purity-lie` | Warning | A `compute_`/`parse_`/`is_`-named function that actually does I/O |
+| `untested-effect` | Advisory | A branching function that performs I/O and no test reaches, in a codebase that tests most of its effectful functions |
 | `dead-island` | Warning / Advisory | Functions nothing references and that aren't declared entry points (methods → Advisory: SCIP can miss dynamic dispatch) |
 | `naming-convention` | Advisory | Deviation from the codebase's dominant case style |
 | `slop-name` | Advisory | Throwaway markers that outlive their intent — `_v2`, `helper_`, `temp_` |
