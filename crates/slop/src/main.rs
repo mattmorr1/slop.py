@@ -1,4 +1,4 @@
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 
@@ -13,7 +13,9 @@ use slop_analyze::compress::{self, CompressConfig};
 use slop_analyze::index::{
     default_project_name, ensure_index, run_indexer, run_scip_index, Indexer,
 };
-use slop_analyze::{detect, fix, gate, harness, infer, inline, policy::Policy, rename, suppress};
+use slop_analyze::{
+    detect, fix, gate, harness, infer, inline, policy::Policy, rename, retrieve, suppress,
+};
 use slop_resolve::{Resolver, ScipResolver};
 
 #[derive(Parser)]
@@ -335,6 +337,25 @@ enum Command {
         /// Write <repo>/slop.toml (refuses to overwrite an existing one)
         #[arg(long)]
         write: bool,
+    },
+    /// Where does proposed code belong? Reads the content on stdin and names
+    /// existing functions whose callee neighborhood it overlaps.
+    Suggest {
+        /// Repo root (default: current directory)
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+        /// Path to index.scip (default: <repo>/index.scip)
+        #[arg(long)]
+        index: Option<PathBuf>,
+        /// Path the content is destined for; sets the language (default: Python)
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Leave-one-out over every indexed function instead of reading stdin:
+        /// feed each existing body back as if proposed, hiding its own entry.
+        #[arg(long)]
+        eval: bool,
     },
     /// Low-level SCIP index introspection (index-info / occurrences / resolve).
     Debug {
@@ -834,8 +855,95 @@ fn main() -> Result<()> {
                 println!("wrote {}", path.display());
             }
         }
+        Command::Suggest {
+            repo,
+            index,
+            file,
+            limit,
+            eval,
+        } => run_suggest(&repo, index.as_deref(), file.as_deref(), limit, eval)?,
         Command::Debug { command } => run_debug(command)?,
     }
+    Ok(())
+}
+
+/// Prospective retrieval: name the existing functions a piece of proposed code
+/// overlaps. `--eval` runs it leave-one-out over the whole repo, which is how the
+/// signal gets measured before it is wired into anything.
+fn run_suggest(
+    repo: &Path,
+    index: Option<&Path>,
+    file: Option<&str>,
+    limit: usize,
+    eval: bool,
+) -> Result<()> {
+    let analysis = check::load_analysis_fresh(repo, index, check::Freshness::Reindex)?;
+    let hood = retrieve::Neighborhood::build(&analysis.built);
+    if !eval {
+        let mut source = String::new();
+        std::io::stdin().read_to_string(&mut source)?;
+        let lang = file
+            .and_then(slop_parse::Language::from_path)
+            .unwrap_or(slop_parse::Language::Python);
+        let query = retrieve::query_from_source(lang, &source);
+        let matches = hood.matches(&query, None, limit);
+        if matches.is_empty() {
+            println!("nothing in {} shares this code's neighborhood", repo.display());
+            return Ok(());
+        }
+        println!("this code calls {} known things; closest existing homes:", query.len());
+        for m in &matches {
+            println!("  {}  ({}:{})", m.label, m.file, m.line + 1);
+            println!("      score {:.2}, {} distinctive of {} shared: {}", m.score, m.distinctive.len(), m.shared, m.distinctive.join(", "));
+        }
+        return Ok(());
+    }
+
+    let mut hits = 0usize;
+    let mut probed = 0usize;
+    for ff in &analysis.facts {
+        if slop_analyze::source::is_test_file(&ff.file) {
+            continue;
+        }
+        let Some(lang) = slop_parse::Language::from_path(&ff.file) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(repo.join(&ff.file)) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for fact in &ff.functions {
+            let (a, b) = (fact.start_line as usize, (fact.end_line as usize).min(lines.len() - 1));
+            if a > b {
+                continue;
+            }
+            let body = lines[a..=b].join("\n");
+            let query = retrieve::query_from_source(lang, &body);
+            // The label the graph knows this function by, so it can be hidden.
+            let label = analysis
+                .built
+                .graph
+                .entities()
+                .find(|(_, e)| e.file == ff.file && e.source_range.0 == a)
+                .map(|(_, e)| e.id.clone());
+            // Inline `mod tests` fixture builders are excluded as candidates by
+            // `Neighborhood::build`; without this they still leak in as queries.
+            if label.as_deref().is_some_and(slop_analyze::source::is_test_entity) {
+                continue;
+            }
+            probed += 1;
+            let matches = hood.matches(&query, label.as_deref(), limit);
+            if matches.is_empty() {
+                continue;
+            }
+            hits += 1;
+            println!("{}:{}  {}", ff.file, a + 1, label.unwrap_or_else(|| fact.name.clone()));
+            for m in &matches {
+                println!("    -> {}  ({}:{})  {:.2} / {} distinctive: {}", m.label, m.file, m.line + 1, m.score, m.distinctive.len(), m.distinctive.join(", "));
+            }
+        }
+    }
+    println!("\n{hits} of {probed} functions retrieved an existing neighbor ({:.1}%)", 100.0 * hits as f64 / probed.max(1) as f64);
     Ok(())
 }
 

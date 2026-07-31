@@ -25,6 +25,7 @@ pub mod policy;
 pub mod precheck;
 pub mod query;
 pub mod rename;
+pub mod retrieve;
 pub mod search;
 pub mod skeleton;
 pub mod source;

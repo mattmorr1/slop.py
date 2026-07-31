@@ -863,11 +863,11 @@ const MIN_SHARED_CALLEES: usize = 3;
 /// call `Option::map`/`as_str`/`get`; four `__init__`s all call the same torch
 /// constructors. Sharing ubiquitous calls says nothing about doing the same job,
 /// so a match needs callees that few other functions make.
-const MIN_DISTINCTIVE_CALLEES: usize = 2;
+pub(crate) const MIN_DISTINCTIVE_CALLEES: usize = 2;
 
 /// A callee called by more than `functions / this` others is common vocabulary,
 /// not a distinguishing feature — inverse document frequency, thresholded.
-const DISTINCTIVE_DF_DIVISOR: usize = 20;
+pub(crate) const DISTINCTIVE_DF_DIVISOR: usize = 20;
 
 /// The set of things a function calls, as sorted entity IDs. External callees
 /// (`std.fs.read_to_string`, `requests.post`) are included deliberately — they
