@@ -375,7 +375,7 @@ pub fn audit(repo: &Path, index: Option<&Path>) -> Result<AuditResult> {
     let (built, facts) = (&analysis.built, &analysis.facts);
     let baseline = Baseline::load(repo)?;
 
-    let mut raw = crate::detect::run_all(built, &policy, facts);
+    let mut raw = crate::detect::run_all(built, &policy, facts, repo);
     raw.extend(crate::detect::effect_creep(built, &baseline));
     let suppressions = suppress::scan(repo, facts);
     let submodules = source::submodule_paths(repo);
@@ -434,7 +434,7 @@ pub fn run(req: CheckRequest) -> Result<CheckResult> {
     let analysis = load_analysis_fresh(&req.repo, req.index.as_deref(), Freshness::Reindex)?;
     let (built, facts) = (&analysis.built, &analysis.facts);
     let baseline = Baseline::load(&req.repo)?;
-    let mut raw = crate::detect::run_all(built, &policy, facts);
+    let mut raw = crate::detect::run_all(built, &policy, facts, &req.repo);
     // Baseline-relative regression: a function that was pure at baseline and
     // now does I/O. Lives here, not in run_all, because it needs the baseline
     // (run_all is the baseline-free set fix/baseline/tests share).

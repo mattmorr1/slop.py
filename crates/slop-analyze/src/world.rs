@@ -25,6 +25,9 @@ use crate::source::{is_test_entity, is_test_file};
 /// with headroom so a long capability list never truncates mid-line.
 pub const DEFAULT_BUDGET: usize = 7000;
 
+/// Environment variables to name before the list stops earning its space.
+const ENV_LIMIT: usize = 12;
+
 /// How many capabilities to list per effect group. Enough to show the pattern,
 /// not so many that the model reads as a directory listing.
 const PER_GROUP: usize = 6;
@@ -133,7 +136,15 @@ fn capability_lines(built: &BuiltGraph) -> Vec<String> {
 
 /// Render the world model for `repo`, or `None` when there is nothing useful to
 /// say (no policy and no graph) — silence beats a section header with no facts.
-pub fn render(policy: &Policy, built: Option<&BuiltGraph>, budget: usize) -> Option<String> {
+/// `env` is the repo's environment-variable surface (name, how many modules read
+/// it) from [`crate::config::env_vars`]. Passed in rather than read here so this
+/// module stays free of file I/O.
+pub fn render(
+    policy: &Policy,
+    built: Option<&BuiltGraph>,
+    env: &[(String, usize)],
+    budget: usize,
+) -> Option<String> {
     let mut out = vec![
         "slop: facts about this codebase, from its call/effect graph.".to_string(),
     ];
@@ -142,6 +153,21 @@ pub fn render(policy: &Policy, built: Option<&BuiltGraph>, budget: usize) -> Opt
         out.push(String::new());
         out.push("Effects are routed through these channels; code elsewhere calls them rather than acquiring the effect directly:".to_string());
         out.extend(lines);
+    }
+
+    if !env.is_empty() {
+        out.push(String::new());
+        // Named, with the spread, so an agent needing a setting reaches for one
+        // that exists instead of inventing a parallel name for it.
+        let listed: Vec<String> = env
+            .iter()
+            .take(ENV_LIMIT)
+            .map(|(var, n)| if *n > 1 { format!("{var} ({n} modules)") } else { var.clone() })
+            .collect();
+        out.push(format!(
+            "Configuration this codebase reads from the environment: {}",
+            listed.join(", ")
+        ));
     }
 
     let layers = layer_lines(policy);
@@ -187,21 +213,30 @@ mod tests {
 
     #[test]
     fn renders_channels_and_layers_from_policy_alone() {
-        let out = render(&policy(), None, DEFAULT_BUDGET).unwrap();
+        let out = render(&policy(), None, &[], DEFAULT_BUDGET).unwrap();
         assert!(out.contains("net: core.http_client.HttpClient"));
         assert!(out.contains("pure-utils (utils.scoring) does not perform: net, fs"));
     }
 
     #[test]
     fn no_policy_and_no_graph_says_nothing() {
-        assert!(render(&Policy::default(), None, DEFAULT_BUDGET).is_none());
+        assert!(render(&Policy::default(), None, &[], DEFAULT_BUDGET).is_none());
     }
 
     #[test]
     fn budget_trims_capabilities_not_policy() {
         // A tiny budget must still deliver the channel facts, which are the
         // load-bearing part; capabilities are what gets dropped.
-        let out = render(&policy(), None, 1).unwrap();
+        let out = render(&policy(), None, &[], 1).unwrap();
         assert!(out.contains("core.http_client.HttpClient"));
     }
+    #[test]
+    fn the_env_surface_is_named_with_its_spread() {
+        let env = vec![("DATABASE_URL".to_string(), 4), ("TZ".to_string(), 1)];
+        let out = render(&policy(), None, &env, DEFAULT_BUDGET).unwrap();
+        assert!(out.contains("DATABASE_URL (4 modules)"), "{out}");
+        // A single-module read needs no count.
+        assert!(out.contains("TZ") && !out.contains("TZ (1"), "{out}");
+    }
+
 }

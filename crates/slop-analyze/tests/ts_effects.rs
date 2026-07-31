@@ -68,7 +68,7 @@ fn parser_based_detectors_fire_on_typescript() {
         "the .ts file should yield parsed function facts"
     );
 
-    let findings: Vec<Finding> = detect::run_all(&built, &Policy::default(), &facts);
+    let findings: Vec<Finding> = detect::run_all(&built, &Policy::default(), &facts, &root);
     let has = |rule: &str, needle: &str| {
         findings
             .iter()

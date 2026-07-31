@@ -423,7 +423,7 @@ fn main() -> Result<()> {
         Command::Fix { repo, index, write, remove_dead, inline_wrappers } => {
             let analysis = check::load_analysis(&repo, index.as_deref())?;
             let policy = Policy::load(&repo).unwrap_or_default();
-            let findings = detect::run_all(&analysis.built, &policy, &analysis.facts);
+            let findings = detect::run_all(&analysis.built, &policy, &analysis.facts, &repo);
 
             // Renames first: they only substitute name tokens (no line-count
             // change), so the over-commenting pass below still sees valid line
@@ -802,7 +802,7 @@ fn main() -> Result<()> {
             let policy = Policy::load(&repo)?;
             let analysis = check::load_analysis(&repo, index.as_deref())?;
             let (built, facts) = (&analysis.built, &analysis.facts);
-            let raw = detect::run_all(built, &policy, facts);
+            let raw = detect::run_all(built, &policy, facts, &repo);
             let suppressions = suppress::scan(&repo, facts);
             let findings = suppress::filter(raw, &suppressions);
             let baseline = Baseline::from_findings(&findings).with_effects(built);

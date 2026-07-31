@@ -1040,6 +1040,7 @@ pub fn run_all(
     built: &BuiltGraph,
     policy: &Policy,
     facts: &[crate::source::FileFacts],
+    repo: &std::path::Path,
 ) -> Vec<Finding> {
     let index = crate::source::location_index(built);
     let decorated: std::collections::HashSet<String> = facts
@@ -1069,6 +1070,7 @@ pub fn run_all(
     findings.extend(effect_layer_violation(built, policy));
     findings.extend(source_detectors(built, facts));
     findings.extend(parallel_implementation(built, facts));
+    findings.extend(crate::config::config_sprawl(repo, facts));
     findings.extend(crate::coverage::untested_effect(built, policy, &branching, &decorated));
     findings.extend(crate::naming::naming_convention(built));
     findings.sort_by(|a, b| {

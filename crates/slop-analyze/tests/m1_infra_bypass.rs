@@ -21,7 +21,7 @@ fn analyze(fixture: &str, with_policy: bool) -> (build::BuiltGraph, Vec<Finding>
     let mut built = build::build_graph(&resolver);
     effects::infer_effects(&mut built);
     let facts = slop_analyze::source::parse_repo(&root, &resolver.files());
-    let findings = detect::run_all(&built, &policy, &facts);
+    let findings = detect::run_all(&built, &policy, &facts, &root);
     (built, findings)
 }
 

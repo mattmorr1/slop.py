@@ -113,6 +113,7 @@ baselined repo doesn't look falsely pristine.
 | `dead-island` | Warning / Advisory | Functions nothing references and that aren't declared entry points (methods → Advisory: SCIP can miss dynamic dispatch) |
 | `naming-convention` | Advisory | Deviation from the codebase's dominant case style |
 | `slop-name` | Advisory | Throwaway markers that outlive their intent — `_v2`, `helper_`, `temp_` |
+| `config-sprawl` | Advisory | One environment variable read straight from the environment across four or more modules — a config surface with no single definition |
 | `over-commenting` | Advisory | Comments that merely restate the adjacent code |
 
 Sanctioned channels come from a `slop.toml` policy. `slop init .` proposes one

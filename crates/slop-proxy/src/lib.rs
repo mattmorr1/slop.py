@@ -66,9 +66,14 @@ pub fn serve(config: ProxyConfig) -> Result<()> {
 fn world_model(repo: &std::path::Path) -> Option<String> {
     let policy = slop_analyze::policy::Policy::load(repo).ok()?;
     let analysis = slop_analyze::check::load_analysis(repo, None).ok();
+    let env = analysis
+        .as_ref()
+        .map(|a| slop_analyze::config::env_vars(repo, &a.facts))
+        .unwrap_or_default();
     slop_analyze::world::render(
         &policy,
         analysis.as_ref().map(|a| &a.built),
+        &env,
         slop_analyze::world::DEFAULT_BUDGET,
     )
 }

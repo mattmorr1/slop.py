@@ -387,8 +387,12 @@ pub fn handle_session_start(input: &Value, event: &str) -> Value {
     let policy = Policy::load(&repo).unwrap_or_default();
     let analysis = crate::check::load_analysis(&repo, None).ok();
     let built = analysis.as_ref().map(|a| &a.built);
+    let env = analysis
+        .as_ref()
+        .map(|a| crate::config::env_vars(&repo, &a.facts))
+        .unwrap_or_default();
 
-    let Some(context) = world::render(&policy, built, world::DEFAULT_BUDGET) else {
+    let Some(context) = world::render(&policy, built, &env, world::DEFAULT_BUDGET) else {
         return json!({});
     };
     json!({

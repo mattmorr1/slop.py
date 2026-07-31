@@ -14,6 +14,7 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 
 mod js;
 pub mod names;
+pub mod resources;
 mod rust;
 mod ts_state;
 
