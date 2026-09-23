@@ -74,7 +74,7 @@ pub fn build_graph(resolver: &dyn Resolver) -> BuiltGraph {
                 id,
                 entity_type: node_type,
                 name: def
-                    .map(|d| d.display_name.clone())
+                    .map(|d| simple_name(&d.display_name))
                     .unwrap_or_else(|| occ.symbol.clone()),
                 signature: String::new(),
                 docstring: def.and_then(|d| d.documentation.first().cloned()),
@@ -209,4 +209,22 @@ pub fn build_graph(resolver: &dyn Resolver) -> BuiltGraph {
     }
 
     BuiltGraph { graph, by_symbol, referenced }
+}
+
+/// A declaration's own name from a SCIP display name: `HttpClient#get()` is
+/// `get`, `HttpClient#` is `HttpClient`. Skeletons render it as source.
+fn simple_name(display: &str) -> String {
+    let bare = display.trim_end_matches(['.', '#']);
+    let member = bare.rsplit('#').next().unwrap_or(bare);
+    member.split('(').next().unwrap_or(member).to_string()
+}
+
+#[cfg(test)]
+mod names {
+    #[test]
+    fn simple_names_drop_scip_decoration() {
+        for (display, expected) in [("HttpClient#", "HttpClient"), ("HttpClient#get()", "get"), ("parse_date()", "parse_date"), ("run(+1)", "run"), ("CONST", "CONST")] {
+            assert_eq!(super::simple_name(display), expected);
+        }
+    }
 }
