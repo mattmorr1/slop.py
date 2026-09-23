@@ -185,6 +185,27 @@ pub fn index_paths_for(
     paths
 }
 
+/// Directories (repo-relative, sorted) holding a `tsconfig.json`, outside vendor trees.
+fn tsconfig_projects(repo: &Path) -> Vec<String> {
+    fn walk(repo: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() && !entry.file_name().to_str().is_some_and(|name| SKIP_DIRS.contains(&name)) {
+                walk(repo, &path, out);
+            } else if kind.is_file() && entry.file_name() == "tsconfig.json" {
+                let relative = dir.strip_prefix(repo).unwrap_or(dir).to_string_lossy().replace('\\', "/");
+                out.push(if relative.is_empty() { ".".into() } else { relative });
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(repo, repo, &mut out);
+    out.sort();
+    out
+}
+
 /// Is there a top-level file with extension `ext` in `repo`? A cheap language
 /// signal for repos without config-file markers.
 fn has_top_level_ext(repo: &Path, ext: &str) -> bool {
@@ -483,6 +504,7 @@ fn run_indexer_over(
 }
 
 fn invoke(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> Result<()> {
+    let mut inferred_config = None;
     let npx = || {
         let mut cmd = Process::new("npx");
         cmd.arg("--yes");
@@ -500,12 +522,21 @@ fn invoke(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> Result<()
             )
         }
         Indexer::Typescript => {
-            // scip-typescript reads the project's tsconfig from its cwd and
-            // takes just an output path.
+            // A monorepo keeps its tsconfigs in subprojects, passed positionally;
+            // with none anywhere, scip-typescript infers one (removed after).
             let mut cmd = npx();
             cmd.args([SCIP_TYPESCRIPT_PACKAGE, "index", "--output"])
                 .arg(out)
                 .current_dir(repo);
+            if !repo.join("tsconfig.json").exists() {
+                let projects = tsconfig_projects(repo);
+                if projects.is_empty() {
+                    cmd.arg("--infer-tsconfig");
+                    inferred_config = Some(repo.join("tsconfig.json"));
+                } else {
+                    cmd.args(projects);
+                }
+            }
             ("scip-typescript", "is npx on PATH?", cmd)
         }
         Indexer::Python | Indexer::Auto => {
@@ -513,9 +544,11 @@ fn invoke(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> Result<()
             // argument, so without this it indexes wherever slop was invoked from.
             let mut cmd = npx();
             cmd.current_dir(repo);
+            // An explicit version: scip-python derives one from git and crashes without
+            // it (tarballs, copies); a constant also keeps symbols stable across commits.
             cmd.args([SCIP_PYTHON_PACKAGE, "index"])
                 .arg(repo)
-                .args(["--project-name", project, "--output"])
+                .args(["--project-name", project, "--project-version", "0", "--output"])
                 .arg(out);
             ("scip-python", "is npx on PATH?", cmd)
         }
@@ -524,7 +557,12 @@ fn invoke(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> Result<()
     let status = cmd
         .stdout(std::io::stderr())
         .status()
-        .with_context(|| format!("running {tool} ({install_hint})"))?;
+        .with_context(|| format!("running {tool} ({install_hint})"));
+    if let Some(config) = inferred_config {
+        std::fs::remove_file(&config)
+            .with_context(|| format!("removing the tsconfig {tool} inferred at {}", config.display()))?;
+    }
+    let status = status?;
     if !status.success() {
         bail!("{tool} exited with {status}");
     }
@@ -624,6 +662,17 @@ mod tests {
         std::fs::write(&index, b"").unwrap();
         assert!(validate(&index, 3).is_err());
         assert!(validate(&index, 0).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tsconfig_projects_are_found_outside_vendor_trees() {
+        let dir = temp_repo("tsconfigs");
+        for project in ["clients/web", "services/agent", "node_modules/lib"] {
+            std::fs::create_dir_all(dir.join(project)).unwrap();
+            std::fs::write(dir.join(project).join("tsconfig.json"), "{}").unwrap();
+        }
+        assert_eq!(tsconfig_projects(&dir), ["clients/web", "services/agent"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
