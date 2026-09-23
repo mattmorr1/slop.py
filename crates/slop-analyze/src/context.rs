@@ -3,16 +3,17 @@
 use serde::Serialize;
 
 use crate::compress::{self, CompressConfig, CompressStats};
-use crate::envelope::{self, EnvelopeConfig, EnvelopeItem};
+use crate::envelope::{self, EnvelopeConfig, EnvelopeItem, Selection};
 use crate::snapshot::{DocumentState, RepositorySnapshot, SnapshotFreshness, SnapshotId};
 
-pub const CONTEXT_SCHEMA_VERSION: u32 = 2;
+pub const CONTEXT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct ContextRequest<'a> {
     pub target_entity: &'a str,
     pub token_budget: usize,
     pub edit_zone_hops: usize,
+    pub selection: Selection,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,7 +52,39 @@ pub enum ReadContext {
     },
 }
 
+/// One entity's verbatim source: the inverse of a skeleton in a context artifact.
+#[derive(Debug, Clone, Serialize)]
+pub struct Expansion {
+    pub schema_version: u32,
+    pub snapshot: SnapshotId,
+    pub entity: String,
+    pub file: String,
+    /// 0-based inclusive line range in `file`.
+    pub lines: (usize, usize),
+    /// Anything but `resolved` means the range came from an index built from other content.
+    pub state: DocumentState,
+    pub text: String,
+}
+
 impl RepositorySnapshot {
+    /// Expand one entity from the same snapshot its skeleton came from, so an agent
+    /// can reverse compression per item without mixing source generations.
+    pub fn expand(&self, entity_id: &str) -> Option<Expansion> {
+        let entity = self.built.graph.entity(self.built.graph.node(entity_id)?);
+        let source = self.sources.get(&entity.file)?;
+        let (start, end) = entity.source_range;
+        let text: Vec<&str> = source.lines().skip(start).take(end.checked_sub(start)? + 1).collect();
+        (!text.is_empty()).then(|| Expansion {
+            schema_version: CONTEXT_SCHEMA_VERSION,
+            snapshot: self.id().clone(),
+            entity: entity.id.clone(),
+            file: entity.file.clone(),
+            lines: (start, end),
+            state: self.document_state(&entity.file),
+            text: text.join("\n"),
+        })
+    }
+
     pub fn context(&self, request: ContextRequest<'_>) -> ContextArtifact {
         let file = self
             .built
@@ -81,6 +114,7 @@ impl RepositorySnapshot {
                 &EnvelopeConfig {
                     token_budget: request.token_budget,
                     edit_zone_hops: request.edit_zone_hops,
+                    selection: request.selection,
                 },
                 |file| self.document_state(file) == DocumentState::Resolved,
             )
@@ -98,7 +132,7 @@ impl RepositorySnapshot {
         };
         let estimated_tokens = items
             .iter()
-            .map(|item| item.text.len() / 4 + 1)
+            .map(|item| (item.text.len() + item.equivalents.iter().map(String::len).sum::<usize>()) / 4 + 1)
             .sum::<usize>()
             + fallback
                 .as_ref()
@@ -201,6 +235,7 @@ mod tests {
                 target_entity: "core.http_client::HttpClient::get",
                 token_budget: 8000,
                 edit_zone_hops: 1,
+                selection: Selection::Coverage,
             }))
             .expect("serialize")
         };
@@ -224,6 +259,7 @@ mod tests {
             target_entity: "missing::entity",
             token_budget: 8000,
             edit_zone_hops: 1,
+            selection: Selection::Coverage,
         });
         assert_eq!(
             artifact.fallback.expect("fallback").reason,
@@ -249,6 +285,7 @@ mod tests {
                 target_entity: "slop::main",
                 token_budget: 8000,
                 edit_zone_hops: 1,
+                selection: Selection::Coverage,
             });
             assert!(artifact.fallback.is_none());
             samples.push(start.elapsed());

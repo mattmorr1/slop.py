@@ -99,6 +99,18 @@ pub fn definitions() -> Value {
             }
         },
         {
+            "name": "expand_entity",
+            "description": "Full verbatim source of one entity from the same repository snapshot a context envelope came from: the inverse of a skeleton. Use it when a skeletonized item turns out to matter. `state` other than `resolved` means its line range came from an index built from different content.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repo root (defaults to the server's launch repo)"},
+                    "entity": {"type": "string", "description": "Entity id from an envelope item"}
+                },
+                "required": ["entity"]
+            }
+        },
+        {
             "name": "query_subgraph",
             "description": "Explore the effect graph around an entity: its callers/callees/imports out to a depth, each neighbor's relation and distance, plus the target's inferred effect signature. Use this to learn how a codebase routes an effect (e.g. what owns Net) before writing code.",
             "inputSchema": {
@@ -128,6 +140,7 @@ pub fn call(ctx: &ToolCtx, name: &str, args: &Value) -> Result<String> {
         "assess_write" => assess_write(ctx, args),
         "get_context_envelope" => get_context_envelope(ctx, args),
         "query_subgraph" => query_subgraph(ctx, args),
+        "expand_entity" => expand_entity(ctx, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -229,6 +242,7 @@ fn get_context_envelope(ctx: &ToolCtx, args: &Value) -> Result<String> {
         target_entity: target,
         token_budget: args.get("token_budget").and_then(Value::as_u64).unwrap_or(8000) as usize,
         edit_zone_hops: args.get("edit_zone_hops").and_then(Value::as_u64).unwrap_or(1) as usize,
+        selection: Default::default(),
     });
     Ok(serde_json::to_string_pretty(&artifact)?)
 }
@@ -264,6 +278,23 @@ fn query_subgraph(ctx: &ToolCtx, args: &Value) -> Result<String> {
         None => Ok(serde_json::to_string_pretty(&json!({
             "entity": entity,
             "note": "entity not found in the graph",
+        }))?),
+    }
+}
+
+fn expand_entity(ctx: &ToolCtx, args: &Value) -> Result<String> {
+    let repo = ctx.repo(args);
+    let entity = args
+        .get("entity")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("entity is required"))?;
+    let analysis = check::load_analysis(&repo, ctx.index(args).as_deref())?;
+    match analysis.expand(entity) {
+        Some(expansion) => Ok(serde_json::to_string_pretty(&expansion)?),
+        None => Ok(serde_json::to_string_pretty(&json!({
+            "entity": entity,
+            "snapshot": analysis.id(),
+            "note": "entity not found in this snapshot",
         }))?),
     }
 }

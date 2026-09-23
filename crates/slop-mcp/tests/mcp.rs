@@ -136,6 +136,7 @@ fn tools_list_returns_every_tool() {
             "validate_change",
             "assess_write",
             "get_context_envelope",
+            "expand_entity",
             "query_subgraph"
         ]
     );
@@ -226,6 +227,47 @@ fn get_context_envelope_runs_for_a_known_target() {
     assert!(env.get("items").is_some());
     assert_eq!(env["snapshot"].as_str().unwrap().len(), 64);
     assert_eq!(env["freshness"]["state"], "current");
+}
+
+#[test]
+fn every_skeleton_expands_from_the_same_snapshot() {
+    let out = exchange(
+        fixture("toy_repo_slopped"),
+        &[serde_json::json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": { "name": "get_context_envelope",
+                        "arguments": { "target_entity": "services.routing::route_event", "edit_zone_hops": 0 } }
+        })],
+    );
+    let env = tool_json(&out[0]);
+    let skeletons: Vec<&serde_json::Value> = env["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["fidelity"] == "skeleton")
+        .collect();
+    assert!(!skeletons.is_empty(), "expected skeletons: {env}");
+    for item in skeletons {
+        let out = exchange(
+            fixture("toy_repo_slopped"),
+            &[serde_json::json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": { "name": "expand_entity", "arguments": { "entity": item["entity"] } }
+            })],
+        );
+        let expansion = tool_json(&out[0]);
+        assert_eq!(expansion["snapshot"], env["snapshot"]);
+        assert_eq!(expansion["state"], "resolved");
+        // A tiny body can be shorter than its skeleton (effect comment + stub), so
+        // the property is that the expansion carries the header the skeleton showed.
+        let header = item["text"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .find(|line| line.trim_start().starts_with("def ") || line.trim_start().starts_with("class "))
+            .expect("skeleton has a header");
+        assert!(expansion["text"].as_str().unwrap().contains(header.trim()), "{header:?} not in {expansion}");
+    }
 }
 
 #[test]

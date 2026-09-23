@@ -47,6 +47,11 @@ pub struct EnvelopeItem {
     pub fidelity: Fidelity,
     pub score: u32,
     pub reasons: ScoreReasons,
+    /// What this item added to the envelope's coverage when it was chosen.
+    pub marginal_gain: u64,
+    /// Provably equivalent candidates left out because this one covers them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub equivalents: Vec<String>,
     pub text: String,
 }
 
@@ -64,11 +69,23 @@ impl ScoreReasons {
     }
 }
 
+/// How the envelope spends its budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Selection {
+    /// Budgeted weighted coverage: a candidate pays only for what nothing chosen
+    /// already covers, so equivalent copies and redundant siblings stop costing.
+    #[default]
+    Coverage,
+    /// Pack by independent score; the pre-coverage behaviour, kept as the ablation.
+    Ranked,
+}
+
 pub struct EnvelopeConfig {
     /// Rough token budget (chars / 4) for everything except the target.
     pub token_budget: usize,
     /// BFS hops from the target that still get full-fidelity source.
     pub edit_zone_hops: usize,
+    pub selection: Selection,
 }
 
 impl Default for EnvelopeConfig {
@@ -76,8 +93,130 @@ impl Default for EnvelopeConfig {
         Self {
             token_budget: 8000,
             edit_zone_hops: 1,
+            selection: Selection::Coverage,
         }
     }
+}
+
+/// Weights of the non-class information units a candidate can cover.
+const CALLEE_UNIT_WEIGHT: u64 = 300;
+const EFFECT_UNIT_WEIGHT: u64 = 200;
+
+/// One thing an agent learns from seeing an entity. A function's E-class is one
+/// unit, so a second provably equivalent function teaches nothing new.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Unit {
+    Class(String),
+    Entity(NodeIndex),
+    Callee(NodeIndex),
+    Effect(String),
+}
+
+struct Candidate {
+    idx: NodeIndex,
+    score: u32,
+    reasons: ScoreReasons,
+    fidelity: Fidelity,
+    text: String,
+    /// The skeleton to fall back to when a full rendering no longer fits.
+    fallback: Option<String>,
+    class: Option<String>,
+    units: Vec<(Unit, u64)>,
+}
+
+impl Candidate {
+    fn gain(&self, covered: &HashSet<&Unit>) -> u64 {
+        self.units.iter().filter(|(unit, _)| !covered.contains(unit)).map(|(_, weight)| weight).sum()
+    }
+
+    fn cost(&self) -> usize {
+        estimate_tokens(&self.text)
+    }
+}
+
+/// `gain / cost` compared exactly in integers, so selection is reproducible.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Ratio {
+    gain: u64,
+    cost: u64,
+}
+
+impl Ord for Ratio {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (u128::from(self.gain) * u128::from(other.cost))
+            .cmp(&(u128::from(other.gain) * u128::from(self.cost)))
+            .then(self.gain.cmp(&other.gain))
+    }
+}
+
+impl PartialOrd for Ratio {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Cost-benefit greedy with lazy re-evaluation (CELF): coverage is submodular, so
+/// a stale bound only overstates a gain and re-checking the top of the heap is
+/// enough. Against the best single fitting candidate, this keeps the classic
+/// ½(1 − 1/e) guarantee for budgeted coverage. Returns (candidate, text, gain).
+fn select_coverage(candidates: &[Candidate], budget: usize) -> Vec<(usize, bool, u64)> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let empty = HashSet::new();
+    let mut heap: BinaryHeap<(Ratio, Reverse<usize>)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (Ratio { gain: c.gain(&empty), cost: c.cost() as u64 }, Reverse(i)))
+        .collect();
+    let (mut covered, mut remaining, mut picked, mut total) = (HashSet::new(), budget, Vec::new(), 0u64);
+    while let Some((bound, Reverse(i))) = heap.pop() {
+        let candidate = &candidates[i];
+        let gain = candidate.gain(&covered);
+        if gain == 0 {
+            continue;
+        }
+        if gain != bound.gain {
+            heap.push((Ratio { gain, cost: bound.cost }, Reverse(i)));
+            continue;
+        }
+        let fallback = candidate.fallback.as_ref().map(|text| estimate_tokens(text));
+        let use_fallback = match (candidate.cost() <= remaining, fallback) {
+            (true, _) => false,
+            (false, Some(cost)) if cost <= remaining => true,
+            _ => continue,
+        };
+        remaining -= if use_fallback { fallback.unwrap_or_default() } else { candidate.cost() };
+        covered.extend(candidate.units.iter().map(|(unit, _)| unit));
+        picked.push((i, use_fallback, gain));
+        total += gain;
+    }
+    let best = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.cost() <= budget)
+        .map(|(i, c)| (c.gain(&empty), Reverse(i)))
+        .max();
+    match best {
+        Some((gain, Reverse(i))) if gain > total => vec![(i, false, gain)],
+        _ => picked,
+    }
+}
+
+/// Pack by independent score in rank order: the ablation baseline.
+fn select_ranked(candidates: &[Candidate], budget: usize) -> Vec<(usize, bool, u64)> {
+    let mut remaining = budget;
+    let mut picked = Vec::new();
+    for (i, candidate) in candidates.iter().enumerate() {
+        let fallback = candidate.fallback.as_ref().map(|text| estimate_tokens(text));
+        let use_fallback = match (candidate.cost() <= remaining, fallback) {
+            (true, _) => false,
+            (false, Some(cost)) if cost <= remaining => true,
+            _ => continue,
+        };
+        remaining -= if use_fallback { fallback.unwrap_or_default() } else { candidate.cost() };
+        picked.push((i, use_fallback, u64::from(candidate.score)));
+    }
+    picked
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -233,10 +372,15 @@ where
 
     let by_location = location_index(built);
     let mut signatures: HashMap<String, String> = HashMap::new();
+    let mut classes: HashMap<String, String> = HashMap::new();
     for file_facts in facts {
         for fact in &file_facts.functions {
             if let Some(e) = entity_for(built, &by_location, &file_facts.file, fact) {
                 signatures.insert(e.id.clone(), fact.signature.clone());
+                let class = [&fact.equiv_hash, &fact.body_hash].into_iter().find(|hash| !hash.is_empty());
+                if let Some(class) = class {
+                    classes.insert(e.id.clone(), class.clone());
+                }
             }
         }
     }
@@ -276,7 +420,6 @@ where
     });
 
     let mut items = Vec::new();
-    let mut budget = config.token_budget;
 
     // The target is always included, full fidelity, outside the budget —
     // an envelope that can't afford to show you the thing you're editing
@@ -288,47 +431,68 @@ where
             fidelity: Fidelity::Full,
             score: u32::MAX,
             reasons: ScoreReasons::default(),
+            marginal_gain: 0,
+            equivalents: Vec::new(),
             text,
         });
     }
 
-    for (idx, score, distance, reasons) in scored {
-        let entity = built.graph.entity(idx);
-        let in_zone = distance <= config.edit_zone_hops;
-        if in_zone {
-            if let Some(text) = render(entity) {
-                let cost = estimate_tokens(&text);
-                if cost <= budget {
-                    budget -= cost;
-                    items.push(EnvelopeItem {
-                        entity: entity.id.clone(),
-                        file: entity.file.clone(),
-                        fidelity: Fidelity::Full,
-                        score,
-                        reasons,
-                        text,
-                    });
-                    continue;
-                }
-            }
-        }
-        let sig = signatures.get(&entity.id).map(String::as_str);
-        let text = skeleton_for(entity, sig);
-        if text.is_empty() {
-            continue;
-        }
-        let cost = estimate_tokens(&text);
-        if cost <= budget {
-            budget -= cost;
-            items.push(EnvelopeItem {
-                entity: entity.id.clone(),
-                file: entity.file.clone(),
-                fidelity: Fidelity::Skeleton,
-                score,
-                reasons,
-                text,
-            });
-        }
+    let candidates: Vec<Candidate> = scored
+        .into_iter()
+        .filter_map(|(idx, score, distance, reasons)| {
+            let entity = built.graph.entity(idx);
+            let skeleton = skeleton_for(entity, signatures.get(&entity.id).map(String::as_str));
+            let full = (distance <= config.edit_zone_hops).then(|| render(entity)).flatten();
+            let (fidelity, text, fallback) = match full {
+                Some(text) => (Fidelity::Full, text, (!skeleton.is_empty()).then_some(skeleton)),
+                None if skeleton.is_empty() => return None,
+                None => (Fidelity::Skeleton, skeleton, None),
+            };
+            let class = classes.get(&entity.id).cloned();
+            let own = class.clone().map_or(Unit::Entity(idx), Unit::Class);
+            let units = std::iter::once((own, u64::from(score)))
+                .chain(
+                    built.graph.graph.edges_directed(idx, Direction::Outgoing)
+                        .filter(|edge| *edge.weight() == EdgeKind::Calls)
+                        .map(|edge| (Unit::Callee(edge.target()), CALLEE_UNIT_WEIGHT)),
+                )
+                .chain(entity.effect_signature.0.iter().map(|effect| (Unit::Effect(format!("{effect:?}")), EFFECT_UNIT_WEIGHT)))
+                .collect();
+            Some(Candidate { idx, score, reasons, fidelity, text, fallback, class, units })
+        })
+        .collect();
+    let picked = match config.selection {
+        Selection::Coverage => select_coverage(&candidates, config.token_budget),
+        Selection::Ranked => select_ranked(&candidates, config.token_budget),
+    };
+    let chosen: HashSet<usize> = picked.iter().map(|(i, _, _)| *i).collect();
+    for (i, use_fallback, gain) in picked {
+        let candidate = &candidates[i];
+        let entity = built.graph.entity(candidate.idx);
+        let equivalents = candidate.class.as_ref().map_or_else(Vec::new, |class| {
+            let mut peers: Vec<String> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(j, other)| !chosen.contains(j) && other.class.as_ref() == Some(class))
+                .map(|(_, other)| built.graph.entity(other.idx).id.clone())
+                .collect();
+            peers.sort();
+            peers
+        });
+        let (fidelity, text) = match (use_fallback, &candidate.fallback) {
+            (true, Some(skeleton)) => (Fidelity::Skeleton, skeleton.clone()),
+            _ => (candidate.fidelity, candidate.text.clone()),
+        };
+        items.push(EnvelopeItem {
+            entity: entity.id.clone(),
+            file: entity.file.clone(),
+            fidelity,
+            score: candidate.score,
+            reasons: candidate.reasons,
+            marginal_gain: gain,
+            equivalents,
+            text,
+        });
     }
 
     items
@@ -399,10 +563,7 @@ mod tests {
     #[test]
     fn tiny_budget_still_keeps_the_target() {
         let (built, facts, root) = fixture("toy_repo");
-        let cfg = EnvelopeConfig {
-            token_budget: 0,
-            edit_zone_hops: 1,
-        };
+        let cfg = EnvelopeConfig { token_budget: 0, ..EnvelopeConfig::default() };
         let items = build_envelope(&built, &facts, &root, "services.weather::fetch_forecast", &cfg);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].entity, "services.weather::fetch_forecast");
@@ -423,5 +584,45 @@ mod tests {
             assert_eq!(far.fidelity, Fidelity::Skeleton);
             assert!(far.text.contains("..."));
         }
+    }
+}
+
+#[cfg(test)]
+mod selection {
+    use super::*;
+
+    fn candidate(i: usize, class: &str, callee: usize, text_len: usize) -> Candidate {
+        Candidate {
+            idx: NodeIndex::new(i),
+            score: 1000,
+            reasons: ScoreReasons::default(),
+            fidelity: Fidelity::Skeleton,
+            text: "x".repeat(text_len),
+            fallback: None,
+            class: Some(class.into()),
+            units: vec![(Unit::Class(class.into()), 1000), (Unit::Callee(NodeIndex::new(100 + callee)), CALLEE_UNIT_WEIGHT)],
+        }
+    }
+
+    /// A provably equivalent copy covers nothing new, so coverage never pays for it
+    /// twice, while score-ranked packing spends budget on every copy.
+    #[test]
+    fn coverage_skips_equivalent_copies_ranked_does_not() {
+        let candidates = vec![candidate(0, "E", 0, 40), candidate(1, "E", 0, 40), candidate(2, "F", 1, 40)];
+        let coverage: Vec<usize> = select_coverage(&candidates, 1_000).into_iter().map(|(i, _, _)| i).collect();
+        let ranked: Vec<usize> = select_ranked(&candidates, 1_000).into_iter().map(|(i, _, _)| i).collect();
+        assert_eq!(coverage, [0, 2]);
+        assert_eq!(ranked, [0, 1, 2]);
+    }
+
+    /// A full rendering that no longer fits falls back to its skeleton.
+    #[test]
+    fn coverage_falls_back_to_the_skeleton_when_full_does_not_fit() {
+        let mut full = candidate(0, "E", 0, 4_000);
+        full.fidelity = Fidelity::Full;
+        full.fallback = Some("s".repeat(40));
+        let picked = select_coverage(&[full], 100);
+        assert_eq!(picked.len(), 1);
+        assert!(picked[0].1, "the skeleton was used");
     }
 }
