@@ -57,32 +57,20 @@ process rules, §6 roadmap, §7 desired outcomes. Domain terms are defined in
 Every commit was checked to build and pass `clippy -D warnings` on its own
 (bcf7691 inherits two pre-existing lints from `e86ae58`, fixed in 8cd40b4).
 
-### Uncommitted work in progress (finish first)
+### Calibrated relevance port (R1, done: 7dc5255, evidence in ADR 0005)
 
-The Rust port of calibrated relevance:
-
-- `crates/slop-analyze/src/relevance.rs` (new): `RelevanceModel` (logistic,
-  12 features, optional per-repo override `.slop/relevance.json`), `Lexical`
-  (BM25 index per snapshot, integer length total for determinism), tokenizer
-  matching the benchmark's.
-- `envelope.rs`: candidate pool = graph ≤ 4 hops ∪ target's directory;
-  per-candidate calibrated probability (ppm); coverage = ratio greedy by
-  probability per token with E-class dedup; ranked = by probability; reasons
-  are per-feature log-odds contributions. Old additive scorer, exemplar bonus
-  and callee/effect units removed.
-- `snapshot.rs`: holds the model; the model file enters the cache key and the
-  snapshot id; lazy `lexical()`.
-- `context.rs`: schema 4.
-- `bench/context_bench.py`: `SLOP_BIN`, out-of-sample Rust arms (writes each
-  fold's model to the scratch snapshot, re-runs slop, deletes it), `--fit-all`.
-- **`DEFAULT_WEIGHTS` in `relevance.rs` are provisional** (mean of a trial
-  run's folds, marked `DEFAULT_SOURCE = "provisional"`). They must be replaced
-  by the pooled fit before commit — see roadmap R1.
-- `bench/results/context.jsonl` holds the canonical *before* run (binary pinned
-  at d54cc1f; its manifest reads `dirty` because the port above was in the
-  working tree when it was recorded, not in the binary it measured).
-
-298 tests pass and clippy is clean with the provisional weights.
+- `relevance.rs`: logistic `RelevanceModel` (12 features, default = pooled B4
+  fit, per-repo override `.slop/relevance.json`), `Lexical` BM25 per snapshot.
+- `envelope.rs`: pool = graph <= 4 hops plus the target's directory; packing by
+  probability per token with E-class dedup; reasons are logit contributions.
+  `same_container` uses the benchmark's id-prefix definition (train/serve
+  skew found and fixed; golden test pins one probability).
+- B4 after-run (7dc5255, clean, same task digest as d54cc1f): shipped selector
+  out of sample 66.2% at 4k vs BM25 59.3%, proximity 57.0%, old 51.4%. Rust
+  equals the Python model on 21,396 probabilities; the 2.4-point gap to the
+  Python arm is full-fidelity edit-zone neighbours. Level with BM25 on httpx
+  and requests. vigil warm context p95 132 ms (target 50 ms), see R10.
+- 299 tests pass, clippy clean.
 
 ### Scratch environment (session scratchpad, not the repo)
 
@@ -245,14 +233,7 @@ the same snapshot, making skeletons reversible; context items list E-equivalent
 Ordered; each item has an exit gate. Do not start an item before the previous
 gate unless it is independent.
 
-**R1 — Finish the calibrated context port (in progress).**
-Run `context_bench.py` with `--fit-all` against the four repos; replace
-`DEFAULT_WEIGHTS`/`DEFAULT_SOURCE` with the pooled fit and its provenance;
-re-run once so the ledger's default arms use the shipped weights; confirm Rust
-out-of-sample arms (`slop-calibrated-*`) match the Python calibrated arms
-within CI (parity). Write ADR 0005 (calibrated relevance replaces the additive
-scorer; per-repo override; determinism argument). Update `bench/README.md`.
-*Gate:* clean ledger entries for before/after; parity shown; 0 test failures.
+**R1 — Calibrated context port. Done (7dc5255, ADR 0005, B4 after-run).**
 
 **R2 — Real competitor arm.** Add Aider's RepoMap (pinned version) to B4,
 same budgets and cost model. *Gate:* result recorded whatever it shows.
@@ -281,6 +262,12 @@ helper history says it should? Pre-register hypotheses first.
 
 **R9 — Daily-driver polish.** LSP unsaved-buffer overlays; Codex hook parity;
 `slop doctor` checks for npx/rust-analyzer and indexer failure memos.
+
+**R10 — Envelope latency on large repos.** vigil p95 132 ms: every call
+rebuilds signature/class maps over all facts and scans every entity for the
+target's directory. Build both once per snapshot (like `lexical()`), index
+entities by directory. *Gate:* vigil warm context p95 < 50 ms, output
+byte-identical.
 
 **Deferred (unchanged gates in `DEFERRED_RESEARCH.md`):** e-graph code
 optimisation, daemon, constrained decoding, RL/RLAIF, cross-process cache.

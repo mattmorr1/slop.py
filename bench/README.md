@@ -51,6 +51,59 @@ Residual misses: integer literals inside f-strings (opaque), and a few 3-way
 combinations. Caveats: mutants are synthetic rewrites of real code, not
 naturally occurring duplicates; the corpus is three AI-assisted repos.
 
+## `context_bench.py` — B4, context selection against co-change history
+
+Does the envelope show an agent what it needs? Ground truth comes from history:
+a commit that changed 2–20 non-test functions says each needed the others in
+view. For each (commit, target) the selector gets a token budget and is scored
+on recall of the co-changed functions it included, costed as skeletons. Tasks
+are sampled by commit (seed 20260923); confidence intervals are a
+commit-cluster bootstrap. The logistic model is fit leave-one-repo-out, so
+every calibrated arm is out of sample. **No-edge recall** counts only gold
+functions with no graph edge to the target, which a graph-only selector cannot
+reach by construction and a leaky one would inflate. Snapshots must be scratch
+copies: the Rust arms write and remove `.slop/relevance.json` per fold.
+
+```
+cargo build --release -p slop-cli
+SLOP_BIN=target/release/slop python3 bench/context_bench.py \
+  --repo vigil=<history>:<indexed copy> --repo flask=<clone>:<clone> ... [--fit-all model.json]
+```
+
+### Result (commit 7dc5255, 1,326 tasks over vigil, requests, flask, httpx, 2026-09-23)
+
+Pooled recall (95% CI):
+
+| arm | @1k | @2k | @4k | @8k | @16k |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| additive scorer (d54cc1f, before) | | | 51.4% | | |
+| **shipped, out of sample** (`slop-calibrated-coverage`) | 45.9% [42–50] | 56.6% [52–61] | **66.2%** [62–70] | 77.0% [73–81] | 89.2% [86–92] |
+| Python reference (`calibrated-ratio`) | 50.1% [46–55] | 60.0% [56–64] | 68.6% [65–72] | 78.3% [75–82] | 89.6% [87–92] |
+| BM25 | 41.9% [38–46] | 50.2% [46–54] | 59.3% [55–63] | 69.6% [66–74] | 81.3% [78–85] |
+| file proximity | 40.3% [36–45] | 47.7% [44–52] | 57.0% [53–61] | 72.2% [68–76] | 83.3% [80–87] |
+| random | 0.7% | 2.8% | 6.3% | 12.7% | 25.3% |
+
+At 4k per repository (shipped / BM25 / proximity): vigil 74.1 / 37.3 / 69.5,
+requests 70.0 / 71.9 / 60.1, flask 73.3 / 65.9 / 63.0, httpx 57.7 / 59.6 / 47.9.
+Warm context latency p50 1–3 ms, p95 ≤ 5.4 ms on the OSS repos; vigil (14,786
+entities) p50 39 ms, p95 132 ms, over the 50 ms target: per-call map rebuilds.
+
+What it says:
+
+- **Calibration is the win, not the greedy**: the same packing with the old
+  additive scores got 51.4%; fitted probabilities get 66.2% out of sample.
+- **Locality beats edges**: same file and same directory carry the largest
+  weights in every fold, so the candidate pool includes the directory.
+- **Rust matches the reference model exactly** (21,396 probabilities, ppm); the
+  2.4-point gap is full-fidelity edit-zone neighbours, which recall cannot
+  reward (ADR 0005).
+- **Not a sweep**: level with BM25 on httpx and requests; the pooled lead comes
+  from vigil and flask. The `slop-coverage` arm (70.7%) uses the pooled default
+  and is in-sample, so it is not the headline.
+
+Caveats: co-change is a proxy for need; four Python repositories; no
+competitor harness arm yet (Aider's repo map is next).
+
 ## `compression_bench.py` — token-efficiency A/B
 
 Quantifies the deterministic half of the harness thesis (D11): zoned
