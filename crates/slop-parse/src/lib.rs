@@ -20,6 +20,9 @@ mod js;
 pub mod names;
 pub mod resources;
 mod rust;
+#[cfg(feature = "egraph")]
+pub mod egraph;
+pub mod equiv;
 mod scope;
 mod ts_state;
 
@@ -895,5 +898,28 @@ mod alpha_soundness {
             "def f({a}, timeout=30):\n    {b}, rest = split({a})\n    try:\n        out = [x * 2 for x in rest]\n    except ValueError as {e}:\n        log({e})\n        out = []\n    return get({b}, timeout=timeout) + out\n"
         ));
         assert_eq!(f("path", "head", "err"), f("url", "first", "exc"));
+    }
+}
+
+#[cfg(test)]
+mod alpha_comprehensions {
+    fn alpha(src: &str) -> String {
+        crate::analyze_file(src).unwrap()[0].alpha_hash.clone()
+    }
+
+    /// A comprehension-only name refers to its inner binding everywhere: renaming is α.
+    #[test]
+    fn comprehension_only_names_rename_consistently() {
+        let f = |v: &str| alpha(&format!("def f(events, first):\n    ids = {{{v}['id'] for {v} in events if {v}}}\n    assert first['id'] in ids\n    return sorted(ids)[0]\n"));
+        assert_eq!(f("e"), f("event"));
+    }
+
+    /// The first iterable runs in the enclosing scope: there `e` is a global.
+    #[test]
+    fn a_first_iterable_reads_the_enclosing_scope() {
+        let f = |global: &str| alpha(&format!("def f(xs):\n    total = [e * 2 for e in {global}]\n    for item in xs:\n        total.append(item)\n    return total\n"));
+        let shadowing = |global: &str| alpha(&format!("def f(xs):\n    total = [{global} * 2 for {global} in {global}]\n    for item in xs:\n        total.append(item)\n    return total\n"));
+        assert_ne!(f("left"), f("right"));
+        assert_ne!(shadowing("left"), shadowing("right"));
     }
 }

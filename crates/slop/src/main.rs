@@ -360,6 +360,15 @@ enum Command {
     /// selected by `slop setup`.
     #[command(hide = true)]
     Open { target: String },
+    /// Research adapter for the equivalence benchmark: each JSONL line
+    /// `{"a": src, "b": src}` (one Python function each) yields every tier's verdict.
+    #[command(hide = true)]
+    Equiv {
+        pairs: PathBuf,
+        /// egglog saturation rounds (requires the `egraph` feature).
+        #[arg(long, default_value_t = 12)]
+        iterations: usize,
+    },
     /// Wire slop's harness into a repo's agent-host config: merge the MCP
     /// server into `<repo>/.mcp.json` and the read/prompt hooks into
     /// `<repo>/.claude/settings.json`, pointing at this binary. Idempotent —
@@ -904,6 +913,7 @@ fn main() -> Result<()> {
         Command::Open { target } => {
             setup::open_target(&target)?;
         }
+        Command::Equiv { pairs, iterations } => run_equiv(&pairs, iterations)?,
         Command::Install { repo, force } => {
             install_harness(&repo, force)?;
         }
@@ -1403,4 +1413,72 @@ fn remove_worktree(repo: &Path, dir: &Path) {
     if !ok {
         eprintln!("warning: could not remove worktree {}", dir.display());
     }
+}
+
+/// One side's verdict inputs: the three token hashes plus the E-equivalence term.
+struct EquivSide {
+    exact: String,
+    structural: String,
+    alpha: String,
+    sound: String,
+    graded: String,
+    #[cfg_attr(not(feature = "egraph"), allow(dead_code))]
+    term: slop_parse::equiv::Term,
+}
+
+fn equiv_side(source: &str) -> Result<EquivSide> {
+    let facts = slop_parse::Language::Python.parse(source)?;
+    let first = facts.first().context("no function in source")?;
+    let equiv = slop_parse::equiv::equivalence_facts(source)?
+        .into_iter()
+        .next()
+        .context("no function in source")?;
+    Ok(EquivSide {
+        exact: first.body_hash.clone(),
+        structural: first.structural_hash.clone(),
+        alpha: first.alpha_hash.clone(),
+        sound: equiv.sound,
+        graded: equiv.graded,
+        term: equiv.term,
+    })
+}
+
+fn run_equiv(pairs: &Path, iterations: usize) -> Result<()> {
+    let text = std::fs::read_to_string(pairs).with_context(|| format!("reading {}", pairs.display()))?;
+    for (index, line) in text.lines().enumerate().filter(|(_, line)| !line.trim().is_empty()) {
+        let pair: serde_json::Value = serde_json::from_str(line).with_context(|| format!("pair {index}"))?;
+        let side = |key: &str| pair[key].as_str().context("pair needs string fields a and b").and_then(equiv_side);
+        let start = std::time::Instant::now();
+        let (a, b) = match side("a").and_then(|a| Ok((a, side("b")?))) {
+            Ok(sides) => sides,
+            Err(error) => {
+                println!("{}", serde_json::json!({ "index": index, "error": format!("{error:#}") }));
+                continue;
+            }
+        };
+        let normalize_us = start.elapsed().as_micros() as u64 / 2;
+        // An empty token hash means the body is below the significance floor: abstain.
+        let same = |x: &str, y: &str| (!x.is_empty() && !y.is_empty()).then_some(x == y);
+        #[cfg_attr(not(feature = "egraph"), allow(unused_mut))]
+        let mut verdict = serde_json::json!({
+            "index": index,
+            "exact": same(&a.exact, &b.exact),
+            "structural": same(&a.structural, &b.structural),
+            "alpha": same(&a.alpha, &b.alpha),
+            "sound": a.sound == b.sound,
+            "graded": a.graded == b.graded,
+            "normalize_us": normalize_us,
+        });
+        #[cfg(feature = "egraph")]
+        for (key, tier) in [("egg_sound", slop_parse::equiv::Tier::Sound), ("egg_graded", slop_parse::equiv::Tier::Graded)] {
+            let start = std::time::Instant::now();
+            let proved = slop_parse::egraph::equal(&a.term, &b.term, tier, iterations)?;
+            verdict[key] = serde_json::json!(proved);
+            verdict[format!("{key}_us")] = serde_json::json!(start.elapsed().as_micros() as u64);
+        }
+        #[cfg(not(feature = "egraph"))]
+        let _ = iterations;
+        println!("{verdict}");
+    }
+    Ok(())
 }

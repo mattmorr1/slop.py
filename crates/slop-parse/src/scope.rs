@@ -32,6 +32,25 @@ struct Scope {
     binders: HashSet<String>,
     excluded: HashSet<String>,
     positions: HashSet<TextSize>,
+    /// Binder sets of the comprehensions and lambdas currently entered.
+    inner_scopes: Vec<HashSet<String>>,
+    /// Names some comprehension or lambda binds.
+    inner_binders: HashSet<String>,
+    /// Names read somewhere no enclosing comprehension or lambda binds them.
+    outer_uses: HashSet<String>,
+}
+
+fn target_names(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Name(name) => {
+            out.insert(name.id.to_string());
+        }
+        Expr::Tuple(ast::ExprTuple { elts, .. }) | Expr::List(ast::ExprList { elts, .. }) => {
+            elts.iter().for_each(|elt| target_names(elt, out));
+        }
+        Expr::Starred(star) => target_names(&star.value, out),
+        _ => {}
+    }
 }
 
 impl Scope {
@@ -49,6 +68,33 @@ impl Scope {
         self.depth += 1;
         walk(self);
         self.depth -= 1;
+    }
+
+    /// Enter a comprehension or lambda whose `binders` are known up front, since
+    /// the visitor reaches `elt` before the generators that bind its names.
+    fn inner(&mut self, binders: HashSet<String>, walk: impl FnOnce(&mut Self)) {
+        self.inner_binders.extend(binders.iter().cloned());
+        self.inner_scopes.push(binders);
+        self.nested(walk);
+        self.inner_scopes.pop();
+    }
+
+    fn comprehension(&mut self, generators: &[ast::Comprehension], elts: &[&Expr]) {
+        let Some(first) = generators.first() else { return };
+        // The first iterable is evaluated in the enclosing scope (`[e for e in e]`).
+        self.visit_expr(&first.iter);
+        let mut binders = HashSet::new();
+        generators.iter().for_each(|generator| target_names(&generator.target, &mut binders));
+        self.inner(binders, |scope| {
+            for generator in generators {
+                scope.visit_expr(&generator.target);
+                if !std::ptr::eq(generator, first) {
+                    scope.visit_expr(&generator.iter);
+                }
+                generator.ifs.iter().for_each(|test| scope.visit_expr(test));
+            }
+            elts.iter().for_each(|elt| scope.visit_expr(elt));
+        });
     }
 }
 
@@ -90,19 +136,48 @@ impl<'a> Visitor<'a> for Scope {
         match expr {
             Expr::Name(name) => {
                 self.positions.insert(name.start());
+                let id = name.id.as_str();
+                if !self.inner_scopes.iter().any(|binders| binders.contains(id)) {
+                    self.outer_uses.insert(id.to_string());
+                }
                 match name.ctx {
-                    ExprContext::Store | ExprContext::Del => self.bind(name.id.as_str(), name.start()),
+                    ExprContext::Store | ExprContext::Del => self.bind(id, name.start()),
                     _ if self.enclosing => {
-                        self.excluded.insert(name.id.to_string());
+                        self.excluded.insert(id.to_string());
                     }
                     _ => {}
                 }
             }
-            Expr::Lambda(_)
-            | Expr::ListComp(_)
-            | Expr::SetComp(_)
-            | Expr::DictComp(_)
-            | Expr::Generator(_) => self.nested(|scope| visitor::walk_expr(scope, expr)),
+            Expr::ListComp(ast::ExprListComp { elt, generators, .. })
+            | Expr::SetComp(ast::ExprSetComp { elt, generators, .. })
+            | Expr::Generator(ast::ExprGenerator { elt, generators, .. }) => self.comprehension(generators, &[elt]),
+            Expr::DictComp(ast::ExprDictComp { key, value, generators, .. }) => {
+                let elts: Vec<&Expr> = key.as_deref().into_iter().chain([&**value]).collect();
+                self.comprehension(generators, &elts);
+            }
+            Expr::Lambda(lambda) => {
+                let mut binders = HashSet::new();
+                if let Some(parameters) = &lambda.parameters {
+                    // Defaults run in the enclosing scope, before the lambda exists.
+                    for parameter in parameters.posonlyargs.iter().chain(&parameters.args).chain(&parameters.kwonlyargs) {
+                        parameter.default.iter().for_each(|default| self.visit_expr(default));
+                        binders.insert(parameter.parameter.name.to_string());
+                    }
+                    for parameter in [&parameters.vararg, &parameters.kwarg].into_iter().flatten() {
+                        binders.insert(parameter.name.to_string());
+                    }
+                }
+                self.inner(binders, |scope| {
+                    if let Some(parameters) = &lambda.parameters {
+                        let named = parameters.posonlyargs.iter().chain(&parameters.args).chain(&parameters.kwonlyargs);
+                        let variadic = [&parameters.vararg, &parameters.kwarg].into_iter().flatten();
+                        for parameter in named.map(|p| &p.parameter).chain(variadic.map(|p| &**p)) {
+                            scope.positions.insert(parameter.name.start());
+                        }
+                    }
+                    scope.visit_expr(&lambda.body);
+                });
+            }
             _ => visitor::walk_expr(self, expr),
         }
     }
@@ -152,7 +227,16 @@ pub(crate) fn locals(func: &ast::StmtFunctionDef) -> Locals {
         scope.bind(parameter.name.as_str(), parameter.name.start());
     }
     scope.visit_body(&func.body);
-    let collapsible = scope.binders.difference(&scope.excluded).cloned().collect();
+    // A name only comprehensions/lambdas bind, never read outside one that binds it,
+    // refers to an inner binding at every occurrence: renaming it is α too.
+    let inner_only = scope.inner_binders.difference(&scope.outer_uses).cloned();
+    let collapsible = scope
+        .binders
+        .iter()
+        .cloned()
+        .chain(inner_only)
+        .filter(|name| !scope.excluded.contains(name))
+        .collect();
     Locals {
         collapsible,
         positions: scope.positions,

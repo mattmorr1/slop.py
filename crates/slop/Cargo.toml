@@ -30,3 +30,7 @@ slop-parse = { workspace = true }
 slop-proxy = { workspace = true }
 slop-resolve = { workspace = true }
 slop-tui = { workspace = true }
+
+[features]
+# E-equivalence research engine (egglog); off in release builds.
+egraph = ["slop-parse/egraph"]
