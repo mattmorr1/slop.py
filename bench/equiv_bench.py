@@ -555,7 +555,8 @@ def main() -> None:
     manifest = {
         "bench": "equiv", "label": "exploratory", "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "commit": subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip(),
-        "dirty": bool(subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--", "crates", "bench"],
+        "dirty": bool(subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no", "--", "crates", "bench",
+                                      ":!bench/__pycache__", ":!bench/results"],
                                      capture_output=True, text=True).stdout.strip()),
         "alpha_v1_commit": ALPHA_V1_COMMIT, "python": platform.python_version(), "platform": platform.platform(),
         "seed": args.seed, "repos": [str(r) for r in args.repos], "functions": len(sample), "pairs": len(pairs),
