@@ -58,6 +58,8 @@ WORD = re.compile(r"[A-Za-z][a-z0-9]*|[A-Z]+(?![a-z])|\d+")
 FEATURES = ["bias", "d1", "d2", "d3", "d4", "same_file", "same_dir", "file_gap", "same_container",
             "shared_effect", "is_class", "lexical"]
 NEGATIVES_PER_TASK = 200
+# Log-spaced: nearly every candidate is improbable, so linear bins would put all of them in one.
+CALIBRATION_EDGES = (0.0, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 0.6, 1.0)
 
 
 def is_test(path: str) -> bool:
@@ -384,6 +386,9 @@ def main() -> None:
     precision = {(arm, b, repo.name): defaultdict(list) for arm in arm_names for b in budgets for repo in repos}
     spent = {(arm, b, repo.name): defaultdict(list) for arm in arm_names for b in budgets for repo in repos}
     rng = random.Random(args.seed)
+    # Reliability: out-of-sample (task, candidate) probabilities binned against how often they co-changed.
+    edges = np.array(CALIBRATION_EDGES)
+    bin_count, bin_p, bin_hit = (np.zeros(len(edges) - 1) for _ in range(3))
     for repo in repos:
         shuffled = sorted(repo.catalog)
         rng.shuffle(shuffled)
@@ -394,6 +399,12 @@ def main() -> None:
             idents, features = repo.candidates(target)
             probability = 1 / (1 + np.exp(-features @ beta)) if len(idents) else np.array([])
             chance, pool = dict(zip(idents, probability)), set(idents)
+            if len(idents):
+                which = np.clip(np.digitize(probability, edges) - 1, 0, len(edges) - 2)
+                hits = np.fromiter((ident in gold for ident in idents), dtype=float, count=len(idents))
+                bin_count += np.bincount(which, minlength=len(edges) - 1)
+                bin_p += np.bincount(which, weights=probability, minlength=len(edges) - 1)
+                bin_hit += np.bincount(which, weights=hits, minlength=len(edges) - 1)
             by_rank = [idents[i] for i in np.argsort(-probability, kind="stable")]
             by_ratio = [idents[i] for i in sorted(range(len(idents)),
                                                    key=lambda i: (-probability[i] / repo.cost[idents[i]], idents[i]))]
@@ -445,6 +456,10 @@ def main() -> None:
         return cluster_bootstrap(merged, args.seed)
 
     names = [repo.name for repo in repos]
+    calibration = [{"bin": [float(edges[i]), float(edges[i + 1])], "n": int(bin_count[i]),
+                    "mean_p": float(bin_p[i] / bin_count[i]), "observed": float(bin_hit[i] / bin_count[i])}
+                   for i in range(len(edges) - 1) if bin_count[i]]
+    ece = sum(abs(row["mean_p"] - row["observed"]) * row["n"] for row in calibration) / bin_count.sum()
     results = {}
     for arm in arm_names:
         for budget in budgets:
@@ -509,8 +524,15 @@ def main() -> None:
         "models": {name: list(map(float, beta)) for name, beta in models.items()},
         "tasks_digest": hashlib.sha256(json.dumps([r.tasks for r in repos], sort_keys=True).encode()).hexdigest(),
     }
+    print("\ncalibration (out of sample, every task x candidate):")
+    print("| p bin | pairs | mean predicted | observed |")
+    print("| --- | ---: | ---: | ---: |")
+    for row in calibration:
+        print(f"| {row['bin'][0]:g}–{row['bin'][1]:g} | {row['n']:,} | {row['mean_p']:.4f} | {row['observed']:.4f} |")
+    print(f"expected calibration error {ece:.5f}")
     with args.out.open("a") as ledger:
-        ledger.write(json.dumps({"manifest": manifest, "results": results}) + "\n")
+        ledger.write(json.dumps({"manifest": manifest, "results": results,
+                                 "calibration": {"bins": calibration, "ece": ece}}) + "\n")
     print(f"\nappended to {args.out}")
 
 

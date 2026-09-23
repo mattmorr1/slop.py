@@ -235,8 +235,11 @@ gate unless it is independent.
 
 **R1 — Calibrated context port. Done (7dc5255, ADR 0005, B4 after-run).**
 
-**R2 — Real competitor arm.** Add Aider's RepoMap (pinned version) to B4,
-same budgets and cost model. *Gate:* result recorded whatever it shows.
+**R2 — Real competitor arms (in progress, 28aaa48).** Aider's RepoMap
+(aider-chat 0.86.1; scipy upgraded to 1.18.1 because the pinned wheel does not
+load on this macOS) as `aider-map` and `aider-chat`, and a bge-small embedding
+retriever, scored on B4's own tasks via `--arm`. *Gate:* result recorded
+whatever it shows, with paired differences.
 
 **R3 — Per-repo calibration as a product command.** `slop calibrate` (port the
 history miner or ship the script) writing `.slop/relevance.json`; time-split
@@ -263,11 +266,34 @@ helper history says it should? Pre-register hypotheses first.
 **R9 — Daily-driver polish.** LSP unsaved-buffer overlays; Codex hook parity;
 `slop doctor` checks for npx/rust-analyzer and indexer failure memos.
 
-**R10 — Envelope latency on large repos.** vigil p95 132 ms: every call
-rebuilds signature/class maps over all facts and scans every entity for the
-target's directory. Build both once per snapshot (like `lexical()`), index
-entities by directory. *Gate:* vigil warm context p95 < 50 ms, output
-byte-identical.
+**R10 — Envelope latency. Done (1be6859).** Profiling, not the guessed map
+rebuilds: an O(picked x candidates) equivalents scan and an unbounded BFS.
+vigil p95 164 -> 38 ms, output identical; adaptive default brings it to 21 ms.
+
+**R11 — Adaptive budget. Done (d473695, b7e3ac5).** Candidates beyond the edit
+zone below p = 0.01 are not shown. Like for like at 8k: 95% of recall, 20% fewer
+tokens, 2.5x precision. The edit zone is exempt (callees rarely co-change but
+are needed).
+
+### Benchmark readiness (claims an outside reviewer accepts)
+
+- **B-conf. Confirmatory repos.** 4–6 repos never used in any choice (incl.
+  two TypeScript), hypotheses and metrics written before running; time split
+  (fit on older commits, test on newer). The largest credibility gap.
+- **B-cal. Calibration.** Reliability table and ECE (added to B4; first
+  numbers pending the competitor run).
+- **B-label. Label audit.** Hand-check ~50 tasks; filter bundled commits
+  (formatting sweeps, renames); estimate how much of the ranking gap is noise.
+- **B-repro. Reproducibility.** One script, pinned repo SHAs and indexer
+  versions, a small B3/B4 smoke in CI.
+
+### Production readiness
+
+- **P-feedback.** Opt-in local log of which envelope items the agent expanded
+  or edited: a better label than co-change, and future training data.
+- **P-harden.** Indexer timeouts, monorepo memory ceilings, `slop doctor`
+  checks for missing indexers and failure memos (with R9).
+- **Release** remains paused by the owner; no tags or publishing.
 
 **Deferred (unchanged gates in `DEFERRED_RESEARCH.md`):** e-graph code
 optimisation, daemon, constrained decoding, RL/RLAIF, cross-process cache.
