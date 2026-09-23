@@ -311,7 +311,7 @@ def main() -> None:
     budgets = [int(b) for b in args.budgets.split(",")]
     started = time.time()
     # Recorded before running: the tree measured is the tree at start, whatever is edited meanwhile.
-    commit = git(ROOT, "rev-parse", "HEAD").strip()
+    head = git(ROOT, "rev-parse", "HEAD").strip()
     dirty = bool(git(ROOT, "status", "--porcelain", "--untracked-files=no", "--", "crates", "bench",
                      ":!bench/__pycache__", ":!bench/results").strip())
 
@@ -517,7 +517,7 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     manifest = {
         "bench": "context", "label": "exploratory", "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "commit": commit, "dirty": dirty,
+        "commit": head, "dirty": dirty,
         "repos": {repo.name: {"history_head": git(repo.history, "rev-parse", "HEAD").strip(),
                               "snapshot": repo.header["snapshot"], "tasks": len(repo.tasks)} for repo in repos},
         "seed": args.seed, "budgets": budgets, "features": FEATURES, "python": platform.python_version(),
