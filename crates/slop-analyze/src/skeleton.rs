@@ -65,7 +65,7 @@ fn render_doc(doc: &str, lang: Option<Language>) -> (String, String) {
             doc.lines().map(|l| format!("/// {l}\n")).collect(),
             String::new(),
         ),
-        Some(Language::JavaScript | Language::TypeScript) => {
+        Some(Language::JavaScript | Language::TypeScript | Language::Tsx) => {
             (format!("/** {doc} */\n"), String::new())
         }
         _ => (String::new(), format!("    \"\"\"{doc}\"\"\"\n")),

@@ -49,6 +49,7 @@ pub fn env_reads(lang: Language, source: &str) -> Vec<EnvRead> {
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             JS_ACCESSORS,
         ),
+        Language::Tsx => ts_env_reads(source, tree_sitter_typescript::LANGUAGE_TSX.into(), JS_ACCESSORS),
     };
     out.sort_by(|a, b| a.var.cmp(&b.var).then(a.line.cmp(&b.line)));
     out.dedup();

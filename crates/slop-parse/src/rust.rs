@@ -97,7 +97,7 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
         .to_string();
 
     let mut bound = std::collections::HashSet::new();
-    collect_bound(node, src, BINDERS, &mut bound);
+    collect_bound(node, src, BINDERS, FN_KINDS, &mut bound);
     let mut hasher = HashState::default();
     hash_walk(body, src, &bound, &mut hasher);
     let significant_tokens = hasher.significant;

@@ -32,6 +32,7 @@ pub fn qualified_names(lang: Language, source: &str) -> Vec<String> {
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Syntax::Js,
         ),
+        Language::Tsx => ts_names(source, tree_sitter_typescript::LANGUAGE_TSX.into(), Syntax::Js),
     };
     out.sort();
     out.dedup();

@@ -51,7 +51,7 @@ impl Indexer {
     pub fn for_language(language: Language) -> Option<Self> {
         match language {
             Language::Python => Some(Self::Python),
-            Language::JavaScript | Language::TypeScript => Some(Self::Typescript),
+            Language::JavaScript | Language::TypeScript | Language::Tsx => Some(Self::Typescript),
             Language::Rust => Some(Self::Rust),
             _ => None,
         }

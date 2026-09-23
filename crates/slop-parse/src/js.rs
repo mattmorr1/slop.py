@@ -65,12 +65,22 @@ fn classify<'a>(kind: &str, text: &'a str, bound: &std::collections::HashSet<Str
 }
 
 pub fn analyze_js(source: &str, typescript: bool) -> Result<Vec<FunctionFacts>> {
+    analyze_with(
+        source,
+        if typescript {
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        } else {
+            tree_sitter_javascript::LANGUAGE.into()
+        },
+    )
+}
+
+pub fn analyze_tsx(source: &str) -> Result<Vec<FunctionFacts>> {
+    analyze_with(source, tree_sitter_typescript::LANGUAGE_TSX.into())
+}
+
+fn analyze_with(source: &str, language: tree_sitter::Language) -> Result<Vec<FunctionFacts>> {
     let mut parser = Parser::new();
-    let language = if typescript {
-        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-    } else {
-        tree_sitter_javascript::LANGUAGE.into()
-    };
     parser
         .set_language(&language)
         .map_err(|e| anyhow!("loading tree-sitter grammar: {e}"))?;
@@ -141,7 +151,7 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
 
     // Hashing + token/line counts over the body, skipping nested functions.
     let mut bound = std::collections::HashSet::new();
-    collect_bound(node, src, BINDERS, &mut bound);
+    collect_bound(node, src, BINDERS, FN_KINDS, &mut bound);
     let mut hasher = HashState::default();
     hash_walk(body, src, &bound, &mut hasher);
 
@@ -400,5 +410,41 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].name, "typed");
         assert_eq!(facts[0].branch_points, 1);
+    }
+}
+
+#[cfg(test)]
+mod tsx_tests {
+    use crate::Language;
+
+    /// JSX is a syntax error under the plain TypeScript grammar, which used to
+    /// discard every React component file whole.
+    #[test]
+    fn tsx_components_parse_with_the_tsx_grammar() {
+        let src = "export function Badge({ label }: { label: string }) {\n  const upper = label.toUpperCase();\n  return <span className=\"badge\">{upper}</span>;\n}\n";
+        assert_eq!(Language::from_path("ui/Badge.tsx"), Some(Language::Tsx));
+        assert!(Language::TypeScript.parse(src).is_err());
+        let facts = Language::Tsx.parse(src).expect("tsx parses");
+        assert_eq!(facts[0].name, "Badge");
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::analyze_js;
+
+    /// Each reads a different global, which its callback parameter happens to shadow.
+    /// Treating the callback's `limit` as bound in the outer function renamed
+    /// the global reference and let different globals collide.
+    #[test]
+    fn a_nested_parameter_does_not_bind_the_outer_function() {
+        let body = |global: &str| {
+            format!("function f(xs) {{\n  const total = xs.length + {global};\n  xs.forEach(({global}) => log({global}));\n  return total * 2 + 1;\n}}\n")
+        };
+        let a = analyze_js(&body("limit"), false).unwrap();
+        let b = analyze_js(&body("quota"), false).unwrap();
+        let outer = |facts: &[crate::FunctionFacts]| facts.iter().find(|f| f.name == "f").unwrap().alpha_hash.clone();
+        assert!(!outer(&a).is_empty());
+        assert_ne!(outer(&a), outer(&b), "different globals must not be alpha-equivalent");
     }
 }

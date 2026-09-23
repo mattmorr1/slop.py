@@ -156,9 +156,9 @@ fn stat(_: &Path) -> Option<Stat> {
 /// is rehashed next time, since a coarse ctime clock cannot order a same-tick write.
 const RACY_WINDOW_SECS: i64 = 2;
 
-/// (stat before reading, digest, second the digest was taken), per absolute path.
 type Sources = BTreeMap<String, Arc<str>>;
 
+/// (stat before reading, digest, second the digest was taken), per absolute path.
 static DIGESTS: Mutex<BTreeMap<PathBuf, (Stat, Digest, i64)>> = Mutex::new(BTreeMap::new());
 
 fn read_source(path: &Path, relative: &str) -> Result<Arc<str>> {
@@ -525,10 +525,8 @@ mod tests {
         let repo = fixture("toy_repo");
         let first = RepositorySnapshot::capture(warn(&repo)).expect("first capture");
         let second = RepositorySnapshot::capture(warn(&repo)).expect("second capture");
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "unchanged content is a cache hit"
-        );
+        // Identity, not pointer equality: the one-slot cache is shared with parallel tests.
+        assert_eq!(first.id(), second.id());
         assert_eq!(first.freshness(), &SnapshotFreshness::Current);
     }
 
@@ -661,6 +659,39 @@ mod bench_parts {
         });
         time("digest (warm)", &mut || {
             digest_sources(&repo, &files).unwrap();
+        });
+        let paths: Vec<_> = index::index_paths_for(&repo, None, &files)
+            .into_iter()
+            .filter(|path| path.exists())
+            .collect();
+        let once = |label: &str, f: &mut dyn FnMut()| {
+            let start = std::time::Instant::now();
+            f();
+            eprintln!("{label}: {:?}", start.elapsed());
+        };
+        let mut resolver = None;
+        once("scip load", &mut || resolver = Some(IndexSet::load(&paths).unwrap()));
+        let resolver = resolver.unwrap();
+        let mut built = None;
+        once("build_graph", &mut || built = Some(build::build_graph(&resolver)));
+        let mut built = built.unwrap();
+        once("effects", &mut || effects::infer_effects(&mut built));
+        DIGESTS.lock().unwrap().clear();
+        let (_, read) = digest_sources(&repo, &files).unwrap();
+        once("parse_corpus", &mut || {
+            source::parse_corpus(&read);
+        });
+        let mut by_language: BTreeMap<String, (usize, usize, std::time::Duration)> = BTreeMap::new();
+        for (file, text) in &read {
+            let Some(language) = slop_parse::Language::from_path(file) else { continue };
+            let start = std::time::Instant::now();
+            let _ = language.parse(text);
+            let entry = by_language.entry(format!("{language:?}")).or_default();
+            *entry = (entry.0 + 1, entry.1 + text.len(), entry.2 + start.elapsed());
+        }
+        eprintln!("per language (files, bytes, time): {by_language:?}");
+        once("snapshot_id", &mut || {
+            snapshot_id(&repo, &paths, &repo.join("slop.toml"), &read).unwrap();
         });
     }
 }

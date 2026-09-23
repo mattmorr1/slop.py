@@ -6,7 +6,7 @@
 //! Tier-2 hash = token kinds only, with names/literals collapsed to
 //! placeholders: "same shape, renamed variables / different constants."
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use ruff_python_ast::token::{Token, TokenKind};
@@ -34,6 +34,9 @@ pub enum Language {
     Python,
     JavaScript,
     TypeScript,
+    /// `.tsx`: TypeScript plus JSX, a separate tree-sitter grammar because `<T>x` casts
+    /// and JSX elements are ambiguous under one grammar.
+    Tsx,
     Rust,
 }
 
@@ -52,7 +55,8 @@ impl Language {
         match path.rsplit('.').next() {
             Some("py" | "pyi") => Some(Language::Python),
             Some("js" | "jsx" | "mjs" | "cjs") => Some(Language::JavaScript),
-            Some("ts" | "tsx" | "mts" | "cts") => Some(Language::TypeScript),
+            Some("ts" | "mts" | "cts") => Some(Language::TypeScript),
+            Some("tsx") => Some(Language::Tsx),
             Some("rs") => Some(Language::Rust),
             _ => None,
         }
@@ -65,7 +69,7 @@ impl Language {
         match self {
             Language::Python => ("#", &[]),
             Language::Rust => ("//", &["///", "//!"]),
-            Language::JavaScript | Language::TypeScript => ("//", &["///"]),
+            Language::JavaScript | Language::TypeScript | Language::Tsx => ("//", &["///"]),
         }
     }
 
@@ -75,6 +79,7 @@ impl Language {
             Language::Python => analyze_file(source),
             Language::JavaScript => js::analyze_js(source, false),
             Language::TypeScript => js::analyze_js(source, true),
+            Language::Tsx => js::analyze_tsx(source),
             Language::Rust => rust::analyze_rust(source),
         }
     }
@@ -428,6 +433,7 @@ fn function_facts(
     let bound = bound_names(func, &body_tokens, source);
     let mut hasher = ts_state::HashState::default();
 
+    let mut kind_names: HashMap<TokenKind, String> = HashMap::new();
     for (i, token) in body_tokens.iter().enumerate() {
         let kind = token.kind();
         if kind == TokenKind::Comment {
@@ -446,7 +452,8 @@ fn function_facts(
         }
         let text = &source[token.range()];
         let after_dot = i > 0 && body_tokens[i - 1].kind() == TokenKind::Dot;
-        hasher.leaf(&format!("{kind:?}"), text, line, classify(kind, text, after_dot, &bound));
+        let name = kind_names.entry(kind).or_insert_with(|| format!("{kind:?}"));
+        hasher.leaf(name, text, line, classify(kind, text, after_dot, &bound));
     }
     let significant = hasher.significant;
 
@@ -844,5 +851,27 @@ def documented(x):
     fn small_bodies_get_no_hash() {
         let facts = analyze_file("def tiny(x):\n    return x\n").unwrap();
         assert!(facts[0].body_hash.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod golden {
+    /// Pins the hash byte encoding: baselines and sidecars persist these digests,
+    /// so an optimisation that changes a value is a breaking change, not a refactor.
+    #[test]
+    fn hash_encoding_is_stable() {
+        let py = "def f(a, b):\n    total = a + b * 30\n    for item in a:\n        total += len(str(item))\n    return total\n";
+        let js = "function f(a, b) {\n  let total = a + b * 30;\n  for (const item of a) { total += String(item).length; }\n  return total;\n}\n";
+        let rs = "fn f(a: &[u32], b: u32) -> u32 {\n    let mut total = b * 30;\n    for item in a { total += item.count_ones(); }\n    total\n}\n";
+        let expected = [
+            (crate::Language::Python, py, ["6c5fa27bdcbd5f0c548616f3c2170af19fcca37e3794e4950bb9b3461796ac39", "3d24c11c84e45dfffc57ba276a38cc2304d43a49454c0dd8c28591dc8a3c633e", "f0caade0cfa2d6e48477acd43b8360fa61f09df6dc004aa4e9d7f4e5690af37e"]),
+            (crate::Language::JavaScript, js, ["c5ce10c9afec66d4090a05e9767fbc5202487111cfc6ed4f37c3a79a9e46db82", "bd3f8582380ef18a02dd762b8dc324b22f22fdce915ee25cf62a6200c60bd8e5", "16b0a58367ecd39aa60a93619206c361fca43658c3126310366ccbe74d105b39"]),
+            (crate::Language::Rust, rs, ["1df539fa19211957473fa69706a98cc5f060ce6dd1f1d06df6bc3fdd1a6c77b9", "97d02edf3cb5a4b2c77f0036939383d8b1f92452e2a1c625dacd682479ec4386", "ca505f04679b05cb21ee3553f2ba95c86d374ab7f6f973357bd9e81667ccc12e"]),
+        ];
+        for (language, source, [body, structural, alpha]) in expected {
+            let facts = &language.parse(source).unwrap()[0];
+            let actual = [facts.body_hash.as_str(), &facts.structural_hash, &facts.alpha_hash];
+            assert_eq!(actual, [body, structural, alpha], "{language:?}");
+        }
     }
 }

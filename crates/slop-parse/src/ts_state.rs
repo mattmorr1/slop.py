@@ -44,28 +44,37 @@ impl HashState {
     pub fn leaf(&mut self, kind: &str, text: &str, line: u32, tok: Tok) {
         self.code_lines.insert(line);
         self.significant += 1;
-        self.exact.update(format!("{kind}\u{1}{text}\u{2}").as_bytes());
+        // Byte streams are unchanged from the former `format!` encoding, so every
+        // persisted hash is stable; only the three allocations per token are gone.
+        let field = |hasher: &mut blake3::Hasher, value: &[u8]| {
+            hasher.update(kind.as_bytes()).update(b"\x01").update(value).update(b"\x02");
+        };
+        field(&mut self.exact, text.as_bytes());
 
         // Structural: names *and* literals collapse — "same shape, renamed
         // variables / different constants".
-        let atom = matches!(tok, Tok::Bound(_) | Tok::Free | Tok::Literal);
-        if atom {
-            self.structural.update(format!("{kind}\u{2}").as_bytes());
+        if matches!(tok, Tok::Bound(_) | Tok::Free | Tok::Literal) {
+            self.structural.update(kind.as_bytes()).update(b"\x02");
         } else {
-            self.structural.update(format!("{kind}\u{1}{text}\u{2}").as_bytes());
+            field(&mut self.structural, text.as_bytes());
         }
 
         match tok {
             Tok::Bound(name) => {
                 let next = self.bound_index.len() as u32;
-                let idx = *self.bound_index.entry(name.to_string()).or_insert(next);
-                self.alpha.update(format!("{kind}\u{1}#{idx}\u{2}").as_bytes());
+                let idx = match self.bound_index.get(name) {
+                    Some(idx) => *idx,
+                    None => *self.bound_index.entry(name.to_string()).or_insert(next),
+                };
+                let mut digits = [0u8; 11];
+                let mut cursor = std::io::Cursor::new(&mut digits[..]);
+                let _ = std::io::Write::write_fmt(&mut cursor, format_args!("#{idx}"));
+                let len = cursor.position() as usize;
+                field(&mut self.alpha, &digits[..len]);
             }
             // Everything else contributes verbatim: a different callee, a
             // different constant, or different syntax is a different function.
-            _ => {
-                self.alpha.update(format!("{kind}\u{1}{text}\u{2}").as_bytes());
-            }
+            _ => field(&mut self.alpha, text.as_bytes()),
         }
     }
 
@@ -132,6 +141,7 @@ pub fn collect_bound(
     node: Node,
     src: &[u8],
     binders: &[(&str, &str)],
+    scopes: &[&str],
     out: &mut HashSet<String>,
 ) {
     if let Some((_, field)) = binders.iter().find(|(kind, _)| *kind == node.kind()) {
@@ -145,8 +155,9 @@ pub fn collect_bound(
         }
     }
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_bound(child, src, binders, out);
+    // A nested scope binds for itself, and the hashing walk skips it too.
+    for child in node.children(&mut cursor).filter(|child| !scopes.contains(&child.kind())) {
+        collect_bound(child, src, binders, scopes, out);
     }
 }
 

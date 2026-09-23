@@ -41,14 +41,34 @@ pub fn parse_repo(repo_root: &Path, files: &[&str]) -> Vec<FileFacts> {
 }
 
 pub fn parse_corpus(sources: &BTreeMap<String, Arc<str>>) -> Vec<FileFacts> {
-    sources
-        .iter()
-        .filter_map(|(file, source)| {
-            let lang = Language::from_path(file)?;
-            let functions = lang.parse(source).ok()?;
-            Some(FileFacts { file: file.clone(), functions })
-        })
-        .collect()
+    let files: Vec<_> = sources.iter().collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism().map_or(1, usize::from).min(files.len().max(1));
+    // Files are independent and pulled from a shared counter (sizes are skewed);
+    // re-sorting by index keeps the output deterministic.
+    let mut parsed: Vec<(usize, FileFacts)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((file, source)) = files.get(index) else { return out };
+                        let Some(language) = Language::from_path(file) else { continue };
+                        if let Ok(functions) = language.parse(source) {
+                            out.push((index, FileFacts { file: (*file).clone(), functions }));
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("parser thread panicked"))
+            .collect()
+    });
+    parsed.sort_unstable_by_key(|(index, _)| *index);
+    parsed.into_iter().map(|(_, facts)| facts).collect()
 }
 
 /// Is `entity_id` defined inside a test module? Rust (and Go) keep tests in the
