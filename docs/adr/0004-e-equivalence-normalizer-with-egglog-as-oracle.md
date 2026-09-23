@@ -36,11 +36,14 @@ normalizer overtakes egglog: it can renumber locals after reaching a normal
 form, while a binder-less e-graph compares pre-numbered terms. So the e-graph's
 value here was as a test oracle, not as the engine.
 
-**Soundness evidence.** Across all three runs, 0 of 1,310 behaviour-changing
-mutants and 0 of 111 type-conditional traps were judged sound-equal; the rule of
-three bounds the true rate below 0.23% at 95% confidence on this distribution.
-α v1, the token-adjacency binder it replaces, judged 13.1% of behaviour changes
-equal (73% of keyword-name changes, every changed default).
+**Soundness evidence.** In every run, no behaviour-changing mutant (1,813 in
+run c19cf71, including `async` and annotation changes) and none of 111
+type-conditional traps was judged sound-equal; the rule of three bounds the true
+rate below 0.17% at 95% confidence on this distribution. α v1, the
+token-adjacency binder it replaces, judged 36.9% of behaviour changes equal.
+Reviewing real output (vigil) found one unsound omission the mutators had not
+exercised, `async` and annotations missing from the signature term; both are
+now part of the term and measured by their own mutators.
 
 **Consequences.** The deny gate ADR 0001 describes may use the E-sound hash;
 wiring it into the write hook still requires the same per-language evidence for

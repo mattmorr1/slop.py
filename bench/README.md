@@ -13,7 +13,7 @@ paired with mutants. **P** mutants are provably equivalent for every Python valu
 (consistent rename, ternary ↔ branches, negate-and-swap, dead code after an exit,
 temp inline, implicit `return None`, int folding, `pass`, 2–3 combined). **B real**
 mutants change behaviour (constant, callee, keyword name, comparison, negated
-test, swapped calls, default). **B trap** mutants apply laws true only for some
+test, swapped calls, default, `async`, annotation). **B trap** mutants apply laws true only for some
 types (`x += y`, `a + b → b + a`, De Morgan, comparison flips).
 
 ```
@@ -21,24 +21,26 @@ cargo build --release -p slop-cli --features egraph
 python3 bench/equiv_bench.py --limit 400
 ```
 
-### Result (commit 1434d74, 3,256 pairs, 2026-09-23)
+### Result (commit c19cf71, 3,759 pairs, 2026-09-23)
 
 | | exact | same shape | α v1 | α v2 | **E-sound** | egglog sound | E-graded | egglog graded |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | recall on P (n=1,835) | 0.3% | 21.7% | 16.2% | 21.6% | **99.1%** | 99.0% | 99.1% | 99.0% |
-| false equiv., B real (n=1,310) | 1.3% | 63.4% | 13.1% | 0.0% | **0.0%** | 0.0% | 0.0% | 0.0% |
+| false equiv., B real (n=1,813) | 28.4% | 73.4% | 36.9% | 0.0% | **0.0%** | 0.0% | 0.0% | 0.0% |
 | false equiv., B trap (n=111) | 0.0% | 4.5% | 0.0% | 0.0% | **0.0%** | 0.0% | 93.7% | 91.0% |
 
-Latency per pair (both sides): normalizer p50 97 µs, p95 302 µs; egglog sound
-p50 2.4 ms, graded p50 4.4 ms (release, M-series, one core).
+Latency per pair (both sides): normalizer p50 117 µs, p95 364 µs; egglog sound
+p50 2.5 ms, graded p50 4.6 ms (release, M-series, one core).
 
 What it says:
 
 - **E-sound finds 4.6× the duplicates α does with zero false equivalences**
-  (rule of three: true rate < 0.23% at 95% on this distribution).
-- **α v1 was unsafe to deny on**: 13.1% false equivalence on behaviour changes,
-  73% on keyword-name changes, 100% on changed defaults (see commit f7150bc).
-- **"Same shape" is not evidence of duplication**: 63.4% false equivalence.
+  (rule of three: true rate < 0.17% at 95% on this distribution).
+- **Body-only hashes are unsafe to deny on**: α v1 calls 36.9% of behaviour
+  changes equal: 73% of keyword-name changes, and 100% of changed defaults,
+  `def` → `async def` and annotation changes (the last two added in c19cf71
+  after a real-code review found E-sound ignored them too; see f7150bc).
+- **"Same shape" is not evidence of duplication**: 73.4% false equivalence.
 - **The graded tier is advisory by design**: it equates 93.7% of the traps,
   which is what "holds only for well-behaved types" costs.
 - **egglog as oracle, not engine** (ADR 0004): it found a graded confluence bug
