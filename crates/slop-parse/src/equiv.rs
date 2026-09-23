@@ -636,14 +636,23 @@ fn rewrite(term: &Term, tier: Tier) -> Option<Term> {
     let Term::Node(label, children) = term else { return None };
     match (label.as_str(), children.as_slice()) {
         // `if not c: A else: B` is `if c: B else: A`: one __bool__ call either way.
-        ("if" | "ifexp", [Term::Node(not, inner), a, b]) if not == "not" && inner.len() == 1 => {
+        // Graded orientation below subsumes this; running both ping-pongs forever.
+        ("if" | "ifexp", [Term::Node(not, inner), a, b]) if tier == Tier::Sound && not == "not" && inner.len() == 1 => {
             Some(node(label.clone(), vec![inner[0].clone(), b.clone(), a.clone()]))
         }
-        ("if", [test, then, orelse]) => {
+        ("if", [test, then, orelse]) if single_return(then).is_some() && single_return(orelse).is_some() => {
             let (a, b) = (single_return(then)?, single_return(orelse)?);
             Some(node("return", vec![node("ifexp", vec![test.clone(), a.clone(), b.clone()])]))
         }
         _ if tier == Tier::Sound => None,
+        // De Morgan can push `not` inward before the flip above fires, stranding two
+        // normal forms. Orienting by the smaller of both equivalent forms restores
+        // confluence (the phase-ordering problem an e-graph avoids by keeping both).
+        ("if" | "ifexp", [test, a, b]) => {
+            let negated = normalize(node("not", vec![test.clone()]), tier);
+            let flipped = node(label.clone(), vec![negated, b.clone(), a.clone()]);
+            (flipped < *term).then_some(flipped)
+        }
         (">", [a, b]) => Some(node("<", vec![b.clone(), a.clone()])),
         (">=", [a, b]) => Some(node("<=", vec![b.clone(), a.clone()])),
         ("not", [Term::Node(inner, operands)]) if inner == "not" && operands.len() == 1 => Some(operands[0].clone()),
@@ -737,5 +746,37 @@ mod tests {
         let (swap_sound, swap_graded) = hashes("def f(a, b):\n    return b + a\n");
         assert_ne!(add_sound, swap_sound);
         assert_eq!(add_graded, swap_graded);
+    }
+}
+
+#[cfg(test)]
+mod confluence {
+    use super::*;
+
+    fn graded(src: &str) -> String {
+        equivalence_facts(src).unwrap().remove(0).graded
+    }
+
+    /// The case the egglog ablation found: De Morgan in the test must not strand
+    /// the negate-and-swap normal form.
+    #[test]
+    fn graded_normal_form_survives_de_morgan_in_the_test() {
+        let a = "def f(a, b):\n    if a and b:\n        x = g(a)\n    else:\n        x = h(b)\n    return x\n";
+        let b = "def f(a, b):\n    if not (a and b):\n        x = h(b)\n    else:\n        x = g(a)\n    return x\n";
+        assert_eq!(graded(a), graded(b));
+    }
+}
+
+#[cfg(test)]
+mod termination {
+    use super::*;
+
+    /// `not` sorts before `not in`, so orientation adds a `not` the sound flip would
+    /// strip; with both active on graded terms the normalizer never returned.
+    #[test]
+    fn graded_normalization_terminates_on_negated_membership() {
+        let src = "def f(self, key):\n    if key not in self.seen:\n        self.seen.add(key)\n        log(key)\n    return key\n";
+        let facts = equivalence_facts(src).unwrap();
+        assert!(!facts[0].graded.is_empty());
     }
 }
