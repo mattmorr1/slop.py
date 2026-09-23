@@ -375,6 +375,9 @@ enum Command {
         /// Minimum calibrated probability in ppm; 0 (default) fills the budget, as in B4 runs to date.
         #[arg(long, default_value_t = 0)]
         min_probability_ppm: u32,
+        /// Include each item's rendered text (for building prompts from the envelope).
+        #[arg(long)]
+        with_text: bool,
     },
     /// Research adapter for the equivalence benchmark: each JSONL line
     /// `{"a": src, "b": src}` (one Python function each) yields every tier's verdict.
@@ -950,8 +953,8 @@ fn main() -> Result<()> {
         Command::Open { target } => {
             setup::open_target(&target)?;
         }
-        Command::ContextBench { repo, targets, budgets, selection, min_probability_ppm } => {
-            run_context_bench(&repo, &targets, &budgets, &selection, min_probability_ppm)?
+        Command::ContextBench { repo, targets, budgets, selection, min_probability_ppm, with_text } => {
+            run_context_bench(&repo, &targets, &budgets, &selection, min_probability_ppm, with_text)?
         }
         Command::Equiv { pairs, iterations } => run_equiv(&pairs, iterations)?,
         Command::Install { repo, force } => {
@@ -1553,7 +1556,7 @@ fn run_calibrate(repo: &Path, max_commits: usize, holdout: f64, budget: usize, f
     Ok(())
 }
 
-fn run_context_bench(repo: &Path, targets: &Path, budgets: &[usize], selection: &str, min_probability_ppm: u32) -> Result<()> {
+fn run_context_bench(repo: &Path, targets: &Path, budgets: &[usize], selection: &str, min_probability_ppm: u32, with_text: bool) -> Result<()> {
     use slop_analyze::context::ContextRequest;
     use slop_analyze::envelope::{self, Selection};
     let selection = match selection {
@@ -1571,6 +1574,7 @@ fn run_context_bench(repo: &Path, targets: &Path, budgets: &[usize], selection: 
             serde_json::json!({
                 "target": target,
                 "neighbors": envelope::neighbors(&snapshot.built, target),
+                "callees": envelope::callees(&snapshot.built, target),
                 "distances": envelope::distances(&snapshot.built, target, 4),
             })
         );
@@ -1580,7 +1584,13 @@ fn run_context_bench(repo: &Path, targets: &Path, budgets: &[usize], selection: 
             let items: Vec<serde_json::Value> = artifact
                 .items
                 .iter()
-                .map(|item| serde_json::json!({ "entity": item.entity, "fidelity": item.fidelity, "score": item.score, "tokens": item.text.len() / 4 + 1 }))
+                .map(|item| {
+                    let mut row = serde_json::json!({ "entity": item.entity, "fidelity": item.fidelity, "score": item.score, "tokens": item.text.len() / 4 + 1 });
+                    if with_text {
+                        row["text"] = serde_json::Value::from(item.text.as_str());
+                    }
+                    row
+                })
                 .collect();
             println!(
                 "{}",

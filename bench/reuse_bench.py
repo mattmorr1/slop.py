@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""R8: does the context a model sees change whether it reuses the repository's helpers?
+
+Pre-registered in bench/R8_PREREGISTRATION.md. Three stages:
+
+  prepare   select targets, gut them in a scratch copy, reindex, build four prompts per task
+  generate  greedy generations from a local Ollama (stdlib only; runs on the GPU host)
+  score     helper reuse and invented calls, paired bootstrap, appended to bench/results/reuse.jsonl
+
+  SLOP_BIN=target/release/slop python3 bench/reuse_bench.py prepare \\
+      --repo vigil=PATH:50 --repo flask=PATH:25 --repo httpx=PATH:25 --out DIR
+  python3 bench/reuse_bench.py generate --tasks DIR/tasks.jsonl --model qwen2.5-coder:7b --out DIR/out.jsonl
+  python3 bench/reuse_bench.py score --tasks DIR/tasks.jsonl --outputs DIR/out.jsonl
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import builtins
+import hashlib
+import json
+import math
+import os
+import platform
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from collections import Counter, defaultdict
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SLOP = Path(os.environ.get("SLOP_BIN", ROOT / "target/release/slop"))
+SEED = 20260923
+BUDGET_TOKENS = 4000
+ADAPTIVE_PPM = 10_000
+ARMS = ("none", "file", "bm25", "slop")
+WORD = re.compile(r"[A-Za-z][a-z0-9]*|[A-Z]+(?![a-z])|\d+")
+FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
+IGNORE = shutil.ignore_patterns(".git", ".slop", "index.scip", "index.scip.*", "node_modules", ".venv", "venv",
+                                "__pycache__", ".aider*", ".mypy_cache", ".pytest_cache")
+INSTRUCTION = ("Implement the body of the function below. Reply with the complete function, signature "
+               "included, in a single ```python code block and nothing else.")
+
+
+def tokens(text: str) -> int:
+    return len(text) // 4 + 1
+
+
+def is_test(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return "/tests/" in f"/{path}" or "/test/" in f"/{path}" or name.startswith("test_") \
+        or name.endswith("_test.py") or name == "conftest.py"
+
+
+def simple(entity: str) -> str:
+    return re.findall(r"[A-Za-z_][A-Za-z0-9_]*", entity.rsplit("::", 1)[-1])[-1]
+
+
+def slop_bench(repo: Path, targets: list[str], budget: int, extra: list[str]) -> list[dict]:
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
+        handle.write("\n".join(targets) + "\n")
+    out = subprocess.run([str(SLOP), "context-bench", str(repo), handle.name, "--budgets", str(budget), *extra],
+                         capture_output=True, text=True, check=True)
+    os.unlink(handle.name)
+    return [json.loads(line) for line in out.stdout.splitlines()]
+
+
+def function_node(tree: ast.Module, name: str, lo: int, hi: int):
+    """The def named `name` whose line (1-based) lies in the entity's 0-based range."""
+    hits = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name and lo <= node.lineno - 1 <= hi]
+    return min(hits, key=lambda node: node.lineno) if hits else None
+
+
+def start(stmt) -> int:
+    """First line of a statement, counting its decorators (1-based)."""
+    return min([d.lineno for d in getattr(stmt, "decorator_list", [])] + [stmt.lineno])
+
+
+def body_after_docstring(node) -> list:
+    body = node.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        return body[1:]
+    return body
+
+
+def skeleton(lines: list[str], node) -> str:
+    """Signature through the colon, docstring if any, then `...`: what bm25 packs."""
+    first = start(node) - 1
+    header_end = start(node.body[0]) - 1
+    head = lines[first:header_end]
+    doc = ast.get_docstring(node)
+    indent = " " * (node.body[0].col_offset if node.body else node.col_offset + 4)
+    parts = ["\n".join(head)]
+    if doc:
+        parts.append(f'{indent}"""{doc.strip()}"""')
+    parts.append(f"{indent}...")
+    return "\n".join(parts)
+
+
+def prepare(args) -> None:
+    out = args.out
+    out.mkdir(parents=True, exist_ok=True)
+    tasks = []
+    for spec in args.repo:
+        name, rest = spec.split("=", 1)
+        source, count = rest.rsplit(":", 1)
+        source, count = Path(source).expanduser().resolve(), int(count)
+        lines_out = slop_bench(source, [], 1, [])
+        catalog = {entry["entity"]: entry for entry in lines_out[0]["catalog"]}
+        internal = {entity for entity, entry in catalog.items() if not is_test(entry["file"])}
+        trees, texts = {}, {}
+
+        def parsed(path: str):
+            if path not in trees:
+                texts[path] = (source / path).read_text(errors="replace")
+                try:
+                    trees[path] = ast.parse(texts[path])
+                except SyntaxError:
+                    trees[path] = None
+            return trees[path]
+
+        candidates = []
+        for entity, entry in sorted(catalog.items()):
+            if entry["class"] or not entry["file"].endswith(".py") or is_test(entry["file"]) or "tests" in entity.split("::"):
+                continue
+            tree = parsed(entry["file"])
+            node = tree and function_node(tree, simple(entity), *entry["lines"])
+            body = node and body_after_docstring(node)
+            if body and 5 <= body[-1].end_lineno - start(body[0]) + 1 <= 60:
+                candidates.append(entity)
+        rows = slop_bench(source, candidates, 1, [])
+        callees = {row["target"]: sorted(set(row["callees"]) & internal - {row["target"]}) for row in rows if "callees" in row}
+        eligible = [entity for entity in candidates if 1 <= len(callees.get(entity, [])) <= 10]
+        random.Random(f"{SEED}:{name}").shuffle(eligible)
+        picked, per_file, forbidden = [], Counter(), set()
+        for entity in eligible:
+            file = catalog[entity]["file"]
+            mine = set(callees[entity])
+            if per_file[file] >= 2 or entity in forbidden or mine & set(picked):
+                continue
+            picked.append(entity)
+            per_file[file] += 1
+            forbidden |= mine
+            if len(picked) == count:
+                break
+        if len(picked) < count:
+            raise SystemExit(f"{name}: only {len(picked)} eligible targets for {count}")
+
+        copy = out / f"{name}-gutted"
+        if copy.exists():
+            shutil.rmtree(copy)
+        shutil.copytree(source, copy, ignore=IGNORE, symlinks=True)
+        by_file = defaultdict(list)
+        for entity in picked:
+            by_file[catalog[entity]["file"]].append(entity)
+        for file, entities in by_file.items():
+            lines = texts[file].splitlines()
+            nodes = sorted((function_node(trees[file], simple(e), *catalog[e]["lines"]) for e in entities),
+                           key=lambda node: -node.lineno)
+            for node in nodes:
+                body = body_after_docstring(node)
+                indent = " " * body[0].col_offset
+                lines[start(body[0]) - 1: body[-1].end_lineno] = [f"{indent}raise NotImplementedError"]
+            (copy / file).write_text("\n".join(lines) + "\n")
+        subprocess.run([str(SLOP), "index", str(copy)], check=True, stdout=subprocess.DEVNULL)
+
+        gutted_rows = slop_bench(copy, picked, BUDGET_TOKENS, ["--min-probability-ppm", str(ADAPTIVE_PPM), "--with-text"])
+        envelopes = {row["target"]: row for row in gutted_rows if "items" in row}
+        gutted_catalog = {e["entity"]: e for e in gutted_rows[0]["catalog"]}
+        gutted_trees, gutted_text = {}, {}
+        for entry in gutted_catalog.values():
+            if entry["file"].endswith(".py") and entry["file"] not in gutted_text:
+                gutted_text[entry["file"]] = (copy / entry["file"]).read_text(errors="replace")
+                try:
+                    gutted_trees[entry["file"]] = ast.parse(gutted_text[entry["file"]])
+                except SyntaxError:
+                    gutted_trees[entry["file"]] = None
+        skeletons = {}
+        for entity, entry in gutted_catalog.items():
+            tree = gutted_trees.get(entry["file"])
+            if tree is None:
+                continue
+            kinds = (ast.ClassDef,) if entry["class"] else (ast.FunctionDef, ast.AsyncFunctionDef)
+            hits = [n for n in ast.walk(tree) if isinstance(n, kinds) and n.name == simple(entity)
+                    and entry["lines"][0] <= n.lineno - 1 <= entry["lines"][1]]
+            if hits:
+                skeletons[entity] = skeleton(gutted_text[entry["file"]].splitlines(), min(hits, key=lambda n: n.lineno))
+        index = Bm25({entity: WORD.findall(text.lower()) for entity, text in skeletons.items()})
+        repo_names = {simple(entity) for entity in catalog}
+
+        for entity in picked:
+            file = catalog[entity]["file"]
+            text = gutted_text[file]
+            lines = text.splitlines()
+            tree = gutted_trees[file]
+            node = function_node(tree, simple(entity), *gutted_catalog[entity]["lines"])
+            first = start(node) - 1
+            stub = "\n".join(lines[first: node.end_lineno])
+            imports = "\n".join(ast.get_source_segment(text, stmt) for stmt in tree.body
+                                if isinstance(stmt, (ast.Import, ast.ImportFrom)))
+            top_level = set()
+            for stmt in tree.body:
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    top_level.add(stmt.name)
+                elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                    top_level |= {(alias.asname or alias.name).split(".")[0] for alias in stmt.names}
+                elif isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                    for target in (stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]):
+                        top_level |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+            window = BUDGET_TOKENS * 4
+            if len(text) <= window:
+                file_context = text
+            else:
+                centre = len("\n".join(lines[:first]))
+                lo = max(0, min(centre - window // 2, len(text) - window))
+                file_context = text[lo: lo + window]
+            ranked = sorted(((score, e) for e, score in index.scores(WORD.findall(stub.lower())).items() if e != entity),
+                            key=lambda pair: (-pair[0], pair[1]))
+            bm25_items, spent = [], 0
+            for _, other in ranked:
+                block = f"# {gutted_catalog[other]['file']} ({other})\n{skeletons[other]}\n"
+                if spent + tokens(block) <= BUDGET_TOKENS:
+                    bm25_items.append(block)
+                    spent += tokens(block)
+            # Same packing rule as bm25: headers count, items kept in the envelope's own order.
+            slop_items, spent = [], 0
+            for item in (i for i in envelopes[entity]["items"] if i["entity"] != entity):
+                block = f"# {gutted_catalog.get(item['entity'], {}).get('file', '?')} ({item['entity']})\n{item['text']}\n"
+                if spent + tokens(block) <= BUDGET_TOKENS:
+                    slop_items.append(block)
+                    spent += tokens(block)
+            header = f"Repository: {name}. File: {file}\nImports at the top of the file:\n{imports}\n"
+            blocks = {
+                "none": "",
+                "file": f"\nCurrent contents of {file} (the function is a stub):\n{file_context}\n",
+                "bm25": "\nRelated code from the repository:\n" + "".join(bm25_items),
+                "slop": "\nRelated code from the repository:\n" + "".join(slop_items),
+            }
+            prompts = {arm: f"{header}{block}\n{INSTRUCTION}\n\n```python\n{stub}\n```\n" for arm, block in blocks.items()}
+            tasks.append({
+                "id": f"{name}:{entity}", "repo": name, "target": entity, "name": node.name, "file": file,
+                "callees": callees[entity], "callee_names": sorted({simple(c) for c in callees[entity]}),
+                "allowed": sorted(repo_names | top_level),
+                "prompts": prompts, "prompt_tokens": {arm: tokens(p) for arm, p in prompts.items()},
+            })
+        print(f"{name}: {len(picked)} targets gutted and indexed in {copy}", file=sys.stderr)
+    (out / "tasks.jsonl").write_text("".join(json.dumps(task) + "\n" for task in tasks))
+    digest = hashlib.sha256((out / "tasks.jsonl").read_bytes()).hexdigest()
+    print(f"{len(tasks)} tasks -> {out / 'tasks.jsonl'} (sha256 {digest})")
+
+
+class Bm25:
+    def __init__(self, docs: dict[str, list[str]], k1: float = 1.2, b: float = 0.75):
+        self.docs, self.k1, self.b = docs, k1, b
+        self.avg = sum(map(len, docs.values())) / max(1, len(docs))
+        self.df = Counter(term for words in docs.values() for term in set(words))
+        self.tf = {ident: Counter(words) for ident, words in docs.items()}
+        self.postings = defaultdict(list)
+        for ident, counts in self.tf.items():
+            for term in counts:
+                self.postings[term].append(ident)
+
+    def scores(self, query: list[str]) -> dict[str, float]:
+        n, scores = len(self.docs), defaultdict(float)
+        for term in set(query):
+            idf = math.log(1 + (n - self.df[term] + 0.5) / (self.df[term] + 0.5))
+            for ident in self.postings.get(term, ()):
+                tf, length = self.tf[ident][term], len(self.docs[ident])
+                scores[ident] += idf * tf * (self.k1 + 1) / (tf + self.k1 * (1 - self.b + self.b * length / self.avg))
+        return scores
+
+
+def generate(args) -> None:
+    done = set()
+    if args.out.exists():
+        done = {(r["id"], r["arm"], r["model"]) for r in map(json.loads, args.out.read_text().splitlines())}
+    tasks = [json.loads(line) for line in args.tasks.read_text().splitlines()]
+    todo = [(t, arm) for t in tasks for arm in ARMS if (t["id"], arm, args.model) not in done]
+    with args.out.open("a") as out:
+        for n, (task, arm) in enumerate(todo):
+            body = json.dumps({"model": args.model, "prompt": task["prompts"][arm], "stream": False,
+                               "options": {"temperature": 0, "seed": 0, "num_ctx": 8192, "num_predict": 768}})
+            request = urllib.request.Request(f"{args.host}/api/generate", data=body.encode(),
+                                             headers={"Content-Type": "application/json"})
+            started = time.time()
+            with urllib.request.urlopen(request, timeout=600) as response:
+                reply = json.loads(response.read())
+            out.write(json.dumps({"id": task["id"], "arm": arm, "model": args.model, "response": reply["response"],
+                                  "prompt_eval_count": reply.get("prompt_eval_count"),
+                                  "eval_count": reply.get("eval_count"), "seconds": round(time.time() - started, 2)}) + "\n")
+            out.flush()
+            print(f"{n + 1}/{len(todo)} {args.model} {arm} {task['id']} {time.time() - started:.1f}s", file=sys.stderr, flush=True)
+
+
+def generated_function(response: str, name: str):
+    match = FENCE.search(response)
+    code = match.group(1) if match else response
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    defs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    named = [n for n in defs if n.name == name]
+    return (named or defs or [None])[0]
+
+
+def calls(node) -> tuple[set[str], set[str]]:
+    bare, any_name = set(), set()
+    for call in (n for n in ast.walk(node) if isinstance(n, ast.Call)):
+        if isinstance(call.func, ast.Name):
+            bare.add(call.func.id)
+            any_name.add(call.func.id)
+        elif isinstance(call.func, ast.Attribute):
+            any_name.add(call.func.attr)
+    return bare, any_name
+
+
+def bound(node) -> set[str]:
+    names = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.arg):
+            names.add(n.arg)
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            names.add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(n.name)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            names |= {(a.asname or a.name).split(".")[0] for a in n.names}
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            names.add(n.name)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            names |= set(n.names)
+    return names
+
+
+def bootstrap(values: list[float], rounds: int = 1000) -> tuple[float, float, float]:
+    if not values:
+        return (math.nan, math.nan, math.nan)
+    rng = random.Random(SEED)
+    means = sorted(sum(values[rng.randrange(len(values))] for _ in values) / len(values) for _ in range(rounds))
+    return (sum(values) / len(values), means[int(0.025 * rounds)], means[int(0.975 * rounds)])
+
+
+def score(args) -> None:
+    tasks = {t["id"]: t for t in map(json.loads, args.tasks.read_text().splitlines())}
+    outputs = [json.loads(line) for path in args.outputs for line in path.read_text().splitlines()]
+    builtin_names = set(dir(builtins))
+    rows = {}
+    for out in outputs:
+        task = tasks[out["id"]]
+        node = generated_function(out["response"], task["name"])
+        if node is None:
+            rows[(out["model"], out["id"], out["arm"])] = {"reuse": 0.0, "invented": None, "parse_error": True}
+            continue
+        bare, any_name = calls(node)
+        reuse = sum(name in any_name for name in task["callee_names"]) / len(task["callee_names"])
+        allowed = set(task["allowed"]) | builtin_names | bound(node)
+        rows[(out["model"], out["id"], out["arm"])] = {"reuse": reuse, "invented": bool(bare - allowed), "parse_error": False}
+    models = sorted({key[0] for key in rows})
+    repos = sorted({t["repo"] for t in tasks.values()})
+    complete = [(m, i) for m in models for i in tasks if all((m, i, arm) in rows for arm in ARMS)]
+    missing = len(models) * len(tasks) - len(complete)
+
+    def select(model=None, repo=None):
+        return [(m, i) for m, i in complete if (model is None or m == model) and (repo is None or tasks[i]["repo"] == repo)]
+
+    results = {}
+    scopes = [("pooled", None, None)] + [(f"repo={r}", None, r) for r in repos] + [(f"model={m}", m, None) for m in models]
+    for label, model, repo in scopes:
+        keys = select(model, repo)
+        entry = {"tasks": len(keys)}
+        for arm in ARMS:
+            entry[arm] = {
+                "reuse": bootstrap([rows[(m, i, arm)]["reuse"] for m, i in keys]),
+                "invented": bootstrap([float(rows[(m, i, arm)]["invented"]) for m, i in keys if rows[(m, i, arm)]["invented"] is not None]),
+                "parse_errors": sum(rows[(m, i, arm)]["parse_error"] for m, i in keys),
+                "prompt_tokens": sum(tasks[i]["prompt_tokens"][arm] for _, i in keys) / max(1, len(keys)),
+            }
+        for other in ("bm25", "file", "none"):
+            entry[f"slop_minus_{other}_reuse"] = bootstrap([rows[(m, i, "slop")]["reuse"] - rows[(m, i, other)]["reuse"] for m, i in keys])
+        both = [(m, i) for m, i in keys if rows[(m, i, "slop")]["invented"] is not None and rows[(m, i, "file")]["invented"] is not None]
+        entry["slop_minus_file_invented"] = bootstrap([float(rows[(m, i, "slop")]["invented"]) - float(rows[(m, i, "file")]["invented"]) for m, i in both])
+        results[label] = entry
+
+    pct = lambda e: f"{e[0] * 100:5.1f}% [{e[1] * 100:.1f}, {e[2] * 100:.1f}]"
+    diff = lambda e: f"{e[0] * 100:+5.1f} [{e[1] * 100:+.1f}, {e[2] * 100:+.1f}]"
+    for label, entry in results.items():
+        print(f"\n{label} ({entry['tasks']} task x model pairs)")
+        print("| arm | reuse | invented calls | parse errors | prompt tokens |")
+        print("| --- | ---: | ---: | ---: | ---: |")
+        for arm in ARMS:
+            a = entry[arm]
+            print(f"| {arm} | {pct(a['reuse'])} | {pct(a['invented'])} | {a['parse_errors']} | {a['prompt_tokens']:.0f} |")
+        print(f"H1 slop - bm25 reuse   {diff(entry['slop_minus_bm25_reuse'])}")
+        print(f"H2 slop - file reuse   {diff(entry['slop_minus_file_reuse'])}")
+        print(f"H3 slop - file invented {diff(entry['slop_minus_file_invented'])} (margin +5)")
+        print(f"   slop - none reuse   {diff(entry['slop_minus_none_reuse'])}")
+    if missing:
+        print(f"\n{missing} (task, model) pairs lack an arm and were left out", file=sys.stderr)
+    manifest = {"bench": "reuse", "label": "pre-registered (bench/R8_PREREGISTRATION.md)",
+                "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "commit": subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip(),
+                "tasks_digest": hashlib.sha256(args.tasks.read_bytes()).hexdigest(),
+                "models": models, "python": platform.python_version(), "missing_pairs": missing}
+    ledger = ROOT / "bench/results/reuse.jsonl"
+    with ledger.open("a") as handle:
+        handle.write(json.dumps({"manifest": manifest, "results": results}) + "\n")
+    print(f"\nappended to {ledger}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="stage", required=True)
+    p = sub.add_parser("prepare")
+    p.add_argument("--repo", action="append", required=True, help="NAME=PATH:COUNT")
+    p.add_argument("--out", type=Path, required=True)
+    g = sub.add_parser("generate")
+    g.add_argument("--tasks", type=Path, required=True)
+    g.add_argument("--model", required=True)
+    g.add_argument("--out", type=Path, required=True)
+    g.add_argument("--host", default="http://127.0.0.1:11434")
+    s = sub.add_parser("score")
+    s.add_argument("--tasks", type=Path, required=True)
+    s.add_argument("--outputs", type=Path, nargs="+", required=True)
+    args = parser.parse_args()
+    {"prepare": prepare, "generate": generate, "score": score}[args.stage](args)
+
+
+if __name__ == "__main__":
+    main()

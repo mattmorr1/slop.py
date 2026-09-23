@@ -686,6 +686,21 @@ mod selection {
     }
 }
 
+/// Entities `entity` calls, from the index's `Calls` edges.
+pub fn callees(built: &BuiltGraph, entity: &str) -> Vec<String> {
+    let Some(start) = built.graph.node(entity) else { return Vec::new() };
+    let mut out: Vec<String> = built
+        .graph
+        .graph
+        .edges_directed(start, Direction::Outgoing)
+        .filter(|edge| *edge.weight() == EdgeKind::Calls)
+        .map(|edge| built.graph.entity(edge.target()).id.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Entities one proximity hop (Contains/Calls/Imports, either direction) from `entity`.
 pub fn neighbors(built: &BuiltGraph, entity: &str) -> Vec<String> {
     let Some(start) = built.graph.node(entity) else { return Vec::new() };
