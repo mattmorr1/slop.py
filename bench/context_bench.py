@@ -47,6 +47,8 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 SLOP = Path(os.environ.get("SLOP_BIN", ROOT / "target/release/slop"))
+# Adaptive arms stop at this calibrated probability instead of filling the budget.
+THRESHOLDS = (0.2, 0.05, 0.01)
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 WORD = re.compile(r"[A-Za-z][a-z0-9]*|[A-Z]+(?![a-z])|\d+")
 FEATURES = ["bias", "d1", "d2", "d3", "d4", "same_file", "same_dir", "file_gap", "same_container",
@@ -346,8 +348,11 @@ def main() -> None:
 
     arm_names = ["slop-coverage", "slop-ranked", "slop-calibrated-coverage", "slop-calibrated-ranked",
                  "calibrated-ratio", "calibrated-rank", "bm25", "proximity", "random"]
+    arm_names += [f"adaptive-{t}" for t in THRESHOLDS] + ["oracle-pool", "oracle"]
     recall = {(arm, b, repo.name): defaultdict(list) for arm in arm_names for b in budgets for repo in repos}
     no_edge = {(arm, b, repo.name): defaultdict(list) for arm in arm_names for b in budgets for repo in repos}
+    precision = {(arm, b, repo.name): defaultdict(list) for arm in arm_names for b in budgets for repo in repos}
+    spent = {(arm, b, repo.name): defaultdict(list) for arm in arm_names for b in budgets for repo in repos}
     rng = random.Random(args.seed)
     for repo in repos:
         shuffled = sorted(repo.catalog)
@@ -358,6 +363,7 @@ def main() -> None:
             neighbors, _ = repo.graph.get(target, (set(), {}))
             idents, features = repo.candidates(target)
             probability = 1 / (1 + np.exp(-features @ beta)) if len(idents) else np.array([])
+            chance, pool = dict(zip(idents, probability)), set(idents)
             by_rank = [idents[i] for i in np.argsort(-probability, kind="stable")]
             by_ratio = [idents[i] for i in sorted(range(len(idents)),
                                                    key=lambda i: (-probability[i] / repo.cost[idents[i]], idents[i]))]
@@ -379,10 +385,18 @@ def main() -> None:
                     "bm25": pack(bm25_order, repo.cost, budget),
                     "proximity": pack(near, repo.cost, budget),
                     "random": pack((i for i in shuffled if i != target), repo.cost, budget),
+                    # Ceilings: cheapest-first packing of the gold set maximises count recall.
+                    "oracle-pool": pack(sorted(gold & pool, key=lambda i: (repo.cost[i], i)), repo.cost, budget),
+                    "oracle": pack(sorted(gold, key=lambda i: (repo.cost[i], i)), repo.cost, budget),
+                    **{f"adaptive-{t}": pack((i for i in by_ratio if chance[i] >= t), repo.cost, budget)
+                       for t in THRESHOLDS},
                 }
                 far = gold - neighbors
                 for arm, picked in chosen.items():
                     recall[(arm, budget, repo.name)][task["commit"]].append(len(gold & picked) / len(gold))
+                    if picked:
+                        precision[(arm, budget, repo.name)][task["commit"]].append(len(gold & picked) / len(picked))
+                    spent[(arm, budget, repo.name)][task["commit"]].append(sum(repo.cost.get(i, 0) for i in picked))
                     if far:
                         no_edge[(arm, budget, repo.name)][task["commit"]].append(len(far & picked) / len(far))
 
@@ -400,13 +414,16 @@ def main() -> None:
             for scope in names + ["pooled"]:
                 members = names if scope == "pooled" else [scope]
                 results[f"{arm}@{budget}@{scope}"] = {"recall": pooled(recall, arm, budget, members),
-                                                      "no_edge": pooled(no_edge, arm, budget, members)}
+                                                      "no_edge": pooled(no_edge, arm, budget, members),
+                                                      "precision": pooled(precision, arm, budget, members),
+                                                      "tokens": pooled(spent, arm, budget, members)}
 
     print(f"\nelapsed {time.time() - started:.0f}s; models (leave-one-repo-out coefficients):")
     for name, beta in models.items():
         print(f"  held out {name}: " + ", ".join(f"{f}={b:+.2f}" for f, b in zip(FEATURES, beta)))
     for scope in ["pooled"] + names:
-        for label, key in (("recall", "recall"), ("no-edge recall", "no_edge")):
+        tables = (("recall", "recall"), ("no-edge recall", "no_edge"))
+        for label, key in tables + ((("precision", "precision"), ("tokens spent", "tokens")) if scope == "pooled" else ()):
             print(f"\n{scope} — {label}")
             print("| arm | " + " | ".join(f"@{b}" for b in budgets) + " |")
             print("| --- | " + " | ".join("---:" for _ in budgets) + " |")
@@ -414,7 +431,10 @@ def main() -> None:
                 cells = []
                 for b in budgets:
                     mean, low, high = results[f"{arm}@{b}@{scope}"][key]
-                    cells.append(f"{mean:.1%} [{low:.0%}–{high:.0%}]" if scope == "pooled" else f"{mean:.1%}")
+                    if key == "tokens":
+                        cells.append(f"{mean:.0f}")
+                    else:
+                        cells.append(f"{mean:.1%} [{low:.0%}–{high:.0%}]" if scope == "pooled" else f"{mean:.1%}")
                 print(f"| {arm} | " + " | ".join(cells) + " |")
     for repo in repos:
         for selection, values in repo.micros.items():
