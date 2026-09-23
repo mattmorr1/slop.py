@@ -1,8 +1,6 @@
 //! Immutable, revision-coherent repository evidence shared by every adapter.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -12,12 +10,13 @@ use slop_resolve::{IndexSet, Resolver};
 
 use crate::baseline::Baseline;
 use crate::build::{self, BuiltGraph};
+use crate::effects;
+use crate::index::{self, Digest, Stamp};
 use crate::policy::Policy;
 use crate::retrieve::Neighborhood;
 use crate::source::{self, FileFacts};
-use crate::{effects, index};
 
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SnapshotId(String);
@@ -47,6 +46,18 @@ pub enum SnapshotFreshness {
     Stale { reason: String },
 }
 
+/// How much SCIP evidence stands behind one source document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentState {
+    /// Indexed, and the index was built from exactly this content.
+    Resolved,
+    /// Indexed, but from different content: its graph edges may be wrong.
+    Stale,
+    /// No index document: parser facts only.
+    Unresolved,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Freshness {
     Reindex,
@@ -64,6 +75,9 @@ pub struct RepositorySnapshot {
     id: SnapshotId,
     repo: PathBuf,
     freshness: SnapshotFreshness,
+    /// Only documents that are not [`DocumentState::Resolved`].
+    degraded: BTreeMap<String, DocumentState>,
+    digests: BTreeMap<String, Digest>,
     pub built: BuiltGraph,
     pub facts: Vec<FileFacts>,
     pub sources: BTreeMap<String, Arc<str>>,
@@ -91,6 +105,14 @@ impl RepositorySnapshot {
         &self.freshness
     }
 
+    pub fn document_state(&self, file: &str) -> DocumentState {
+        match self.degraded.get(file) {
+            Some(state) => *state,
+            None if self.sources.contains_key(file) => DocumentState::Resolved,
+            None => DocumentState::Unresolved,
+        }
+    }
+
     pub fn indexed_files(&self) -> &BTreeSet<String> {
         &self.indexed_files
     }
@@ -101,163 +123,156 @@ impl RepositorySnapshot {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct FileStamp {
-    modified: Option<std::time::SystemTime>,
+static CACHE: Mutex<Option<(Digest, Arc<RepositorySnapshot>)>> = Mutex::new(None);
+
+/// A source file's identity short of its bytes. ctime is load-bearing: userspace
+/// cannot set it, so a backdated same-length edit still changes the tuple.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stat {
     len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    ino: u64,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct CacheKey {
-    repo: PathBuf,
-    indexes: Vec<(PathBuf, FileStamp)>,
-    policy: PathBuf,
-    policy_stamp: Option<FileStamp>,
-    baseline_stamp: Option<FileStamp>,
-    source_count: usize,
-    source_len: u64,
-    newest_source: Option<std::time::SystemTime>,
-}
-
-static CACHE: Mutex<Option<(CacheKey, Arc<RepositorySnapshot>)>> = Mutex::new(None);
-
-fn stamp(path: &Path) -> Option<FileStamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some(FileStamp {
-        modified: meta.modified().ok(),
+#[cfg(unix)]
+fn stat(path: &Path) -> Option<Stat> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some(Stat {
         len: meta.len(),
+        mtime: (meta.mtime(), meta.mtime_nsec()),
+        ctime: (meta.ctime(), meta.ctime_nsec()),
+        ino: meta.ino(),
     })
 }
 
-fn source_state(
-    dir: &Path,
-    count: &mut usize,
-    len: &mut u64,
-    newest: &mut Option<std::time::SystemTime>,
-) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if index::SKIP_DIRS.contains(&name) {
-                continue;
-            }
-            source_state(&path, count, len, newest);
-            continue;
-        }
-        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(index::ignored_source_path)
-        {
-            continue;
-        }
-        if !slop_parse::SOURCE_EXTS.contains(&ext) {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        *count += 1;
-        *len = len.saturating_add(meta.len());
-        if let Ok(modified) = meta.modified() {
-            *newest = Some(newest.map_or(modified, |current| current.max(modified)));
-        }
-    }
+#[cfg(not(unix))]
+fn stat(_: &Path) -> Option<Stat> {
+    None
 }
 
-fn cache_key(repo: &Path, index_paths: &[PathBuf], policy_path: &Path) -> Option<CacheKey> {
-    let mut source_count = 0;
-    let mut source_len = 0;
-    let mut newest_source = None;
-    source_state(repo, &mut source_count, &mut source_len, &mut newest_source);
-    Some(CacheKey {
-        repo: repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf()),
-        indexes: index_paths
-            .iter()
-            .map(|path| {
-                Some((
-                    path.canonicalize().unwrap_or_else(|_| path.clone()),
-                    stamp(path)?,
-                ))
-            })
-            .collect::<Option<Vec<_>>>()?,
-        policy: policy_path
-            .canonicalize()
-            .unwrap_or_else(|_| policy_path.to_path_buf()),
-        policy_stamp: stamp(policy_path),
-        baseline_stamp: stamp(&repo.join(crate::baseline::BASELINE_FILE)),
-        source_count,
-        source_len,
-        newest_source,
-    })
+/// git's racily-clean rule: a file changed within this many seconds of being hashed
+/// is rehashed next time, since a coarse ctime clock cannot order a same-tick write.
+const RACY_WINDOW_SECS: i64 = 2;
+
+/// (stat before reading, digest, second the digest was taken), per absolute path.
+type Sources = BTreeMap<String, Arc<str>>;
+
+static DIGESTS: Mutex<BTreeMap<PathBuf, (Stat, Digest, i64)>> = Mutex::new(BTreeMap::new());
+
+fn read_source(path: &Path, relative: &str) -> Result<Arc<str>> {
+    let source =
+        std::fs::read_to_string(path).with_context(|| format!("reading source {relative}"))?;
+    Ok(Arc::from(source))
 }
 
-fn hash_file(hasher: &mut blake3::Hasher, path: &Path) -> Result<()> {
-    let mut file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("reading {}", path.display()))?;
-        if read == 0 {
-            return Ok(());
+/// Digest every source, reading only files whose stat tuple changed or was racy.
+/// Returns what it had to read, so a cache miss need not read those files again.
+fn digest_sources(
+    repo: &Path,
+    files: &BTreeSet<String>,
+) -> Result<(BTreeMap<String, Digest>, Sources)> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    let (mut digests, mut read) = (BTreeMap::new(), BTreeMap::new());
+    for file in files {
+        let path = repo.join(file);
+        let before = stat(&path);
+        let known = DIGESTS
+            .lock()
+            .ok()
+            .and_then(|known| known.get(&path).copied());
+        let trusted = known.filter(|(seen, _, hashed_at)| {
+            before == Some(*seen) && seen.ctime.0 < hashed_at - RACY_WINDOW_SECS
+        });
+        if let Some((_, digest, _)) = trusted {
+            digests.insert(file.clone(), digest);
+            continue;
         }
-        hasher.update(&buffer[..read]);
+        let source = read_source(&path, file)?;
+        let digest = *blake3::hash(source.as_bytes()).as_bytes();
+        if let (Some(before), Ok(mut known)) = (before, DIGESTS.lock()) {
+            known.insert(path, (before, digest, now));
+        }
+        digests.insert(file.clone(), digest);
+        read.insert(file.clone(), source);
     }
+    Ok((digests, read))
 }
 
-fn discover_sources(repo: &Path, dir: &Path, files: &mut BTreeSet<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_symlink() {
-            continue;
-        }
-        if kind.is_dir() {
-            let name = entry.file_name();
-            if name.to_str().is_some_and(|part| index::SKIP_DIRS.contains(&part)) {
-                continue;
-            }
-            discover_sources(repo, &path, files);
-            continue;
-        }
-        let Some(relative) = path.strip_prefix(repo).ok().and_then(Path::to_str) else {
-            continue;
-        };
-        let normalized = relative.replace('\\', "/");
-        if slop_parse::Language::from_path(&normalized).is_some()
-            && !index::ignored_source_path(&normalized)
-        {
-            files.insert(normalized);
-        }
-    }
+/// Sources for a new snapshot: bytes already read, else the previous snapshot's
+/// shared text when its digest still matches, else a fresh read (re-digested).
+fn collect_sources(
+    repo: &Path,
+    digests: &mut BTreeMap<String, Digest>,
+    mut read: BTreeMap<String, Arc<str>>,
+) -> Result<BTreeMap<String, Arc<str>>> {
+    let previous = CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref().map(|(_, snapshot)| snapshot.clone()))
+        .filter(|snapshot| snapshot.repo == repo);
+    digests
+        .iter_mut()
+        .map(|(file, digest)| {
+            let source = match read.remove(file) {
+                Some(source) => source,
+                None => match previous
+                    .as_ref()
+                    .filter(|snapshot| snapshot.digests.get(file) == Some(digest))
+                    .and_then(|snapshot| snapshot.sources.get(file))
+                {
+                    Some(shared) => shared.clone(),
+                    None => {
+                        let source = read_source(&repo.join(file), file)?;
+                        *digest = *blake3::hash(source.as_bytes()).as_bytes();
+                        source
+                    }
+                },
+            };
+            Ok((file.clone(), source))
+        })
+        .collect()
 }
 
-fn capture_sources(repo: &Path, indexed: &BTreeSet<String>) -> Result<BTreeMap<String, Arc<str>>> {
-    let mut files = indexed.clone();
-    discover_sources(repo, repo, &mut files);
-    let mut sources = BTreeMap::new();
-    for relative in files {
-        if slop_parse::Language::from_path(&relative).is_none()
-            || index::ignored_source_path(&relative)
-        {
-            continue;
-        }
-        let source = std::fs::read_to_string(repo.join(&relative))
-            .with_context(|| format!("reading indexed source {relative}"))?;
-        sources.insert(relative, Arc::<str>::from(source));
+/// Index artifacts are keyed by (length, mtime): only indexers write them, through
+/// an atomic rename. Sources are keyed by content because anything may edit them.
+fn artifact_stat(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+fn cache_key(
+    repo: &Path,
+    index_paths: &[PathBuf],
+    policy_path: &Path,
+    digests: &BTreeMap<String, Digest>,
+) -> Digest {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(repo.as_os_str().as_encoded_bytes());
+    for (file, digest) in digests {
+        hasher.update(file.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(digest);
     }
-    Ok(sources)
+    for path in index_paths {
+        hasher.update(path.as_os_str().as_encoded_bytes());
+        hasher.update(format!("{:?}", artifact_stat(path)).as_bytes());
+        for side in [index::stamp_path(path), index::failure_path(path)] {
+            hasher.update(&std::fs::read(side).unwrap_or_default());
+            hasher.update(&[0]);
+        }
+    }
+    for path in [
+        policy_path.to_path_buf(),
+        repo.join(crate::baseline::BASELINE_FILE),
+    ] {
+        hasher.update(&std::fs::read(path).unwrap_or_default());
+        hasher.update(&[0]);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 fn snapshot_id(
@@ -272,7 +287,7 @@ fn snapshot_id(
     for index_path in index_paths {
         hasher.update(index_path.to_string_lossy().as_bytes());
         hasher.update(&[0]);
-        hash_file(&mut hasher, index_path)?;
+        hasher.update(&index::hash_source(index_path)?);
     }
     for (relative, source) in sources {
         hasher.update(relative.as_bytes());
@@ -289,10 +304,87 @@ fn snapshot_id(
         );
         hasher.update(&[0]);
         if path.exists() {
-            hash_file(&mut hasher, path)?;
+            hasher.update(&index::hash_source(path)?);
         }
     }
     Ok(SnapshotId(hasher.finalize().to_hex().to_string()))
+}
+
+/// Per-document states plus the reasons, if any, the snapshot is not current.
+fn coverage(
+    digests: &BTreeMap<String, Digest>,
+    indexed: &BTreeSet<String>,
+    stamps: &[Stamp],
+    failures: &[Stamp],
+) -> (BTreeMap<String, DocumentState>, Vec<String>) {
+    let vouched = |stamps: &[Stamp], file: &String, digest: &Digest| {
+        stamps
+            .iter()
+            .any(|stamp| stamp.files.get(file) == Some(digest))
+    };
+    let mut degraded = BTreeMap::new();
+    let (mut changed, mut unindexed) = (Vec::new(), Vec::new());
+    for (file, digest) in digests {
+        let fresh = vouched(stamps, file, digest);
+        match (indexed.contains(file), fresh) {
+            (true, true) => {}
+            (true, false) => {
+                degraded.insert(file.clone(), DocumentState::Stale);
+                changed.push(file.as_str());
+            }
+            (false, fresh) => {
+                degraded.insert(file.clone(), DocumentState::Unresolved);
+                if !fresh && !vouched(failures, file, digest) {
+                    unindexed.push(file.as_str());
+                }
+            }
+        }
+    }
+    let removed = indexed
+        .iter()
+        .filter(|file| !digests.contains_key(*file))
+        .count();
+    let summary = |count: usize, what: &str, first: Option<&&str>| {
+        format!(
+            "{count} {what}{}",
+            first
+                .map(|file| format!(" (first: {file})"))
+                .unwrap_or_default()
+        )
+    };
+    let mut reasons = Vec::new();
+    if !changed.is_empty() {
+        reasons.push(summary(
+            changed.len(),
+            "document(s) not vouched for by an index content stamp",
+            changed.first(),
+        ));
+    }
+    if !unindexed.is_empty() {
+        reasons.push(summary(
+            unindexed.len(),
+            "document(s) not yet indexed",
+            unindexed.first(),
+        ));
+    }
+    if removed > 0 {
+        reasons.push(format!("{removed} indexed document(s) no longer exist"));
+    }
+    reasons.extend(failures.iter().filter_map(|failure| {
+        let active = failure
+            .files
+            .iter()
+            .all(|(file, digest)| digests.get(file) == Some(digest));
+        failure.error.as_ref().filter(|_| active).cloned()
+    }));
+    (degraded, reasons)
+}
+
+fn stamps_of(index_paths: &[PathBuf], side: fn(&Path) -> PathBuf) -> Vec<Stamp> {
+    index_paths
+        .iter()
+        .filter_map(|path| Stamp::read(&side(path)))
+        .collect()
 }
 
 fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
@@ -300,62 +392,62 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
         .repo
         .canonicalize()
         .with_context(|| format!("canonicalizing repository root {}", request.repo.display()))?;
-    let mut index_paths = index::index_paths(&repo, request.index);
     let policy_path = request
         .policy
         .map(Path::to_path_buf)
         .unwrap_or_else(|| repo.join("slop.toml"));
+    let files = index::discover_sources(&repo);
+    let (mut digests, read) = digest_sources(&repo, &files)?;
 
+    let mut index_paths = index::index_paths_for(&repo, request.index, &files);
+    let mut reindex_errors = Vec::new();
     if request.freshness == Freshness::Reindex {
-        index_paths = index::ensure_indexes(&repo, request.index)?;
-        let stale = index_paths
-            .iter()
-            .filter_map(|path| index::index_staleness(&repo, path))
-            .collect::<Vec<_>>();
+        let stale = index::stale_indexers(
+            &digests,
+            &stamps_of(&index_paths, index::stamp_path),
+            &stamps_of(&index_paths, index::failure_path),
+        );
         if !stale.is_empty() {
-            eprintln!("slop: {} — reindexing detected languages", stale.join("; "));
-            index::run_scip_index(&repo, request.index)?;
-            index_paths = index::index_paths(&repo, request.index);
+            let labels: Vec<_> = stale.iter().map(|indexer| indexer.label()).collect();
+            eprintln!(
+                "slop: reindexing {} (content changed since indexing)",
+                labels.join(", ")
+            );
+            reindex_errors = index::reindex(&repo, request.index, &files, &stale);
+            reindex_errors
+                .iter()
+                .for_each(|error| eprintln!("warning: {error}"));
+            index_paths = index::index_paths_for(&repo, request.index, &files);
         }
     }
-    let missing: Vec<_> = index_paths.iter().filter(|path| !path.exists()).collect();
-    if !missing.is_empty() {
+    index_paths.retain(|path| path.exists());
+    if index_paths.is_empty() {
+        let cause = if reindex_errors.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", reindex_errors.join("; "))
+        };
         bail!(
-            "missing SCIP index artifact(s): {} — generate them with:\n  slop index {}",
-            missing
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
+            "no usable SCIP index{cause} — generate one with:\n  slop index {}",
             repo.display(),
         );
     }
 
-    let stale_reasons: Vec<_> = index_paths
-        .iter()
-        .filter_map(|path| index::index_staleness(&repo, path))
-        .collect();
-    let stale_reason = (!stale_reasons.is_empty()).then(|| stale_reasons.join("; "));
-    if request.freshness == Freshness::Warn {
-        if let Some(reason) = &stale_reason {
-            eprintln!("warning: {reason}");
-        }
-    }
-    let freshness = stale_reason
-        .map(|reason| SnapshotFreshness::Stale { reason })
-        .unwrap_or(SnapshotFreshness::Current);
-
-    let before = cache_key(&repo, &index_paths, &policy_path)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "index metadata unavailable"))?;
+    let key = cache_key(&repo, &index_paths, &policy_path, &digests);
     if let Some(snapshot) = CACHE.lock().ok().and_then(|cache| {
         cache
             .as_ref()
-            .filter(|(key, _)| key == &before)
+            .filter(|(cached, _)| cached == &key)
             .map(|(_, value)| value.clone())
     }) {
         return Ok(snapshot);
     }
 
+    let sources = collect_sources(&repo, &mut digests, read)?;
+    let key = cache_key(&repo, &index_paths, &policy_path, &digests);
+    let artifacts: Vec<_> = index_paths.iter().map(|path| artifact_stat(path)).collect();
+    let stamps = stamps_of(&index_paths, index::stamp_path);
+    let failures = stamps_of(&index_paths, index::failure_path);
     let resolver = IndexSet::load(&index_paths)?;
     if resolver.definition_count() == 0 {
         bail!(
@@ -363,25 +455,38 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
             repo.display(),
         );
     }
-    let mut built = build::build_graph(&resolver);
-    effects::infer_effects(&mut built);
     let indexed_files: BTreeSet<String> =
         resolver.files().into_iter().map(str::to_string).collect();
-    let sources = capture_sources(&repo, &indexed_files)?;
+    let (degraded, reasons) = coverage(&digests, &indexed_files, &stamps, &failures);
+    let freshness = if reasons.is_empty() {
+        SnapshotFreshness::Current
+    } else {
+        let reason = reasons.join("; ");
+        if request.freshness == Freshness::Warn {
+            eprintln!("warning: SCIP evidence is partial — {reason}");
+        }
+        SnapshotFreshness::Stale { reason }
+    };
+    let mut built = build::build_graph(&resolver);
+    effects::infer_effects(&mut built);
     let facts = source::parse_corpus(&sources);
     let policy = Policy::load_file(&policy_path)?;
     let baseline = Baseline::load(&repo)?;
     let id = snapshot_id(&repo, &index_paths, &policy_path, &sources)?;
-    let after = cache_key(&repo, &index_paths, &policy_path)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "index metadata unavailable"))?;
-    if before != after {
-        bail!("repository changed while capturing analysis; retry the command");
+    if index_paths
+        .iter()
+        .map(|path| artifact_stat(path))
+        .ne(artifacts)
+    {
+        bail!("an index was rewritten while capturing analysis; retry the command");
     }
 
     let snapshot = Arc::new(RepositorySnapshot {
         id,
         repo,
         freshness,
+        degraded,
+        digests,
         built,
         facts,
         sources,
@@ -392,7 +497,7 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
         neighborhood: OnceLock::new(),
     });
     if let Ok(mut cache) = CACHE.lock() {
-        *cache = Some((after, snapshot.clone()));
+        *cache = Some((key, snapshot.clone()));
     }
     Ok(snapshot)
 }
@@ -406,17 +511,156 @@ mod tests {
         TempFixture::new(name)
     }
 
+    fn warn(repo: &Path) -> CaptureRequest<'_> {
+        CaptureRequest {
+            repo,
+            index: None,
+            policy: None,
+            freshness: Freshness::Warn,
+        }
+    }
+
     #[test]
     fn repeated_capture_has_stable_identity() {
         let repo = fixture("toy_repo");
+        let first = RepositorySnapshot::capture(warn(&repo)).expect("first capture");
+        let second = RepositorySnapshot::capture(warn(&repo)).expect("second capture");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged content is a cache hit"
+        );
+        assert_eq!(first.freshness(), &SnapshotFreshness::Current);
+    }
+
+    /// Same length, backdated mtime, different bytes: the old metadata key
+    /// served the obsolete snapshot. Content identity must not.
+    #[test]
+    fn a_backdated_same_length_edit_is_a_new_snapshot() {
+        let repo = fixture("toy_repo");
+        let first = RepositorySnapshot::capture(warn(&repo)).expect("first capture");
+        let (file, source) = first
+            .sources
+            .iter()
+            .find(|(_, source)| source.contains("self"))
+            .map(|(file, source)| (file.clone(), source.to_string()))
+            .expect("a source using self");
+        let path = repo.join(&file);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, source.replacen("self", "selg", 1)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let second = RepositorySnapshot::capture(warn(&repo)).expect("second capture");
+        assert_ne!(first.id(), second.id());
+        assert_eq!(second.document_state(&file), DocumentState::Stale);
+        assert!(matches!(
+            second.freshness(),
+            SnapshotFreshness::Stale { .. }
+        ));
+        let other = second
+            .sources
+            .keys()
+            .find(|other| **other != file)
+            .expect("second file");
+        assert_eq!(second.document_state(other), DocumentState::Resolved);
+    }
+
+    #[test]
+    fn coverage_separates_stale_unindexed_and_excluded() {
+        let digests = BTreeMap::from([
+            ("a.py".to_string(), [1; 32]),
+            ("b.py".to_string(), [2; 32]),
+            ("c.py".to_string(), [3; 32]),
+            ("d.py".to_string(), [4; 32]),
+        ]);
+        let indexed = BTreeSet::from(["a.py".to_string(), "b.py".to_string()]);
+        let stamp = Stamp {
+            files: BTreeMap::from([
+                ("a.py".to_string(), [1; 32]),
+                ("b.py".to_string(), [9; 32]),
+                ("c.py".to_string(), [3; 32]),
+            ]),
+            error: None,
+        };
+        let (degraded, reasons) = coverage(&digests, &indexed, &[stamp], &[]);
+        assert_eq!(degraded.get("a.py"), None);
+        assert_eq!(degraded.get("b.py"), Some(&DocumentState::Stale));
+        assert_eq!(degraded.get("c.py"), Some(&DocumentState::Unresolved));
+        assert_eq!(degraded.get("d.py"), Some(&DocumentState::Unresolved));
+        assert_eq!(
+            reasons.len(),
+            2,
+            "c.py was excluded by its indexer, not missed: {reasons:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// `SLOP_BENCH_REPO=<repo> cargo test --release -p slop-analyze warm_capture -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual benchmark"]
+    fn warm_capture() {
+        let repo = PathBuf::from(std::env::var("SLOP_BENCH_REPO").expect("SLOP_BENCH_REPO"));
         let request = || CaptureRequest {
             repo: &repo,
             index: None,
             policy: None,
             freshness: Freshness::Warn,
         };
-        let first = RepositorySnapshot::capture(request()).expect("first capture");
-        let second = RepositorySnapshot::capture(request()).expect("second capture");
-        assert_eq!(first.id(), second.id());
+        let start = std::time::Instant::now();
+        let first = RepositorySnapshot::capture(request()).expect("cold capture");
+        eprintln!(
+            "cold capture {:?} ({} sources)",
+            start.elapsed(),
+            first.sources.len()
+        );
+        let mut samples: Vec<_> = (0..50)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                let warm = RepositorySnapshot::capture(request()).expect("warm capture");
+                assert!(Arc::ptr_eq(&first, &warm));
+                start.elapsed()
+            })
+            .collect();
+        samples.sort();
+        eprintln!(
+            "warm capture p50={:?} p95={:?} max={:?}",
+            samples[24], samples[47], samples[49]
+        );
+    }
+}
+
+#[cfg(test)]
+mod bench_parts {
+    use super::*;
+
+    #[test]
+    #[ignore = "manual benchmark"]
+    fn capture_parts() {
+        let repo = PathBuf::from(std::env::var("SLOP_BENCH_REPO").expect("SLOP_BENCH_REPO"));
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            let mut samples: Vec<_> = (0..30)
+                .map(|_| {
+                    let s = std::time::Instant::now();
+                    f();
+                    s.elapsed()
+                })
+                .collect();
+            samples.sort();
+            eprintln!("{label}: p50={:?}", samples[15]);
+        };
+        let files = index::discover_sources(&repo);
+        time("discover", &mut || {
+            index::discover_sources(&repo);
+        });
+        time("digest (warm)", &mut || {
+            digest_sources(&repo, &files).unwrap();
+        });
     }
 }

@@ -29,7 +29,7 @@ impl TempFixture {
         copy_sources(source, &path).expect("copy fixture sources");
         let index = path.join("index.scip");
         std::fs::copy(source.join("index.scip"), &index).expect("copy fixture index");
-        slop_analyze::index::write_stamp(&path, &index);
+        slop_analyze::index::write_stamp(&path, &index).expect("stamp fixture index");
         Self(path)
     }
 }

@@ -206,10 +206,15 @@ pub fn build_captured_envelope(
     sources: &BTreeMap<String, Arc<str>>,
     target_entity: &str,
     config: &EnvelopeConfig,
-) -> Vec<EnvelopeItem> {
-    build_envelope_with(built, facts, target_entity, config, |entity| {
+    resolved: impl Fn(&str) -> bool,
+) -> (Vec<EnvelopeItem>, usize) {
+    let mut items = build_envelope_with(built, facts, target_entity, config, |entity| {
         render_captured(sources, entity)
-    })
+    });
+    let before = items.len();
+    items.retain(|item| resolved(&item.file));
+    let omitted = before - items.len();
+    (items, omitted)
 }
 
 fn build_envelope_with<F>(

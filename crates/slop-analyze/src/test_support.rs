@@ -20,7 +20,7 @@ impl TempFixture {
         let index = destination.join("index.scip");
         std::fs::copy(source.join("index.scip"), &index)
             .expect("copy fixture index after sources");
-        crate::index::write_stamp(&destination, &index);
+        crate::index::write_stamp(&destination, &index).expect("stamp fixture index");
         Self(destination)
     }
 }

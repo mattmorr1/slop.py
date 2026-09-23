@@ -4,9 +4,9 @@ use serde::Serialize;
 
 use crate::compress::{self, CompressConfig, CompressStats};
 use crate::envelope::{self, EnvelopeConfig, EnvelopeItem};
-use crate::snapshot::{RepositorySnapshot, SnapshotFreshness, SnapshotId};
+use crate::snapshot::{DocumentState, RepositorySnapshot, SnapshotFreshness, SnapshotId};
 
-pub const CONTEXT_SCHEMA_VERSION: u32 = 1;
+pub const CONTEXT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct ContextRequest<'a> {
@@ -32,6 +32,8 @@ pub struct ContextArtifact {
     pub edit_zone_hops: usize,
     pub estimated_tokens: usize,
     pub items: Vec<EnvelopeItem>,
+    /// Selected entities left out because their document is not resolved.
+    pub omitted_unresolved: usize,
     pub fallback: Option<ContextFallback>,
 }
 
@@ -51,15 +53,14 @@ pub enum ReadContext {
 
 impl RepositorySnapshot {
     pub fn context(&self, request: ContextRequest<'_>) -> ContextArtifact {
-        let fallback = match self.freshness() {
-            SnapshotFreshness::Current => None,
-            SnapshotFreshness::Stale { .. } => {
-                let entity = self
-                    .built
-                    .graph
-                    .node(request.target_entity)
-                    .map(|idx| self.built.graph.entity(idx));
-                let file = entity.map(|value| value.file.clone());
+        let file = self
+            .built
+            .graph
+            .node(request.target_entity)
+            .map(|idx| self.built.graph.entity(idx).file.clone());
+        let fallback = match file.as_deref().map(|path| self.document_state(path)) {
+            None | Some(DocumentState::Resolved) => None,
+            Some(_) => {
                 let text = file
                     .as_ref()
                     .and_then(|path| self.sources.get(path))
@@ -71,7 +72,7 @@ impl RepositorySnapshot {
                 })
             }
         };
-        let items = if fallback.is_none() {
+        let (items, omitted_unresolved) = if fallback.is_none() {
             envelope::build_captured_envelope(
                 &self.built,
                 &self.facts,
@@ -81,9 +82,10 @@ impl RepositorySnapshot {
                     token_budget: request.token_budget,
                     edit_zone_hops: request.edit_zone_hops,
                 },
+                |file| self.document_state(file) == DocumentState::Resolved,
             )
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
         let fallback = if fallback.is_none() && items.is_empty() {
             Some(ContextFallback {
@@ -111,6 +113,7 @@ impl RepositorySnapshot {
             edit_zone_hops: request.edit_zone_hops,
             estimated_tokens,
             items,
+            omitted_unresolved,
             fallback,
         }
     }
@@ -129,7 +132,8 @@ impl RepositorySnapshot {
         if source.lines().count() < config.min_lines {
             return verbatim("small_file");
         }
-        if !matches!(self.freshness(), SnapshotFreshness::Current) {
+        let resolved = |file: &str| self.document_state(file) == DocumentState::Resolved;
+        if !resolved(rel_file) || !edit_files.iter().all(|file| resolved(file)) {
             return verbatim("stale_index");
         }
         if self

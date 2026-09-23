@@ -139,6 +139,10 @@ impl ScipResolver {
         self.definitions.len()
     }
 
+    pub fn document_count(&self) -> usize {
+        self.occurrences_by_file.len()
+    }
+
     /// Definition of a document-scoped `local N` symbol within `file`.
     pub fn local_definition_of(&self, file: &str, symbol: &str) -> Option<&Definition> {
         self.local_definitions
