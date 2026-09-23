@@ -57,7 +57,20 @@ budget; across targets it averages 3–6% of spent tokens.
 
 **Consequences.** On httpx the model is level with BM25 rather than ahead, and
 on requests within noise of it; the pooled lead comes from vigil and flask.
-Per-repository calibration (roadmap R3) is the next lever, and a real
-competitor arm (Aider's repo map, R2) the next test. Co-change is a proxy for
-what an agent needs, not the need itself; an end-to-end run (R8) is still
-required before claiming agents edit better with this context.
+Per-repository calibration (roadmap R3) is the next lever.
+
+**Competitors (bench/README.md).** Aider's repo map alone recovers 9.9% at 4k;
+Aider as used (target file in chat plus map) reaches 59.3% but spends 8.8k
+tokens doing it, and at 16k, inside its budget, 78.0% against 89.2% for this
+selector filling the budget. bge-small embeddings trail BM25. The model is
+calibrated within a factor of two across bins (ECE 0.0010), overconfident in
+the 0.001–0.01 band and the top bin.
+
+**Adaptive default (d473695).** Candidates beyond the edit zone below
+p = 0.01 are not shown. It trades recall for precision: at 8k, 95% of the
+recall, 20% fewer tokens, 2.5x precision, and no significant lead over BM25
+at >= 8k. `min_probability: 0` restores filling the budget.
+
+Co-change is a proxy for what an agent needs, not the need itself; an
+end-to-end run (R8) is still required before claiming agents edit better with
+this context.

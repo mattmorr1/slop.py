@@ -144,6 +144,67 @@ signature is needed even though callees rarely co-change). vigil p95 falls to
 restores filling the budget. Adaptive arms are Python-only so far.
 
 
+### Competitors, paired differences and calibration (tree 25c757e)
+
+Same 1,326 tasks. Aider (aider-chat 0.86.1, `bench/aider_arm.py`; scipy 1.18.1
+because the pinned wheel does not load on this macOS) and bge-small embeddings
+(`bench/embedding_arm.py`). The ledger entry's `commit` field reads an httpx
+sha: a loop rebound the variable (fixed); the tree measured was 25c757e, clean.
+
+| pooled recall (tokens spent) | @1k | @4k | @8k | @16k |
+| --- | ---: | ---: | ---: | ---: |
+| slop, fill the budget | 45.9% (894) | 66.2% (3,692) | 77.0% (7,585) | 89.2% (15,341) |
+| slop, adaptive (default) | 44.9% (862) | 63.6% (3,188) | 73.1% (6,037) | 81.0% (10,159) |
+| Aider, file in chat + map | 57.0% (8,119) | 59.3% (8,837) | 64.5% (10,775) | 78.0% (16,145) |
+| Aider, map alone | 3.5% (1,002) | 9.9% (3,866) | 20.9% (8,012) | 32.6% (15,644) |
+| BM25 | 41.9% (998) | 59.3% (3,997) | 69.6% (7,997) | 81.3% (15,899) |
+| embeddings, bge-small | 35.6% (998) | 51.8% (3,998) | 62.0% (7,998) | 71.7% (15,909) |
+
+Paired recall difference, adaptive default minus arm (points, 95% CI):
+
+| arm | @1k | @4k | @8k | @16k |
+| --- | ---: | ---: | ---: | ---: |
+| BM25 | +3.0 [−0.3, +6.5] | +4.3 [+0.7, +8.2] | +3.5 [−0.8, +7.5] | −0.3 [−3.9, +3.4] |
+| proximity | +4.6 [+2.7, +6.7] | +6.6 [+3.6, +9.8] | +0.9 [−3.4, +5.2] | −2.3 [−5.5, +1.3] |
+| embeddings | +9.4 [+5.6, +13.1] | +11.8 [+7.4, +16.0] | +11.1 [+6.1, +15.7] | +9.3 [+5.1, +13.1] |
+| Aider, file + map | −12.1 [−17.2, −7.6] | +4.3 [−0.6, +8.7] | +8.6 [+3.3, +13.6] | +3.0 [−0.7, +6.5] |
+| slop, fill the budget | −1.0 [−2.0, −0.2] | −2.6 [−4.2, −1.2] | −3.9 [−6.0, −2.1] | −8.2 [−10.7, −5.6] |
+
+- **Aider's number at small budgets is the whole file, not the map.** The
+  target's file is in the chat, so at 1k it spends 8.1k tokens and exceeds
+  its own 15% tolerance on 91% of targets. At matched spend slop leads: Aider
+  at "4k" spends 8.8k for 59.3%; slop filling 8k spends 7.6k for 77.0%. At
+  16k, where Aider stays in budget, slop filling it gets 89.2% to 78.0%.
+- **The map alone recovers 10% at 4k.** Global PageRank over referenced
+  definitions is the wrong signal for "what does this edit need", and the
+  map excludes the file being edited, where most co-change lives.
+- **Where Aider wins: httpx** (67.1% vs 57.6% at 4k), whose co-changes are
+  mostly within one file, which Aider shows whole.
+- **Embeddings lose to BM25** at every budget (51.8% vs 59.3% at 4k):
+  identifier overlap beats semantic similarity for co-change.
+- **The adaptive default gives up its significant lead over BM25 at >= 8k**
+  by design (it stops early: 25% fewer tokens, 1.9x precision at 8k). Filling
+  the budget keeps a 7–8 point lead. Which default is right depends on what a
+  missing item costs the agent, which only an end-to-end run measures.
+
+Calibration over 3.5M out-of-sample (task, candidate) pairs, ECE 0.0010:
+
+| predicted p | pairs | mean predicted | observed |
+| --- | ---: | ---: | ---: |
+| < 0.001 | 2,359,205 | 0.0003 | 0.0003 |
+| 0.001–0.003 | 593,487 | 0.0017 | 0.0004 |
+| 0.003–0.01 | 270,390 | 0.0055 | 0.0029 |
+| 0.01–0.03 | 205,655 | 0.0167 | 0.0116 |
+| 0.03–0.1 | 35,344 | 0.0513 | 0.0624 |
+| 0.1–0.3 | 10,742 | 0.1715 | 0.1391 |
+| 0.3–0.6 | 3,007 | 0.4174 | 0.4024 |
+| > 0.6 | 614 | 0.6922 | 0.3958 |
+
+Well calibrated where it matters for ranking, overconfident in two places:
+the 0.001–0.01 band (about 2x, so the p = 0.01 threshold is roughly an
+observed 0.5–1%) and the top bin (0.69 predicted, 0.40 observed; 614 pairs).
+The ECE is small mostly because the lowest bin holds two thirds of the pairs.
+
 ## `compression_bench.py` — token-efficiency A/B
 
 Quantifies the deterministic half of the harness thesis (D11): zoned

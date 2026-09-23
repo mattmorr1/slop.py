@@ -235,7 +235,10 @@ gate unless it is independent.
 
 **R1 — Calibrated context port. Done (7dc5255, ADR 0005, B4 after-run).**
 
-**R2 — Real competitor arms (in progress, 28aaa48).** Aider's RepoMap
+**R2 — Real competitor arms. Done (28aaa48; results in bench/README.md).**
+Aider as used reaches 59.3% at 4k by spending 8.8k tokens (whole target file);
+map alone 9.9%; embeddings below BM25. Adaptive default: no significant lead
+over BM25 at >= 8k (open decision: default threshold vs fill). Aider's RepoMap
 (aider-chat 0.86.1; scipy upgraded to 1.18.1 because the pinned wheel does not
 load on this macOS) as `aider-map` and `aider-chat`, and a bge-small embedding
 retriever, scored on B4's own tasks via `--arm`. *Gate:* result recorded
