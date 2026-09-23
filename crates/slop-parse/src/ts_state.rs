@@ -24,6 +24,11 @@ pub enum Tok<'a> {
     Other,
 }
 
+/// One `kind \x01 value \x02` record; byte-identical to the former `format!` encoding.
+fn field(hasher: &mut blake3::Hasher, kind: &str, value: &[u8]) {
+    hasher.update(kind.as_bytes()).update(b"\x01").update(value).update(b"\x02");
+}
+
 #[derive(Default)]
 pub struct HashState {
     pub exact: blake3::Hasher,
@@ -44,21 +49,21 @@ impl HashState {
     pub fn leaf(&mut self, kind: &str, text: &str, line: u32, tok: Tok) {
         self.code_lines.insert(line);
         self.significant += 1;
-        // Byte streams are unchanged from the former `format!` encoding, so every
-        // persisted hash is stable; only the three allocations per token are gone.
-        let field = |hasher: &mut blake3::Hasher, value: &[u8]| {
-            hasher.update(kind.as_bytes()).update(b"\x01").update(value).update(b"\x02");
-        };
-        field(&mut self.exact, text.as_bytes());
+        field(&mut self.exact, kind, text.as_bytes());
 
         // Structural: names *and* literals collapse — "same shape, renamed
         // variables / different constants".
         if matches!(tok, Tok::Bound(_) | Tok::Free | Tok::Literal) {
             self.structural.update(kind.as_bytes()).update(b"\x02");
         } else {
-            field(&mut self.structural, text.as_bytes());
+            field(&mut self.structural, kind, text.as_bytes());
         }
+        self.alpha_leaf(kind, text, tok);
+    }
 
+    /// Fold a token into the α-hash only: signature tokens (defaults, annotations,
+    /// decorators) change what a function means but not its body hashes.
+    pub fn alpha_leaf(&mut self, kind: &str, text: &str, tok: Tok) {
         match tok {
             Tok::Bound(name) => {
                 let next = self.bound_index.len() as u32;
@@ -70,11 +75,11 @@ impl HashState {
                 let mut cursor = std::io::Cursor::new(&mut digits[..]);
                 let _ = std::io::Write::write_fmt(&mut cursor, format_args!("#{idx}"));
                 let len = cursor.position() as usize;
-                field(&mut self.alpha, &digits[..len]);
+                field(&mut self.alpha, kind, &digits[..len]);
             }
             // Everything else contributes verbatim: a different callee, a
             // different constant, or different syntax is a different function.
-            _ => field(&mut self.alpha, text.as_bytes()),
+            _ => field(&mut self.alpha, kind, text.as_bytes()),
         }
     }
 

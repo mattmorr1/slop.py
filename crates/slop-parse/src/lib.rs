@@ -6,7 +6,7 @@
 //! Tier-2 hash = token kinds only, with names/literals collapsed to
 //! placeholders: "same shape, renamed variables / different constants."
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use ruff_python_ast::token::{Token, TokenKind};
@@ -20,6 +20,7 @@ mod js;
 pub mod names;
 pub mod resources;
 mod rust;
+mod scope;
 mod ts_state;
 
 /// A source language slop can produce per-function facts for. The parser-based
@@ -179,71 +180,11 @@ fn is_trivia(kind: TokenKind) -> bool {
 }
 
 /// Assignment operators: the token after a name that binds it.
-fn is_assign_op(kind: TokenKind) -> bool {
-    matches!(
-        kind,
-        TokenKind::Equal
-            | TokenKind::PlusEqual
-            | TokenKind::MinusEqual
-            | TokenKind::StarEqual
-            | TokenKind::SlashEqual
-            | TokenKind::DoubleSlashEqual
-            | TokenKind::PercentEqual
-            | TokenKind::DoubleStarEqual
-            | TokenKind::AmperEqual
-            | TokenKind::VbarEqual
-            | TokenKind::CircumflexEqual
-            | TokenKind::LeftShiftEqual
-            | TokenKind::RightShiftEqual
-            | TokenKind::ColonEqual
-            | TokenKind::AtEqual
-    )
-}
-
-/// Names this function binds locally: its parameters, plus anything it assigns,
-/// iterates or aliases. Deliberately incomplete — a name we cannot prove is
-/// bound is treated as free, which makes the α-hash under-match rather than
-/// over-match, and under-matching a *deny* gate is the safe direction.
-fn bound_names(func: &ast::StmtFunctionDef, body: &[&Token], source: &str) -> HashSet<String> {
-    let p = &func.parameters;
-    let mut out: HashSet<String> = p
-        .posonlyargs
-        .iter()
-        .chain(p.args.iter())
-        .chain(p.kwonlyargs.iter())
-        .map(|a| a.parameter.name.to_string())
-        .collect();
-    for extra in [p.vararg.as_deref(), p.kwarg.as_deref()].into_iter().flatten() {
-        out.insert(extra.name.to_string());
-    }
-    for (i, token) in body.iter().enumerate() {
-        if token.kind() != TokenKind::Name {
-            continue;
-        }
-        // `obj.attr = x` binds nothing local: `attr` belongs to `obj`.
-        let after_dot = i > 0 && body[i - 1].kind() == TokenKind::Dot;
-        let binds = body
-            .get(i + 1)
-            .is_some_and(|t| is_assign_op(t.kind()))
-            || (i > 0 && matches!(body[i - 1].kind(), TokenKind::For | TokenKind::As));
-        if binds && !after_dot {
-            out.insert(source[token.range()].to_string());
-        }
-    }
-    out
-}
-
-/// Classify a body token for the three hashes.
-fn classify<'a>(
-    kind: TokenKind,
-    text: &'a str,
-    after_dot: bool,
-    bound: &HashSet<String>,
-) -> Tok<'a> {
+/// Classify a token for the hashes. `local` comes from [`scope::locals`]: the AST, not
+/// token adjacency, decides binding, so keyword and attribute names stay free.
+fn classify(kind: TokenKind, text: &str, local: bool) -> Tok<'_> {
     match kind {
-        // An attribute is named by its owner, not by this scope, so it stays
-        // free even when a local happens to share the name.
-        TokenKind::Name if !after_dot && bound.contains(text) => Tok::Bound(text),
+        TokenKind::Name if local => Tok::Bound(text),
         TokenKind::Name => Tok::Free,
         TokenKind::Int
         | TokenKind::Float
@@ -425,16 +366,35 @@ fn function_facts(
     let mut comment_lines = 0u32;
     let mut code_line_set: Vec<u32> = Vec::new();
 
-    // Body tokens once, so binding positions can be read from neighbours.
     let body_tokens: Vec<&Token> = tokens
         .iter()
         .filter(|t| t.range().start() >= body.start() && t.range().end() <= body.end())
         .collect();
-    let bound = bound_names(func, &body_tokens, source);
+    let locals = scope::locals(func);
     let mut hasher = ts_state::HashState::default();
-
     let mut kind_names: HashMap<TokenKind, String> = HashMap::new();
-    for (i, token) in body_tokens.iter().enumerate() {
+
+    // The signature (decorators, defaults, annotations, parameter kinds) is part of
+    // what the function means, so it feeds the α-hash; its own name does not.
+    let signature_start = func
+        .decorator_list
+        .iter()
+        .map(|decorator| decorator.start())
+        .fold(func.start(), TextSize::min);
+    let signature = tokens.iter().filter(|t| {
+        t.start() >= signature_start && t.end() <= body.start() && t.range() != func.name.range()
+    });
+    for token in signature {
+        let kind = token.kind();
+        if is_trivia(kind) || matches!(kind, TokenKind::Comment | TokenKind::Indent | TokenKind::Dedent) {
+            continue;
+        }
+        let text = &source[token.range()];
+        let name = kind_names.entry(kind).or_insert_with(|| format!("{kind:?}"));
+        hasher.alpha_leaf(name, text, classify(kind, text, locals.is_local(token.start(), text)));
+    }
+
+    for token in &body_tokens {
         let kind = token.kind();
         if kind == TokenKind::Comment {
             comment_lines += 1;
@@ -451,9 +411,8 @@ fn function_facts(
             complexity += 1;
         }
         let text = &source[token.range()];
-        let after_dot = i > 0 && body_tokens[i - 1].kind() == TokenKind::Dot;
         let name = kind_names.entry(kind).or_insert_with(|| format!("{kind:?}"));
-        hasher.leaf(name, text, line, classify(kind, text, after_dot, &bound));
+        hasher.leaf(name, text, line, classify(kind, text, locals.is_local(token.start(), text)));
     }
     let significant = hasher.significant;
 
@@ -858,13 +817,14 @@ def documented(x):
 mod golden {
     /// Pins the hash byte encoding: baselines and sidecars persist these digests,
     /// so an optimisation that changes a value is a breaking change, not a refactor.
+    /// Python α changed once, deliberately, for α v2 (AST scopes plus signature).
     #[test]
     fn hash_encoding_is_stable() {
         let py = "def f(a, b):\n    total = a + b * 30\n    for item in a:\n        total += len(str(item))\n    return total\n";
         let js = "function f(a, b) {\n  let total = a + b * 30;\n  for (const item of a) { total += String(item).length; }\n  return total;\n}\n";
         let rs = "fn f(a: &[u32], b: u32) -> u32 {\n    let mut total = b * 30;\n    for item in a { total += item.count_ones(); }\n    total\n}\n";
         let expected = [
-            (crate::Language::Python, py, ["6c5fa27bdcbd5f0c548616f3c2170af19fcca37e3794e4950bb9b3461796ac39", "3d24c11c84e45dfffc57ba276a38cc2304d43a49454c0dd8c28591dc8a3c633e", "f0caade0cfa2d6e48477acd43b8360fa61f09df6dc004aa4e9d7f4e5690af37e"]),
+            (crate::Language::Python, py, ["6c5fa27bdcbd5f0c548616f3c2170af19fcca37e3794e4950bb9b3461796ac39", "3d24c11c84e45dfffc57ba276a38cc2304d43a49454c0dd8c28591dc8a3c633e", "dfeac5f5c52fe6c0de997879170cac031f8a09e767d560fce0c40ee70ac3ec1b"]),
             (crate::Language::JavaScript, js, ["c5ce10c9afec66d4090a05e9767fbc5202487111cfc6ed4f37c3a79a9e46db82", "bd3f8582380ef18a02dd762b8dc324b22f22fdce915ee25cf62a6200c60bd8e5", "16b0a58367ecd39aa60a93619206c361fca43658c3126310366ccbe74d105b39"]),
             (crate::Language::Rust, rs, ["1df539fa19211957473fa69706a98cc5f060ce6dd1f1d06df6bc3fdd1a6c77b9", "97d02edf3cb5a4b2c77f0036939383d8b1f92452e2a1c625dacd682479ec4386", "ca505f04679b05cb21ee3553f2ba95c86d374ab7f6f973357bd9e81667ccc12e"]),
         ];
@@ -873,5 +833,67 @@ mod golden {
             let actual = [facts.body_hash.as_str(), &facts.structural_hash, &facts.alpha_hash];
             assert_eq!(actual, [body, structural, alpha], "{language:?}");
         }
+    }
+}
+
+/// α v2: each test is a pair a token-adjacency binder got wrong. Unequal pairs
+/// would let a deny gate refuse a genuinely different function (ADR 0001).
+#[cfg(test)]
+mod alpha_soundness {
+    fn alpha(src: &str) -> String {
+        let facts = crate::analyze_file(src).unwrap();
+        assert!(!facts[0].alpha_hash.is_empty(), "below significance floor:\n{src}");
+        facts[0].alpha_hash.clone()
+    }
+
+    #[test]
+    fn keyword_argument_names_are_not_renameable() {
+        let f = |kw: &str| alpha(&format!("def f(url, limit):\n    response = get(url, {kw}=limit)\n    response.check()\n    return response.json()\n"));
+        assert_ne!(f("timeout"), f("verify"));
+    }
+
+    #[test]
+    fn a_global_declaration_is_not_a_local_binding() {
+        let f = |name: &str| alpha(&format!("def f(xs):\n    global {name}\n    {name} = len(xs) + 1\n    total = {name} * 2 + sum(xs)\n    for item in xs:\n        total += item / 3\n    return total + 7\n"));
+        assert_ne!(f("counter"), f("limit"));
+    }
+
+    #[test]
+    fn defaults_are_part_of_the_function() {
+        let f = |value: &str| alpha(&format!("def f(xs, scale={value}):\n    total = 0\n    for x in xs:\n        total += x * scale\n        total -= x / 2\n    return total + len(xs)\n"));
+        assert_ne!(f("30"), f("60"));
+    }
+
+    #[test]
+    fn a_default_reading_a_global_is_not_the_parameter() {
+        let f = |name: &str| alpha(&format!("def f({name}={name}):\n    total = {name} * 2\n    for item in range(total):\n        total += item\n    return total + 1\n"));
+        assert_ne!(f("left"), f("right"));
+    }
+
+    #[test]
+    fn comprehension_variables_do_not_leak_into_function_scope() {
+        let f = |name: &str| alpha(&format!("def f(xs):\n    ys = [{name} for {name} in xs]\n    total = len(ys) + {name} + 1\n    for item in ys:\n        total += item * 3\n    return total\n"));
+        assert_ne!(f("left"), f("right"));
+    }
+
+    #[test]
+    fn a_bare_import_binds_an_external_name() {
+        let f = |module: &str| alpha(&format!("def f(path):\n    import {module}\n    data = {module}.loads(path)\n    return data.get(\"items\", [])\n"));
+        assert_ne!(f("json"), f("yaml"));
+    }
+
+    #[test]
+    fn decorators_are_part_of_the_function() {
+        let f = |decorator: &str| alpha(&format!("@{decorator}\ndef f(xs):\n    total = 0\n    for x in xs:\n        total += x * 2\n        total -= x / 3\n    return total + len(xs)\n"));
+        assert_ne!(f("cache"), f("retry"));
+    }
+
+    /// The property that justifies the hash at all must survive the tightening.
+    #[test]
+    fn consistent_renames_of_locals_still_match() {
+        let f = |a: &str, b: &str, e: &str| alpha(&format!(
+            "def f({a}, timeout=30):\n    {b}, rest = split({a})\n    try:\n        out = [x * 2 for x in rest]\n    except ValueError as {e}:\n        log({e})\n        out = []\n    return get({b}, timeout=timeout) + out\n"
+        ));
+        assert_eq!(f("path", "head", "err"), f("url", "first", "exc"));
     }
 }
