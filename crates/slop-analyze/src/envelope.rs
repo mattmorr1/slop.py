@@ -1,14 +1,11 @@
-//! Context envelope (D11, M4b): effect-typed relevance scoring + budgeted
-//! greedy packing around an edit locus. This is Aider's repo-map problem
-//! with PageRank swapped for a semantic, effect-typed scorer — global
-//! topological centrality is the wrong signal for "what does *this* edit
-//! need to see."
+//! Context envelope (D11, M4b): what an agent sees around an edit locus. This is
+//! Aider's repo-map problem with PageRank swapped for calibrated relevance:
+//! global centrality is the wrong signal for "what does *this* edit need."
 //!
-//! Score = call/containment distance + type-contract adjacency (same
-//! class/module as the target) + effect-signature relevance (Jaccard) +
-//! convention-exemplar bonus (dominant-pattern channel owners, D8). Pack
-//! greedily by score under a token budget: full fidelity inside the edit
-//! zone (target + its direct neighborhood), skeletons beyond.
+//! Candidates are the target's graph neighbourhood and its directory, each
+//! scored `P(co-change)` by the logistic model in `relevance` (ADR 0005), then
+//! packed by probability per token under a budget: full fidelity inside the
+//! edit zone, skeletons beyond, one unit per E-equivalence class.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -231,11 +228,12 @@ fn estimate_tokens(text: &str) -> usize {
 }
 
 /// Multi-source BFS over proximity edges (Contains/Calls/Imports, undirected):
-/// distance from each node to its *nearest* start. Shared by the envelope
+/// distance from each node to its *nearest* start, for nodes within `max_hops`. Shared by the envelope
 /// (one start = the edit target) and `compress` (many starts = the edit zone).
 pub(crate) fn proximity_distances(
     built: &BuiltGraph,
     starts: &[NodeIndex],
+    max_hops: usize,
 ) -> HashMap<NodeIndex, usize> {
     let graph = &built.graph.graph;
     let mut dist = HashMap::new();
@@ -247,6 +245,9 @@ pub(crate) fn proximity_distances(
     }
     while let Some(n) = queue.pop_front() {
         let d = dist[&n];
+        if d >= max_hops {
+            continue;
+        }
         let mut neighbors = Vec::new();
         for e in graph.edges_directed(n, Direction::Outgoing) {
             if PROXIMITY_EDGES.contains(e.weight()) {
@@ -266,10 +267,6 @@ pub(crate) fn proximity_distances(
         }
     }
     dist
-}
-
-fn bfs_distance(built: &BuiltGraph, start: NodeIndex) -> HashMap<NodeIndex, usize> {
-    proximity_distances(built, &[start])
 }
 
 /// The Contains-parent of `idx` (the class/module a function lives in), if any.
@@ -421,7 +418,7 @@ where
         }
     }
 
-    let distances = bfs_distance(built, target_idx);
+    let distances = proximity_distances(built, &[target_idx], MAX_HOPS);
     let target = built.graph.entity(target_idx);
     let target_dir = directory(&target.file);
     let lexical = relevance.lexical.scores(target_text);
@@ -503,16 +500,22 @@ where
         Selection::Coverage => select_coverage(&candidates, config.token_budget),
         Selection::Ranked => select_ranked(&candidates, config.token_budget),
     };
-    let chosen: HashSet<usize> = picked.iter().map(|(i, _, _)| *i).collect();
+    let mut chosen = vec![false; candidates.len()];
+    picked.iter().for_each(|(i, _, _)| chosen[*i] = true);
+    let mut by_class: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (j, candidate) in candidates.iter().enumerate() {
+        if let Some(class) = &candidate.class {
+            by_class.entry(class.as_str()).or_default().push(j);
+        }
+    }
     for (i, use_fallback, gain) in picked {
         let candidate = &candidates[i];
         let entity = built.graph.entity(candidate.idx);
-        let equivalents = candidate.class.as_ref().map_or_else(Vec::new, |class| {
-            let mut peers: Vec<String> = candidates
+        let equivalents = candidate.class.as_deref().map_or_else(Vec::new, |class| {
+            let mut peers: Vec<String> = by_class[class]
                 .iter()
-                .enumerate()
-                .filter(|(j, other)| !chosen.contains(j) && other.class.as_ref() == Some(class))
-                .map(|(_, other)| built.graph.entity(other.idx).id.clone())
+                .filter(|&&j| !chosen[j])
+                .map(|&j| built.graph.entity(candidates[j].idx).id.clone())
                 .collect();
             peers.sort();
             peers
@@ -668,7 +671,7 @@ mod selection {
 /// Entities one proximity hop (Contains/Calls/Imports, either direction) from `entity`.
 pub fn neighbors(built: &BuiltGraph, entity: &str) -> Vec<String> {
     let Some(start) = built.graph.node(entity) else { return Vec::new() };
-    let mut out: Vec<String> = proximity_distances(built, &[start])
+    let mut out: Vec<String> = proximity_distances(built, &[start], 1)
         .into_iter()
         .filter(|(_, distance)| *distance == 1)
         .map(|(idx, _)| built.graph.entity(idx).id.clone())
@@ -680,7 +683,7 @@ pub fn neighbors(built: &BuiltGraph, entity: &str) -> Vec<String> {
 /// Proximity distance from `entity` to every entity within `max_hops`.
 pub fn distances(built: &BuiltGraph, entity: &str, max_hops: usize) -> Vec<(String, usize)> {
     let Some(start) = built.graph.node(entity) else { return Vec::new() };
-    let mut out: Vec<(String, usize)> = proximity_distances(built, &[start])
+    let mut out: Vec<(String, usize)> = proximity_distances(built, &[start], max_hops)
         .into_iter()
         .filter(|(_, distance)| (1..=max_hops).contains(distance))
         .map(|(idx, distance)| (built.graph.entity(idx).id.clone(), distance))

@@ -127,7 +127,7 @@ pub fn compress_file(
     if starts.is_empty() {
         return plain(0);
     }
-    let dist = proximity_distances(built, &starts);
+    let dist = proximity_distances(built, &starts, config.edit_zone_hops);
     let by_loc = location_index(built);
 
     // Collect (start, end, skeleton) for each out-of-zone function in this file.
