@@ -1,9 +1,11 @@
 # The modularity engine — running plan
 
-> **Status: prospective retrieval built and passing; signal (1) killed.**
+> **Status: prospective retrieval is wired into prewrite assessment; signal (1) killed.**
 > `retrieve.rs` / `slop suggest` answers extend-vs-create *before* code exists —
 > the original question — and found real cross-package duplication in both
-> dogfood repos. One free parameter left (the score threshold) and then placement.
+> dogfood repos. Ranking is integer and deterministic; the conservative
+> `125_000` squared-cosine threshold is enforced by the snapshot-bound MCP and
+> hook paths. The threshold remains an evaluation parameter, not a deny rule.
 >
 > **Signal (1) failed its kill criterion.** Built on SCIP
 > def-use (D20), tri-lingual, and adjudicated against 1184 Python functions in
@@ -442,4 +444,5 @@ benchmark shows inlining wins here") rather than a bare pragma.
 | 2026-07-31 | **M0(c) written and M0 adjudicated. Signal (1) is dead.** 243 tests green. The oracle earned its place immediately: interleaved components were visible only in its line ranges, and reading three findings against real source identified guard chains as the dominant cause — confirmed at 31 of 60. Rust reproduced the failure with a fourth cause (recursive traversal). `split.rs` is retained but unwired; `run_all`'s signature was reverted rather than left carrying an unused parameter. |
 | 2026-07-31 | D13 qualified: minimum cut is only as good as the edge set, and intra-procedural dataflow omits control transfer, shared mutable state and required ordering. The thesis holds at module scale, where the graph carries effects, and fails one scale down — losing exactly the scale-freeness that motivated it. Signal (2) inherits three of the four causes and should not be built as specified. |
 | 2026-07-31 | Option 2 chosen: skip to prospective retrieval. **Built and it passes** — `retrieve.rs` + `slop suggest`. See §5. Three false-positive classes found by reading output and each removed by a principled fix, not a tuned threshold. Found real duplication in both dogfood repos, including cross-package duplication of secrets and database init in vigil. |
-| | **NEXT: pick a score threshold (the one free parameter), then wire it. `PreToolUse` needs a callee sidecar first — retrieval reads the graph, and a 1.2s build has no place on the write path. `validate_change` and the `Stop` sieve can have it today.** |
+| 2026-09-22 | **Prospective retrieval wired.** `assess_write` exposes versioned, snapshot-bound policy and reuse evidence. `SessionStart`/indexing writes a deterministic callee sidecar; `PreToolUse` reads it without rebuilding the graph. Scores are integer parts-per-million and suggestions require at least `125_000`. This remains advisory. |
+| | **NEXT: run the measurement contract in `DEFERRED_RESEARCH.md`; adjust the threshold only from labeled precision/recall evidence. Do not add a daemon, constrained decoder, e-graph, profiler service, or training loop before its gate passes.** |

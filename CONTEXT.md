@@ -65,6 +65,30 @@ A callable the codebase already provides, offered to an agent as an alternative 
 
 ### The harness
 
+**Repository snapshot**:
+An immutable, content-identified generation of indexed source, graph, effect
+signatures, policy, baseline, and parsed facts. Every finding and context
+artifact names the repository snapshot it came from.
+
+**Judgment**:
+The deterministic projection that turns one repository snapshot into ordered
+findings after suppression, submodule exclusion, baseline classification, and
+scope selection. CLI, MCP, LSP, TUI, gate, baseline, and fix share it.
+
+**Context artifact**:
+A deterministic, provenance-bearing selection of full source and contract
+skeletons for one repository snapshot, locus, edit zone, and token budget.
+Stale coverage degrades explicitly to verbatim source.
+
+**Prewrite assessment**:
+A snapshot-bound projection of proposed source into direct policy findings and
+graded reuse suggestions. It may steer a write; suggestions never deny one.
+
+**Repair plan**:
+A schema-versioned, snapshot-bound set of explicit source transformations with
+safety classes and source preconditions. It remains pending until replacement
+judgment succeeds, then commits or restores its journaled originals.
+
 **World model**:
 The codebase facts an agent is given *before* it designs anything — channels, layer rules, the capability index, the config surface. Distinct from a finding, which arrives after a decision was already made.
 
@@ -92,6 +116,9 @@ The direction a codebase actually grows, measured from history: adding cases ver
 - An **Entity** has one **Effect signature**, which is the union of its own **Effects** and its callees'
 - A **Sanctioned channel** is an **Entity** that acquires an **Effect** on everyone else's behalf
 - A **Capability** is an **Entity** proposed for reuse; the **World model** is a budgeted selection of them
+- A **Judgment** and a **Context artifact** name exactly one **Repository snapshot**
+- A **Prewrite assessment** names exactly one **Repository snapshot** and may name zero or more existing **Capabilities**
+- A **Repair plan** names exactly one **Repository snapshot** and settles only after a replacement **Judgment**
 - A **Split candidate** is an **Entity** whose **Interface width** at some internal boundary is small enough that splitting costs less than it saves
 
 ## Example dialogue
@@ -103,7 +130,7 @@ The direction a codebase actually grows, measured from history: adding cases ver
 
 ## Flagged ambiguities
 
-- **"Modularity"** was used to mean three different things at once: cohesion, adaptability, and net code volume. Resolved: modularity is **minimum cut at every scale** — the same computation on a different graph (statements within a function, functions within a module). Cohesion and volume are consequences of it, not separate objectives to weigh.
+- **"Modularity"** was used to mean three different things at once: cohesion, adaptability, and net code volume. Qualified by measurement: graph partitioning remains useful at module scale, where call and effect edges carry architectural evidence. It failed at statement scale because dataflow omitted control transfer, shared mutable state, required ordering, and recursive traversal. Orbit does not claim one scale-free minimum-cut computation.
 - **"Modular" vs "extensible"** are not the same claim. Modularity is scale-free; extensibility is directional and undefined until an **Axis of change** is named.
 - **"Sprawl"** was used for both "too many functions" and "too much code". Resolved: only unit count weighted against **Interface width** is measurable; total volume on its own is not a defect.
 - **"Duplicate"** was used for all three **grades of sameness** at once. Resolved: they are separate claims, and the distinction is load-bearing — only **α-equivalence** is strong enough to deny a write, and the codebase's two existing hashes bracket it without hitting it.
