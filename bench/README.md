@@ -122,9 +122,26 @@ competitor harness arm yet (Aider's repo map is next).
   which no ceiling here can separate out.
 - **Filling the budget buys recall with noise**: at 4k, 94% of what is shown
   was not co-changed.
-- **Calibrated probabilities make stopping meaningful**: p >= 0.01 keeps
-  99% of the shipped recall with 8% fewer tokens; p >= 0.05 quadruples
-  precision (23.8%) with 43% of the tokens, for 15 points of recall. Adaptive arms are Python-only so far.
+- **Calibrated probabilities make stopping meaningful**: against the same
+  Python ranker filling the budget (68.6%), p >= 0.01 keeps 95% of its recall
+  with 15% fewer tokens; p >= 0.05 quadruples precision (23.8%) with 40% of the
+  tokens, for 18 points of recall.
+
+### The product default: adaptive, p >= 0.01 (commit d473695)
+
+| Rust, out of sample | @1k | @2k | @4k | @8k | @16k |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| fill the budget: recall | 45.9% | 56.6% | 66.2% | 77.0% | 89.2% |
+| adaptive: recall | 44.9% | 55.2% | 63.6% | 73.1% | 81.0% |
+| fill: precision / tokens | 14.6% / 894 | 9.8% / 1,816 | 5.6% / 3,692 | 3.6% / 7,585 | 2.5% / 15,341 |
+| adaptive: precision / tokens | 17.2% / 862 | 13.4% / 1,674 | 10.3% / 3,188 | 9.2% / 6,037 | 9.0% / 10,159 |
+
+A trade, not a free lunch: at the MCP default budget (8k) adaptive keeps 95%
+of recall with 20% fewer tokens and 2.5x the precision; at 16k it gives up 8
+points to spend a third less. It never drops the edit zone (a callee's
+signature is needed even though callees rarely co-change). vigil p95 falls to
+21 ms because dropped candidates are never rendered. `min_probability: 0`
+restores filling the budget. Adaptive arms are Python-only so far.
 
 
 ## `compression_bench.py` — token-efficiency A/B

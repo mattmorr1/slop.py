@@ -25,7 +25,7 @@ use crate::source::{entity_for, location_index, FileFacts};
 const MAX_HOPS: usize = 4;
 
 /// Candidates outside the edit zone below this probability are never shown, so the
-/// budget is a cap. B4: p >= 0.01 keeps 99% of recall at 4k with 8% fewer tokens.
+/// budget is a cap. B4 at 8k: 95% of fill-the-budget recall, 20% fewer tokens.
 pub const DEFAULT_MIN_PROBABILITY_PPM: u32 = 10_000;
 
 /// Distance-independent edge kinds that count as "the same call/containment
