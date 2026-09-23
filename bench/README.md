@@ -104,6 +104,29 @@ What it says:
 Caveats: co-change is a proxy for need; four Python repositories; no
 competitor harness arm yet (Aider's repo map is next).
 
+### Ceilings, precision and adaptive budgets (commit f5b74d0)
+
+| pooled @4k cap | recall | precision | tokens spent |
+| --- | ---: | ---: | ---: |
+| oracle (cheapest gold first) | 99.7% | 100% | 637 |
+| oracle within candidate pool | 99.4% | 100% | 636 |
+| shipped, out of sample | 66.2% | 5.6% | 3,692 |
+| adaptive, stop at p < 0.01 | 65.4% | 10.5% | 3,380 |
+| adaptive, stop at p < 0.05 | 50.8% | 23.8% | 1,571 |
+| adaptive, stop at p < 0.2 | 30.1% | 39.5% | 460 |
+| BM25 | 59.3% | 7.2% | 3,997 |
+
+- **The pool is not the limit; ranking is.** Graph <= 4 hops plus the
+  directory reaches 99.4% of gold, and all of it fits in about 640 tokens, so
+  the 33-point gap is ordering. Part of it is label noise (bundled commits),
+  which no ceiling here can separate out.
+- **Filling the budget buys recall with noise**: at 4k, 94% of what is shown
+  was not co-changed.
+- **Calibrated probabilities make stopping meaningful**: p >= 0.01 keeps
+  99% of the shipped recall with 8% fewer tokens; p >= 0.05 quadruples
+  precision (23.8%) with 43% of the tokens, for 15 points of recall. Adaptive arms are Python-only so far.
+
+
 ## `compression_bench.py` — token-efficiency A/B
 
 Quantifies the deterministic half of the harness thesis (D11): zoned
