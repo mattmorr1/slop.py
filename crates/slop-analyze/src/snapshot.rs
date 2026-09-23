@@ -285,7 +285,9 @@ fn snapshot_id(
     hasher.update(b"slop-repository-snapshot\0");
     hasher.update(&SNAPSHOT_SCHEMA_VERSION.to_le_bytes());
     for index_path in index_paths {
-        hasher.update(index_path.to_string_lossy().as_bytes());
+        // Repo-relative: the same content checked out elsewhere is the same snapshot.
+        let relative = index_path.strip_prefix(repo).unwrap_or(index_path);
+        hasher.update(relative.to_string_lossy().as_bytes());
         hasher.update(&[0]);
         hasher.update(&index::hash_source(index_path)?);
     }
@@ -693,5 +695,25 @@ mod bench_parts {
         once("snapshot_id", &mut || {
             snapshot_id(&repo, &paths, &repo.join("slop.toml"), &read).unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod location {
+    use super::*;
+    use crate::test_support::TempFixture;
+
+    /// ADR 0002 says content-identified: two checkouts of the same bytes agree.
+    #[test]
+    fn identity_does_not_depend_on_where_the_repo_lives() {
+        let (a, b) = (TempFixture::new("toy_repo"), TempFixture::new("toy_repo"));
+        let capture = |repo: &Path| {
+            RepositorySnapshot::capture(CaptureRequest { repo, index: None, policy: None, freshness: Freshness::Warn })
+                .expect("capture")
+                .id()
+                .clone()
+        };
+        assert_ne!(&*a, &*b);
+        assert_eq!(capture(&a), capture(&b));
     }
 }
