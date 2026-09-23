@@ -84,7 +84,7 @@ slop index <repo>
 | `find_capability` | What the codebase already provides for an intent | `intent`, `effect`, `limit` |
 | `assess_write` | Proposed-source policy findings and existing homes | `file`, `content`, `limit` |
 | `validate_change` | Full detector suite → findings + fix guidance | `all`, `base`, `tier3` |
-| `get_context_envelope` | Effect-typed, budget-packed context around an entity | `target_entity`, `token_budget`, `edit_zone_hops` |
+| `get_context_envelope` | Calibrated, budget-capped context around an entity (ADR 0005) | `target_entity`, `token_budget`, `edit_zone_hops`, `min_probability` |
 | `query_subgraph` | Callers/callees/imports + effect signature | `entity`, `depth`, `edge_kinds` |
 
 `find_capability` is the intent-first entry point: the graph tools take an entity

@@ -49,6 +49,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SLOP = Path(os.environ.get("SLOP_BIN", ROOT / "target/release/slop"))
 # Adaptive arms stop at this calibrated probability instead of filling the budget.
 THRESHOLDS = (0.2, 0.05, 0.01)
+ADAPTIVE_PPM = 10_000  # the product default, crates/slop-analyze/src/envelope.rs
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 WORD = re.compile(r"[A-Za-z][a-z0-9]*|[A-Z]+(?![a-z])|\d+")
 FEATURES = ["bias", "d1", "d2", "d3", "d4", "same_file", "same_dir", "file_gap", "same_container",
@@ -131,11 +132,12 @@ def mine(repo: str, history: Path, catalog: dict, max_commits: int):
     return tasks
 
 
-def slop_runs(snapshot: Path, targets: list[str], budgets: list[int], selection: str):
+def slop_runs(snapshot: Path, targets: list[str], budgets: list[int], selection: str, min_ppm: int = 0):
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
         handle.write("\n".join(targets) + "\n")
     out = subprocess.run([str(SLOP), "context-bench", str(snapshot), handle.name, "--budgets",
-                          ",".join(map(str, budgets)), "--selection", selection],
+                          ",".join(map(str, budgets)), "--selection", selection,
+                          "--min-probability-ppm", str(min_ppm)],
                          capture_output=True, text=True, check=True)
     lines = [json.loads(line) for line in out.stdout.splitlines()]
     header, graph, picks, micros = lines[0], {}, {}, []
@@ -338,6 +340,8 @@ def main() -> None:
             for selection in ("coverage", "ranked"):
                 _, _, repo.picks[f"calibrated-{selection}"], repo.micros[f"calibrated-{selection}"] = slop_runs(
                     repo.snapshot, targets, budgets, selection)
+            _, _, repo.picks["calibrated-adaptive"], repo.micros["calibrated-adaptive"] = slop_runs(
+                repo.snapshot, targets, budgets, "coverage", ADAPTIVE_PPM)
         finally:
             model_file.unlink()
     if args.fit_all:
@@ -346,7 +350,7 @@ def main() -> None:
             f"{repo.name}@{git(repo.history, 'rev-parse', '--short', 'HEAD').strip()}" for repo in repos)), indent=2) + "\n")
         print(f"pooled model written to {args.fit_all}")
 
-    arm_names = ["slop-coverage", "slop-ranked", "slop-calibrated-coverage", "slop-calibrated-ranked",
+    arm_names = ["slop-coverage", "slop-ranked", "slop-calibrated-coverage", "slop-calibrated-ranked", "slop-calibrated-adaptive",
                  "calibrated-ratio", "calibrated-rank", "bm25", "proximity", "random"]
     arm_names += [f"adaptive-{t}" for t in THRESHOLDS] + ["oracle-pool", "oracle"]
     recall = {(arm, b, repo.name): defaultdict(list) for arm in arm_names for b in budgets for repo in repos}
@@ -380,6 +384,7 @@ def main() -> None:
                     "slop-ranked": repo.picks["ranked"].get((target, budget), set()),
                     "slop-calibrated-coverage": repo.picks["calibrated-coverage"].get((target, budget), set()),
                     "slop-calibrated-ranked": repo.picks["calibrated-ranked"].get((target, budget), set()),
+                    "slop-calibrated-adaptive": repo.picks["calibrated-adaptive"].get((target, budget), set()),
                     "calibrated-ratio": pack(by_ratio, repo.cost, budget),
                     "calibrated-rank": pack(by_rank, repo.cost, budget),
                     "bm25": pack(bm25_order, repo.cost, budget),

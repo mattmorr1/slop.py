@@ -372,6 +372,9 @@ enum Command {
         /// `coverage` (default) or `ranked` (the ablation baseline).
         #[arg(long, default_value = "coverage")]
         selection: String,
+        /// Minimum calibrated probability in ppm; 0 (default) fills the budget, as in B4 runs to date.
+        #[arg(long, default_value_t = 0)]
+        min_probability_ppm: u32,
     },
     /// Research adapter for the equivalence benchmark: each JSONL line
     /// `{"a": src, "b": src}` (one Python function each) yields every tier's verdict.
@@ -926,7 +929,9 @@ fn main() -> Result<()> {
         Command::Open { target } => {
             setup::open_target(&target)?;
         }
-        Command::ContextBench { repo, targets, budgets, selection } => run_context_bench(&repo, &targets, &budgets, &selection)?,
+        Command::ContextBench { repo, targets, budgets, selection, min_probability_ppm } => {
+            run_context_bench(&repo, &targets, &budgets, &selection, min_probability_ppm)?
+        }
         Command::Equiv { pairs, iterations } => run_equiv(&pairs, iterations)?,
         Command::Install { repo, force } => {
             install_harness(&repo, force)?;
@@ -1497,7 +1502,7 @@ fn run_equiv(pairs: &Path, iterations: usize) -> Result<()> {
     Ok(())
 }
 
-fn run_context_bench(repo: &Path, targets: &Path, budgets: &[usize], selection: &str) -> Result<()> {
+fn run_context_bench(repo: &Path, targets: &Path, budgets: &[usize], selection: &str, min_probability_ppm: u32) -> Result<()> {
     use slop_analyze::context::ContextRequest;
     use slop_analyze::envelope::{self, Selection};
     let selection = match selection {
@@ -1520,7 +1525,7 @@ fn run_context_bench(repo: &Path, targets: &Path, budgets: &[usize], selection: 
         );
         for &budget in budgets {
             let start = std::time::Instant::now();
-            let artifact = snapshot.context(ContextRequest { target_entity: target, token_budget: budget, edit_zone_hops: 1, selection });
+            let artifact = snapshot.context(ContextRequest { target_entity: target, token_budget: budget, edit_zone_hops: 1, selection, min_probability_ppm });
             let items: Vec<serde_json::Value> = artifact
                 .items
                 .iter()

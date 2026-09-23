@@ -6,7 +6,7 @@ use crate::compress::{self, CompressConfig, CompressStats};
 use crate::envelope::{self, EnvelopeConfig, EnvelopeItem, Selection};
 use crate::snapshot::{DocumentState, RepositorySnapshot, SnapshotFreshness, SnapshotId};
 
-pub const CONTEXT_SCHEMA_VERSION: u32 = 4;
+pub const CONTEXT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct ContextRequest<'a> {
@@ -14,6 +14,7 @@ pub struct ContextRequest<'a> {
     pub token_budget: usize,
     pub edit_zone_hops: usize,
     pub selection: Selection,
+    pub min_probability_ppm: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,6 +32,7 @@ pub struct ContextArtifact {
     pub target: String,
     pub token_budget: usize,
     pub edit_zone_hops: usize,
+    pub min_probability_ppm: u32,
     pub estimated_tokens: usize,
     pub items: Vec<EnvelopeItem>,
     /// Selected entities left out because their document is not resolved.
@@ -115,6 +117,7 @@ impl RepositorySnapshot {
                     token_budget: request.token_budget,
                     edit_zone_hops: request.edit_zone_hops,
                     selection: request.selection,
+                    min_probability_ppm: request.min_probability_ppm,
                 },
                 &envelope::Relevance { model: &self.relevance, lexical: self.lexical() },
                 |file| self.document_state(file) == DocumentState::Resolved,
@@ -146,6 +149,7 @@ impl RepositorySnapshot {
             target: request.target_entity.to_string(),
             token_budget: request.token_budget,
             edit_zone_hops: request.edit_zone_hops,
+            min_probability_ppm: request.min_probability_ppm,
             estimated_tokens,
             items,
             omitted_unresolved,
@@ -237,6 +241,7 @@ mod tests {
                 token_budget: 8000,
                 edit_zone_hops: 1,
                 selection: Selection::Coverage,
+                min_probability_ppm: 0,
             }))
             .expect("serialize")
         };
@@ -244,6 +249,35 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(render(), expected);
         }
+    }
+
+    #[test]
+    fn min_probability_caps_what_is_shown() {
+        let repo = fixture("toy_repo");
+        let snapshot = RepositorySnapshot::capture(CaptureRequest {
+            repo: &repo,
+            index: None,
+            policy: None,
+            freshness: Freshness::Warn,
+        })
+        .expect("snapshot");
+        let items = |min_probability_ppm| {
+            snapshot
+                .context(ContextRequest {
+                    target_entity: "core.http_client::HttpClient::get",
+                    token_budget: 8000,
+                    edit_zone_hops: 1,
+                    selection: Selection::Coverage,
+                    min_probability_ppm,
+                })
+                .items
+        };
+        let (fill, adaptive, strict) = (items(0), items(envelope::DEFAULT_MIN_PROBABILITY_PPM), items(1_000_001));
+        assert!(strict.len() > 1, "the edit zone is exempt from the threshold");
+        assert!(strict.iter().skip(1).all(|item| item.fidelity == envelope::Fidelity::Full));
+        assert!(adaptive.len() < fill.len());
+        let shown = |item: &&envelope::EnvelopeItem| item.fidelity == envelope::Fidelity::Skeleton;
+        assert!(adaptive.iter().filter(shown).all(|item| item.score >= envelope::DEFAULT_MIN_PROBABILITY_PPM));
     }
 
     #[test]
@@ -261,6 +295,7 @@ mod tests {
             token_budget: 8000,
             edit_zone_hops: 1,
             selection: Selection::Coverage,
+            min_probability_ppm: 0,
         });
         assert_eq!(
             artifact.fallback.expect("fallback").reason,
@@ -287,6 +322,7 @@ mod tests {
                 token_budget: 8000,
                 edit_zone_hops: 1,
                 selection: Selection::Coverage,
+                min_probability_ppm: 0,
             });
             assert!(artifact.fallback.is_none());
             samples.push(start.elapsed());

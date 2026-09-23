@@ -24,6 +24,10 @@ use crate::source::{entity_for, location_index, FileFacts};
 /// Graph hops a candidate may be from the target (the model's distance features).
 const MAX_HOPS: usize = 4;
 
+/// Candidates outside the edit zone below this probability are never shown, so the
+/// budget is a cap. B4: p >= 0.01 keeps 99% of recall at 4k with 8% fewer tokens.
+pub const DEFAULT_MIN_PROBABILITY_PPM: u32 = 10_000;
+
 /// Distance-independent edge kinds that count as "the same call/containment
 /// neighborhood" for BFS proximity.
 const PROXIMITY_EDGES: [EdgeKind; 3] = [EdgeKind::Contains, EdgeKind::Calls, EdgeKind::Imports];
@@ -96,6 +100,9 @@ pub struct EnvelopeConfig {
     /// BFS hops from the target that still get full-fidelity source.
     pub edit_zone_hops: usize,
     pub selection: Selection,
+    /// Probability (ppm) a candidate beyond the edit zone needs; 0 fills the budget.
+    /// The edit zone is exempt: a callee rarely co-changes, but its signature is needed.
+    pub min_probability_ppm: u32,
 }
 
 impl Default for EnvelopeConfig {
@@ -104,6 +111,7 @@ impl Default for EnvelopeConfig {
             token_budget: 8000,
             edit_zone_hops: 1,
             selection: Selection::Coverage,
+            min_probability_ppm: DEFAULT_MIN_PROBABILITY_PPM,
         }
     }
 }
@@ -454,8 +462,12 @@ where
                 lexical: lexical.get(&idx).copied().unwrap_or(0.0),
             };
             let (probability, contributions) = relevance.model.probability_ppm(&features);
+            let in_zone = distance.is_some_and(|d| d <= config.edit_zone_hops);
+            if probability < config.min_probability_ppm && !in_zone {
+                return None;
+            }
             let skeleton = skeleton_for(entity, signatures.get(&entity.id).map(String::as_str));
-            let full = distance.is_some_and(|d| d <= config.edit_zone_hops).then(|| render(entity)).flatten();
+            let full = in_zone.then(|| render(entity)).flatten();
             let (fidelity, text, fallback) = match full {
                 Some(text) => (Fidelity::Full, text, (!skeleton.is_empty()).then_some(skeleton)),
                 None if skeleton.is_empty() => return None,

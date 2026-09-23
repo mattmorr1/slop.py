@@ -5,10 +5,11 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use slop_analyze::check::{self, CheckRequest};
 use slop_analyze::context::ContextRequest;
+use slop_analyze::envelope::DEFAULT_MIN_PROBABILITY_PPM;
 use slop_analyze::query;
 use slop_analyze::search;
 use slop_graph::{EdgeKind, Effect};
@@ -86,14 +87,15 @@ pub fn definitions() -> Value {
         },
         {
             "name": "get_context_envelope",
-            "description": "Build the effect-typed context envelope around a target entity: the most relevant code to see when editing it, full-fidelity inside the edit zone and skeletonized beyond, packed under a token budget. Returns ranked items with source text.",
+            "description": "Build the context envelope around a target entity: the code most likely needed when editing it, scored by calibrated relevance, full-fidelity inside the edit zone and skeletonized beyond, capped by a token budget. Returns items with source text and per-feature reasons.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string", "description": "Repo root (defaults to the server's launch repo)"},
                     "target_entity": {"type": "string", "description": "Entity id, e.g. `billing.gateways::StripeGateway::charge`"},
                     "token_budget": {"type": "integer", "description": "Rough token budget for context beyond the target (default 8000)"},
-                    "edit_zone_hops": {"type": "integer", "description": "BFS hops from the target that stay full-fidelity (default 1)"}
+                    "edit_zone_hops": {"type": "integer", "description": "BFS hops from the target that stay full-fidelity (default 1)"},
+                    "min_probability": {"type": "number", "description": "Calibrated relevance an item needs to be shown, 0-1 (default 0.01; 0 fills the budget, higher is terser)"}
                 },
                 "required": ["target_entity"]
             }
@@ -243,6 +245,11 @@ fn get_context_envelope(ctx: &ToolCtx, args: &Value) -> Result<String> {
         token_budget: args.get("token_budget").and_then(Value::as_u64).unwrap_or(8000) as usize,
         edit_zone_hops: args.get("edit_zone_hops").and_then(Value::as_u64).unwrap_or(1) as usize,
         selection: Default::default(),
+        min_probability_ppm: match args.get("min_probability").and_then(Value::as_f64) {
+            Some(p) if (0.0..=1.0).contains(&p) => (p * 1_000_000.0).round() as u32,
+            Some(p) => bail!("min_probability must be between 0 and 1, got {p}"),
+            None => DEFAULT_MIN_PROBABILITY_PPM,
+        },
     });
     Ok(serde_json::to_string_pretty(&artifact)?)
 }
