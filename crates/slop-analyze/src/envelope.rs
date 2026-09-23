@@ -395,6 +395,41 @@ fn directory(file: &str) -> &str {
     file.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
+/// Every candidate for `target_idx` with the features the model scores: the graph
+/// neighbourhood and the target's directory. Training and serving share this one definition.
+pub(crate) fn candidate_features(
+    built: &BuiltGraph,
+    target_idx: NodeIndex,
+    lexical: &Lexical,
+    target_text: &str,
+) -> Vec<(NodeIndex, Features)> {
+    let distances = proximity_distances(built, &[target_idx], MAX_HOPS);
+    let target = built.graph.entity(target_idx);
+    let target_dir = directory(&target.file);
+    let lexical = lexical.scores(target_text);
+    let mut pool: std::collections::BTreeSet<NodeIndex> =
+        distances.iter().filter(|(_, distance)| (1..=MAX_HOPS).contains(*distance)).map(|(idx, _)| *idx).collect();
+    pool.extend(built.graph.entities().filter(|(_, entity)| directory(&entity.file) == target_dir).map(|(idx, _)| idx));
+    pool.remove(&target_idx);
+    pool.into_iter()
+        .filter(|&idx| matches!(built.graph.entity(idx).entity_type, NodeType::Function | NodeType::Class))
+        .map(|idx| {
+            let entity = built.graph.entity(idx);
+            let features = Features {
+                distance: distances.get(&idx).copied().filter(|distance| *distance <= MAX_HOPS),
+                same_file: entity.file == target.file,
+                same_dir: directory(&entity.file) == target_dir,
+                line_gap: entity.source_range.0.abs_diff(target.source_range.0),
+                same_container: container(&entity.id) == container(&target.id),
+                shared_effect: entity.effect_signature.0.iter().any(|effect| target.effect_signature.0.contains(effect)),
+                is_class: entity.entity_type == NodeType::Class,
+                lexical: lexical.get(&idx).copied().unwrap_or(0.0),
+            };
+            (idx, features)
+        })
+        .collect()
+}
+
 fn build_envelope_with<F>(
     built: &BuiltGraph,
     facts: &[FileFacts],
@@ -426,41 +461,12 @@ where
         }
     }
 
-    let distances = proximity_distances(built, &[target_idx], MAX_HOPS);
     let target = built.graph.entity(target_idx);
-    let target_dir = directory(&target.file);
-    let lexical = relevance.lexical.scores(target_text);
-
-    // Candidates: the graph neighbourhood and the target's directory. Co-change
-    // history says locality matters as much as edges (B4), so both are in play.
-    let mut pool: std::collections::BTreeSet<NodeIndex> = distances
-        .iter()
-        .filter(|(_, distance)| (1..=MAX_HOPS).contains(*distance))
-        .map(|(idx, _)| *idx)
-        .collect();
-    pool.extend(
-        built.graph.entities().filter(|(_, entity)| directory(&entity.file) == target_dir).map(|(idx, _)| idx),
-    );
-    pool.remove(&target_idx);
-
-    let mut candidates: Vec<Candidate> = pool
+    let mut candidates: Vec<Candidate> = candidate_features(built, target_idx, relevance.lexical, target_text)
         .into_iter()
-        .filter_map(|idx| {
+        .filter_map(|(idx, features)| {
             let entity = built.graph.entity(idx);
-            if !matches!(entity.entity_type, NodeType::Function | NodeType::Class) {
-                return None;
-            }
-            let distance = distances.get(&idx).copied().filter(|distance| *distance <= MAX_HOPS);
-            let features = Features {
-                distance,
-                same_file: entity.file == target.file,
-                same_dir: directory(&entity.file) == target_dir,
-                line_gap: entity.source_range.0.abs_diff(target.source_range.0),
-                same_container: container(&entity.id) == container(&target.id),
-                shared_effect: entity.effect_signature.0.iter().any(|effect| target.effect_signature.0.contains(effect)),
-                is_class: entity.entity_type == NodeType::Class,
-                lexical: lexical.get(&idx).copied().unwrap_or(0.0),
-            };
+            let distance = features.distance;
             let (probability, contributions) = relevance.model.probability_ppm(&features);
             let in_zone = distance.is_some_and(|d| d <= config.edit_zone_hops);
             if probability < config.min_probability_ppm && !in_zone {

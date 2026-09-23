@@ -421,6 +421,27 @@ enum Command {
         #[arg(last = true)]
         claude_args: Vec<String>,
     },
+    /// Fit the context relevance model on this repository's own co-change history,
+    /// validated on the newest commits; writes .slop/relevance.json only if it holds up.
+    Calibrate {
+        /// Repo root (default: current directory)
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+        #[arg(long, default_value_t = 1500)]
+        max_commits: usize,
+        /// Share of the newest commits held out for validation.
+        #[arg(long, default_value_t = 0.2)]
+        holdout: f64,
+        /// Token budget the validation compares recall at.
+        #[arg(long, default_value_t = 4000)]
+        budget: usize,
+        /// Write the fit even if it does worse on the holdout than the model in use.
+        #[arg(long)]
+        force: bool,
+        /// Report only; never write.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Record current findings as the grandfathered baseline.
     Baseline {
         /// Repo root (default: current directory)
@@ -944,6 +965,9 @@ fn main() -> Result<()> {
             claude_args,
         } => {
             launch_claude(&repo, no_install, proxy, proxy_port, &claude_args)?;
+        }
+        Command::Calibrate { repo, max_commits, holdout, budget, force, dry_run } => {
+            run_calibrate(&repo, max_commits, holdout, budget, force, dry_run)?
         }
         Command::Baseline { repo, index } => {
             let analysis = check::load_analysis(&repo, index.as_deref())?;
@@ -1498,6 +1522,33 @@ fn run_equiv(pairs: &Path, iterations: usize) -> Result<()> {
         #[cfg(not(feature = "egraph"))]
         let _ = iterations;
         println!("{verdict}");
+    }
+    Ok(())
+}
+
+fn run_calibrate(repo: &Path, max_commits: usize, holdout: f64, budget: usize, force: bool, dry_run: bool) -> Result<()> {
+    use slop_analyze::calibrate::{self, CalibrateRequest};
+    if !(0.05..=0.5).contains(&holdout) {
+        bail!("--holdout must be between 0.05 and 0.5, got {holdout}");
+    }
+    let snapshot = check::load_analysis(repo, None)?;
+    let report = calibrate::calibrate(&snapshot, repo, &CalibrateRequest { max_commits, holdout, budget })?;
+    let pct = |e: calibrate::Estimate| format!("{:5.1}%  [{:.1}, {:.1}]", e.mean * 100.0, e.low * 100.0, e.high * 100.0);
+    println!("{} co-change tasks from {} commits; fit on {} older, validated on {} newest", report.tasks, report.commits, report.train_tasks, report.holdout_tasks);
+    println!("holdout recall at {} tokens (95% CI over commits):", report.budget);
+    println!("  this repository's fit   {}", pct(report.own));
+    println!("  model in use            {}   ({})", pct(report.current), report.current_source);
+    println!("  file proximity          {}", pct(report.proximity));
+    let d = report.own_minus_current;
+    println!("  fit minus in use        {:+5.1} points [{:+.1}, {:+.1}], paired", d.mean * 100.0, d.low * 100.0, d.high * 100.0);
+    println!("  prior strength {} (shrinks the fit toward the model in use; chosen on older commits only)", report.lambda);
+    if dry_run {
+        println!("dry run: nothing written");
+    } else if report.supports_writing() || force {
+        let path = calibrate::write(repo, &report.model)?;
+        println!("wrote {} (fit on all {} tasks)", path.display(), report.tasks);
+    } else {
+        println!("kept the model in use: this fit did worse on the holdout (--force writes it anyway)");
     }
     Ok(())
 }

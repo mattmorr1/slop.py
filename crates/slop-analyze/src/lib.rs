@@ -2,6 +2,7 @@
 
 pub mod baseline;
 pub mod build;
+pub mod calibrate;
 pub mod check;
 pub mod compress;
 pub mod config;

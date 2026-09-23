@@ -102,7 +102,7 @@ pub struct Features {
 }
 
 impl Features {
-    fn values(&self) -> [f64; 12] {
+    pub(crate) fn values(&self) -> [f64; 12] {
         let hop = |n| f64::from(u8::from(self.distance == Some(n)));
         [
             1.0,

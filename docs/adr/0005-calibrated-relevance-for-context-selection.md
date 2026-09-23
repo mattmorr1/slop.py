@@ -71,6 +71,17 @@ p = 0.01 are not shown. It trades recall for precision: at 8k, 95% of the
 recall, 20% fewer tokens, 2.5x precision, and no significant lead over BM25
 at >= 8k. `min_probability: 0` restores filling the budget.
 
+**Per-repository calibration (`slop calibrate`).** Mines the repository's own
+co-change history (any language `slop-parse` reads), fits with a Gaussian
+prior centred on the model in use, picks the prior's strength on an inner time
+split of the older commits, and validates on the newest 20% by real envelope
+recall. It writes `.slop/relevance.json` only if the fit does at least as well
+as the model in use there. The prior matters: fit toward zero, vigil's 48
+commits lost 2.1 points; shrunk, it stays at the pooled model (strength 10,000),
+while httpx, with more history, moves freely (strength 1, +3.5 points, not
+significant). The default was fit partly on these repositories, so "model in
+use" is in-sample for them.
+
 Co-change is a proxy for what an agent needs, not the need itself; an
 end-to-end run (R8) is still required before claiming agents edit better with
 this context.

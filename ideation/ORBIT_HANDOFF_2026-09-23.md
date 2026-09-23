@@ -244,7 +244,10 @@ load on this macOS) as `aider-map` and `aider-chat`, and a bge-small embedding
 retriever, scored on B4's own tasks via `--arm`. *Gate:* result recorded
 whatever it shows, with paired differences.
 
-**R3 — Per-repo calibration as a product command.** `slop calibrate` (port the
+**R3 — Per-repo calibration. Done (`slop calibrate`, ADR 0005).** Holdout on
+vigil: own fit 81.5% vs proximity 71.4% at 4k (gate met); shrinkage toward the
+model in use keeps small histories from overfitting.
+Original item: **Per-repo calibration as a product command.** `slop calibrate` (port the
 history miner or ship the script) writing `.slop/relevance.json`; time-split
 validation printed. *Gate:* on vigil, calibrated-own ≥ file proximity at 4k.
 
