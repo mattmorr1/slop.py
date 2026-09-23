@@ -11,8 +11,10 @@ correlated, so confidence intervals come from a bootstrap over commits.
 Every arm is charged alike: slop by its own renderings, every other arm by
 slop's skeleton cost for each entity (the catalog), so no arm gets cheaper text.
 
-Arms: slop coverage and slop ranked (the envelope's selections), BM25 over
-function source, same-file/nearby-line proximity, a seeded random floor, and
+Arms: slop coverage and slop ranked (the envelope's selections), slop adaptive
+(the product default, stopping at p = 0.01), BM25 over function source,
+same-file/nearby-line proximity, a seeded random floor, oracle ceilings,
+external arms (`--arm`, e.g. Aider's repo map from bench/aider_arm.py), and
 `calibrated`: logistic regression over (graph distance, same file, line gap,
 same directory, same container, shared effect, class-ness, BM25 similarity),
 fit leave-one-repo-out, packed by probability (rank) or probability per token
@@ -49,6 +51,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SLOP = Path(os.environ.get("SLOP_BIN", ROOT / "target/release/slop"))
 # Adaptive arms stop at this calibrated probability instead of filling the budget.
 THRESHOLDS = (0.2, 0.05, 0.01)
+SHIPPED = "slop-calibrated-adaptive"  # the product's default selector, scored out of sample
 ADAPTIVE_PPM = 10_000  # the product default, crates/slop-analyze/src/envelope.rs
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 WORD = re.compile(r"[A-Za-z][a-z0-9]*|[A-Z]+(?![a-z])|\d+")
@@ -299,9 +302,16 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260923)
     parser.add_argument("--out", type=Path, default=ROOT / "bench/results/context.jsonl")
     parser.add_argument("--fit-all", type=Path, help="also write the model fit on every repo, as .slop/relevance.json")
+    parser.add_argument("--targets-out", type=Path, help="write each repo's sampled targets to DIR/NAME.txt and stop")
+    parser.add_argument("--arm", action="append", default=[], type=Path,
+                        help="DIR of external picks, DIR/NAME.jsonl lines {target, budget, arm, items, tokens}")
     args = parser.parse_args()
     budgets = [int(b) for b in args.budgets.split(",")]
     started = time.time()
+    # Recorded before running: the tree measured is the tree at start, whatever is edited meanwhile.
+    commit = git(ROOT, "rev-parse", "HEAD").strip()
+    dirty = bool(git(ROOT, "status", "--porcelain", "--untracked-files=no", "--", "crates", "bench",
+                     ":!bench/__pycache__", ":!bench/results").strip())
 
     repos = []
     for spec in args.repo:
@@ -318,9 +328,25 @@ def main() -> None:
             kept.add(commit)
             count += size
         repo.tasks = [task for task in repo.tasks if task["commit"] in kept]
+        if args.targets_out:
+            args.targets_out.mkdir(parents=True, exist_ok=True)
+            (args.targets_out / f"{name}.txt").write_text("\n".join(sorted({t["target"] for t in repo.tasks})) + "\n")
+            continue
         repo.run_slop(budgets)
         repos.append(repo)
         print(f"{name}: {len(repo.tasks)} tasks from {len(kept)} commits; catalog {len(repo.catalog)}")
+
+    if args.targets_out:
+        print(f"targets written to {args.targets_out}")
+        return
+    # External arms (e.g. bench/aider_arm.py): picks and their own token counts per (target, budget).
+    external: dict[str, dict[str, dict]] = defaultdict(lambda: defaultdict(dict))
+    for directory in args.arm:
+        for repo in repos:
+            for line in (directory / f"{repo.name}.jsonl").read_text().splitlines():
+                row = json.loads(line)
+                external[repo.name][row["arm"]][(row["target"], row["budget"])] = (set(row["items"]), row["tokens"])
+    external_arms = sorted({arm for arms in external.values() for arm in arms})
 
     models = {}
     for held_out in repos:
@@ -352,7 +378,7 @@ def main() -> None:
 
     arm_names = ["slop-coverage", "slop-ranked", "slop-calibrated-coverage", "slop-calibrated-ranked", "slop-calibrated-adaptive",
                  "calibrated-ratio", "calibrated-rank", "bm25", "proximity", "random"]
-    arm_names += [f"adaptive-{t}" for t in THRESHOLDS] + ["oracle-pool", "oracle"]
+    arm_names += [f"adaptive-{t}" for t in THRESHOLDS] + ["oracle-pool", "oracle"] + external_arms
     recall = {(arm, b, repo.name): defaultdict(list) for arm in arm_names for b in budgets for repo in repos}
     no_edge = {(arm, b, repo.name): defaultdict(list) for arm in arm_names for b in budgets for repo in repos}
     precision = {(arm, b, repo.name): defaultdict(list) for arm in arm_names for b in budgets for repo in repos}
@@ -397,11 +423,17 @@ def main() -> None:
                        for t in THRESHOLDS},
                 }
                 far = gold - neighbors
+                for arm in external_arms:
+                    if (target, budget) not in external[repo.name][arm]:
+                        raise SystemExit(f"{arm} has no picks for {repo.name} {target} @{budget}")
+                    chosen[arm] = external[repo.name][arm][(target, budget)][0]
                 for arm, picked in chosen.items():
                     recall[(arm, budget, repo.name)][task["commit"]].append(len(gold & picked) / len(gold))
                     if picked:
                         precision[(arm, budget, repo.name)][task["commit"]].append(len(gold & picked) / len(picked))
-                    spent[(arm, budget, repo.name)][task["commit"]].append(sum(repo.cost.get(i, 0) for i in picked))
+                    spent[(arm, budget, repo.name)][task["commit"]].append(
+                        external[repo.name][arm][(target, budget)][1] if arm in external_arms
+                        else sum(repo.cost.get(i, 0) for i in picked))
                     if far:
                         no_edge[(arm, budget, repo.name)][task["commit"]].append(len(far & picked) / len(far))
 
@@ -423,6 +455,18 @@ def main() -> None:
                                                       "precision": pooled(precision, arm, budget, members),
                                                       "tokens": pooled(spent, arm, budget, members)}
 
+    # Paired: bootstrap the per-task recall difference (tasks align across arms), tighter than two CIs.
+    def paired(arm, budget, members):
+        merged = {f"{name}:{commit}": [a - b for a, b in zip(values, recall[(arm, budget, name)][commit])]
+                  for name in members for commit, values in recall[(SHIPPED, budget, name)].items()}
+        return cluster_bootstrap(merged, args.seed)
+
+    for arm in arm_names:
+        for budget in budgets:
+            for scope in names + ["pooled"]:
+                results[f"{arm}@{budget}@{scope}"]["shipped_minus"] = paired(
+                    arm, budget, names if scope == "pooled" else [scope])
+
     print(f"\nelapsed {time.time() - started:.0f}s; models (leave-one-repo-out coefficients):")
     for name, beta in models.items():
         print(f"  held out {name}: " + ", ".join(f"{f}={b:+.2f}" for f, b in zip(FEATURES, beta)))
@@ -441,6 +485,14 @@ def main() -> None:
                     else:
                         cells.append(f"{mean:.1%} [{low:.0%}–{high:.0%}]" if scope == "pooled" else f"{mean:.1%}")
                 print(f"| {arm} | " + " | ".join(cells) + " |")
+    print(f"\npooled — recall difference, {SHIPPED} minus arm (paired, 95% CI)")
+    print("| arm | " + " | ".join(f"@{b}" for b in budgets) + " |")
+    print("| --- | " + " | ".join("---:" for _ in budgets) + " |")
+    for arm in arm_names:
+        if arm != SHIPPED:
+            cells = [f"{m * 100:+.1f} [{lo * 100:+.1f}, {hi * 100:+.1f}]"
+                     for m, lo, hi in (results[f"{arm}@{b}@pooled"]["shipped_minus"] for b in budgets)]
+            print(f"| {arm} | " + " | ".join(cells) + " |")
     for repo in repos:
         for selection, values in repo.micros.items():
             values = sorted(values)
@@ -450,9 +502,7 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     manifest = {
         "bench": "context", "label": "exploratory", "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "commit": git(ROOT, "rev-parse", "HEAD").strip(),
-        "dirty": bool(git(ROOT, "status", "--porcelain", "--untracked-files=no", "--", "crates", "bench",
-                          ":!bench/__pycache__", ":!bench/results").strip()),
+        "commit": commit, "dirty": dirty,
         "repos": {repo.name: {"history_head": git(repo.history, "rev-parse", "HEAD").strip(),
                               "snapshot": repo.header["snapshot"], "tasks": len(repo.tasks)} for repo in repos},
         "seed": args.seed, "budgets": budgets, "features": FEATURES, "python": platform.python_version(),

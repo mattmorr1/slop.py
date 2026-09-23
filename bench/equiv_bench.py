@@ -494,6 +494,11 @@ def main() -> None:
     parser.add_argument("--jscpd", action="store_true")
     parser.add_argument("--out", type=Path, default=ROOT / "bench/results/equiv.jsonl")
     args = parser.parse_args()
+    # Recorded before running: the tree measured is the tree at start, whatever is edited meanwhile.
+    commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    dirty = bool(subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no", "--", "crates",
+                                 "bench", ":!bench/__pycache__", ":!bench/results"],
+                                capture_output=True, text=True).stdout.strip())
 
     corpus = {}
     for key, fn in functions(args.repos):
@@ -570,10 +575,7 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     manifest = {
         "bench": "equiv", "label": "exploratory", "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "commit": subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip(),
-        "dirty": bool(subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no", "--", "crates", "bench",
-                                      ":!bench/__pycache__", ":!bench/results"],
-                                     capture_output=True, text=True).stdout.strip()),
+        "commit": commit, "dirty": dirty,
         "alpha_v1_commit": ALPHA_V1_COMMIT, "python": platform.python_version(), "platform": platform.platform(),
         "seed": args.seed, "repos": [str(r) for r in args.repos], "functions": len(sample), "pairs": len(pairs),
         "corpus_digest": hashlib.sha256("".join(sorted(corpus)).encode()).hexdigest(),
