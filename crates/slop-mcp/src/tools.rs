@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use slop_analyze::check::{self, CheckRequest};
-use slop_analyze::envelope::{self, EnvelopeConfig};
+use slop_analyze::context::ContextRequest;
 use slop_analyze::query;
 use slop_analyze::search;
 use slop_graph::{EdgeKind, Effect};
@@ -71,6 +71,20 @@ pub fn definitions() -> Value {
             }
         },
         {
+            "name": "assess_write",
+            "description": "Assess proposed source before writing it. Returns direct sanctioned-channel bypasses and existing functions whose distinctive callee neighborhood suggests the code belongs there instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repo root (defaults to the server's launch repo)"},
+                    "file": {"type": "string", "description": "Repo-relative destination path; selects the language"},
+                    "content": {"type": "string", "description": "Complete proposed file content"},
+                    "limit": {"type": "integer", "description": "Maximum reuse suggestions (default 3)"}
+                },
+                "required": ["file", "content"]
+            }
+        },
+        {
             "name": "get_context_envelope",
             "description": "Build the effect-typed context envelope around a target entity: the most relevant code to see when editing it, full-fidelity inside the edit zone and skeletonized beyond, packed under a token budget. Returns ranked items with source text.",
             "inputSchema": {
@@ -111,10 +125,28 @@ pub fn call(ctx: &ToolCtx, name: &str, args: &Value) -> Result<String> {
     match name {
         "find_capability" => find_capability(ctx, args),
         "validate_change" => validate_change(ctx, args),
+        "assess_write" => assess_write(ctx, args),
         "get_context_envelope" => get_context_envelope(ctx, args),
         "query_subgraph" => query_subgraph(ctx, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
+}
+
+fn assess_write(ctx: &ToolCtx, args: &Value) -> Result<String> {
+    let repo = ctx.repo(args);
+    let file = args
+        .get("file")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("file is required"))?;
+    let content = args
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("content is required"))?;
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(3) as usize;
+    let analysis = check::load_analysis(&repo, ctx.index(args).as_deref())?;
+    Ok(serde_json::to_string_pretty(
+        &analysis.assess_write(file, content, limit)?,
+    )?)
 }
 
 /// `slop.toml`'s effect names, so what an agent passes here matches what it
@@ -173,9 +205,15 @@ fn validate_change(ctx: &ToolCtx, args: &Value) -> Result<String> {
             .to_string(),
     })?;
     Ok(serde_json::to_string_pretty(&json!({
+        "schema_version": result.schema_version,
+        "snapshot": result.snapshot,
+        "freshness": result.freshness,
+        "scope": result.scope,
+        "coverage": result.coverage,
         "findings": result.findings,
         "blocking": result.blocking,
         "health": result.health_line,
+        "current_health": result.current_health,
         "policy_is_empty": result.policy_is_empty,
     }))?)
 }
@@ -187,25 +225,12 @@ fn get_context_envelope(ctx: &ToolCtx, args: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("target_entity is required"))?;
     let analysis = check::load_analysis(&repo, ctx.index(args).as_deref())?;
-    let mut config = EnvelopeConfig::default();
-    if let Some(b) = args.get("token_budget").and_then(Value::as_u64) {
-        config.token_budget = b as usize;
-    }
-    if let Some(h) = args.get("edit_zone_hops").and_then(Value::as_u64) {
-        config.edit_zone_hops = h as usize;
-    }
-    let items = envelope::build_envelope(&analysis.built, &analysis.facts, &repo, target, &config);
-    if items.is_empty() {
-        return Ok(serde_json::to_string_pretty(&json!({
-            "target": target,
-            "items": [],
-            "note": "target not found in the graph, or no relevant context under the budget",
-        }))?);
-    }
-    Ok(serde_json::to_string_pretty(&json!({
-        "target": target,
-        "items": items,
-    }))?)
+    let artifact = analysis.context(ContextRequest {
+        target_entity: target,
+        token_budget: args.get("token_budget").and_then(Value::as_u64).unwrap_or(8000) as usize,
+        edit_zone_hops: args.get("edit_zone_hops").and_then(Value::as_u64).unwrap_or(1) as usize,
+    });
+    Ok(serde_json::to_string_pretty(&artifact)?)
 }
 
 fn parse_edge_kinds(args: &Value) -> Option<Vec<EdgeKind>> {

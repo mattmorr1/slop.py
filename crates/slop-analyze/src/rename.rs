@@ -132,7 +132,7 @@ pub fn rewrite_occurrences(
         }
 
         // Splice right-to-left so earlier offsets stay valid.
-        spans.sort_by(|a, b| b.0.cmp(&a.0));
+        spans.sort_by_key(|span| std::cmp::Reverse(span.0));
         let mut out = src.clone();
         for (start, end) in spans {
             out.replace_range(start..end, new_name);

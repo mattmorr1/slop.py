@@ -19,14 +19,19 @@ precise, located guidance.
 
 ## Install
 
-Requires a recent Rust toolchain, plus `npx` for the Python/TypeScript
-indexers (Rust uses `rust-analyzer`, which needs no npx).
+Release archives contain one binary for Linux/macOS on x86-64/ARM64, plus a
+checksum, README, and license. Building from source requires a recent Rust
+toolchain. Python/TypeScript indexing also requires `npx`; Rust uses
+`rust-analyzer`.
 
 ```sh
-cargo install --path crates/slop     # installs the `slop` binary
+cargo install --path crates/slop
 # or, without installing:
 cargo build --release                # -> target/release/slop
 ```
+
+The crates.io package is `slop-cli` (the binary remains `slop`); once the
+0.1.0 publish workflow completes, install it with `cargo install slop-cli`.
 
 ## Quickstart
 
@@ -34,17 +39,27 @@ cargo build --release                # -> target/release/slop
 Generate one, then check:
 
 ```sh
-slop index              # auto-selects the indexer; verifies the index isn't empty
+slop setup              # choose Claude/Codex and an editor; install the harness
+slop doctor             # verify host, editor, harness, project, and index state
+slop index              # indexes every detected language family
 slop check              # judges the working-tree diff vs HEAD (cwd)
+slop analyze --all      # visible alias for whole-repository analysis
 slop check --all        # audits the whole repo
 slop check --reindex    # regenerate the index first (else a stale one warns)
 slop check --json       # machine-readable output for editors / CI
 ```
 
 Every command defaults its repo argument to the current directory. (`slop index`
-wraps `scip-python`, `scip-typescript` or `rust-analyzer scip`, picked from the
-repo's project markers; `--indexer` overrides. A broken/empty index fails loudly
+wraps pinned `scip-python` 0.6.6, pinned `scip-typescript` 0.4.0, or
+`rust-analyzer scip`, detected from the source tree; polyglot repositories get
+one artifact per language and one combined graph. `--indexer` or `--index`
+retains the single-artifact seam. A broken/empty index fails loudly
 rather than silently passing.)
+
+Every machine-readable judgment names the immutable repository snapshot and its
+freshness. CLI, gate, MCP, LSP, TUI, baseline, and fix all project from that
+same evaluated finding population; refreshing the dashboard swaps its graph and
+findings together.
 
 ```
 WARNING (1)
@@ -63,8 +78,9 @@ and `slop check` exits non-zero when anything is *Blocking*.
 
 ### Interactive dashboard
 
-Run **`slop`** with no command in a terminal (or `slop dash [repo]`) to open a
-full-screen TUI. It's the control surface for everything else:
+Run `slop dash [repo]` to open the optional full-screen TUI. Bare `slop` prints
+the command surface, so setup and scanning remain discoverable without learning
+dashboard keybindings first.
 
 - browse the whole-repo audit with the arrow keys; each finding's fix guidance
   shows in a detail pane
@@ -127,29 +143,40 @@ that was pure then, doing I/O now).
 `slop fix` applies the *mechanical* repairs itself — dry-run by default,
 `--write` to apply:
 
-- **over-commenting** — deletes comments that restate the adjacent line
-  (behaviour-inert: comments are inert).
 - **naming-convention** — renames a camelCase **free function** to snake_case,
   rewriting every SCIP-resolved reference and re-parsing each file. Aborts if
   any reference can't be located as a whole token or a file stops parsing.
   Methods, throwaway-marker names, and collisions are reported and left to a
   human — a rename there can silently break framework dispatch.
+- **over-commenting** — available only with `--allow-advisory`; directives and
+  tooling comments are protected, but natural-language classification is still
+  graded and must be reviewed.
+- **dead-island** and judge-confirmed wrappers — destructive repairs require
+  their explicit opt-in flags.
+
+Every repair plan is bound to a repository snapshot, checks source preconditions,
+and re-parses staged results. Original files remain in a rollback journal while
+slop reindexes and verifies the selected finding ID disappeared; verification
+failure restores both source and index before returning an error. Use
+`--finding <id>` to repair one exact finding from `slop check --json`.
 
 Everything else stays *guidance*: the finding carries a `fix_guidance` string
 precise enough for an agent to act on.
 
 ## The agent harness
 
-`slop` never drives edits itself — it exposes surfaces an agent host (e.g.
-Claude Code) drives. Wire them into a repo with one command:
+Configure Claude or Codex plus the editor `slop launch` should open:
 
 ```sh
-slop install /path/to/repo   # merges MCP server + hooks into the repo's config
+slop setup /path/to/repo --ai codex --editor cursor
+slop launch /path/to/repo
+slop uninstall /path/to/repo # structurally removes only slop-owned entries
 ```
 
-Or launch Claude Code with the layer already active — `slop claude` wires the
-harness (idempotently) and starts `claude` in the repo so it loads the MCP
-server and hooks:
+Claude gets MCP, hooks, and the embedded skill. Codex gets a project-scoped,
+delimited MCP block in `.codex/config.toml`; the rest of that TOML is preserved
+byte-for-byte. AI/editor preferences remain user-local. `slop install` and
+`slop claude` remain compatibility commands:
 
 ```sh
 slop claude                  # install harness + launch claude in the cwd
@@ -160,13 +187,16 @@ slop claude -- --resume      # args after `--` pass through to claude
 - **Claude skill** — `slop install` drops a `/slop` skill so the agent knows
   when and how to check, triage, fix, and gate on its own.
 - **MCP tools** — `find_capability` (what does this repo already have?),
-  `validate_change`, `get_context_envelope`, `query_subgraph`.
+  `assess_write` (where proposed code belongs), `validate_change`,
+  `get_context_envelope`, and `query_subgraph`. Context envelopes
+  carry snapshot provenance, deterministic integer score reasons, and explicit
+  verbatim fallback when index coverage is stale.
 - **Hooks** — read-path steering + zoned graph-distance compression (skeletonize
   code far from what you're editing; keep near context full-fidelity).
 - **Gate** — `slop gate`, a CI/fix-loop entry point that exits non-zero on
   blocking findings and prints a machine-readable verdict.
-- **Proxy** — `slop proxy`, an `ANTHROPIC_BASE_URL` reverse proxy that injects
-  the same world model for *any* Anthropic client, plus token observability.
+- **Proxy** — `slop proxy`, a bounded `ANTHROPIC_BASE_URL` reverse proxy with
+  explicit concurrency, request-size, capture-size, and timeout ceilings.
 
 Full details, config, and the fix-loop shape: **[docs/harness.md](docs/harness.md)**.
 
@@ -186,9 +216,9 @@ slop lsp                # serve over stdio for the cwd (what an editor launches)
 
 - **Python, JavaScript/TypeScript and Rust are supported**, through one seam
   (`Language` in `slop-parse`): Python via ruff, the rest via tree-sitter.
-  `slop index` auto-selects `scip-python`, `scip-typescript` or
-  `rust-analyzer scip`, and the effect seed table carries a validated set for
-  each. Every rule runs on all three. Resolution is only as good as the SCIP
+  `slop index` runs `scip-python`, `scip-typescript`, and/or
+  `rust-analyzer scip` for every detected language, and the effect seed table
+  carries a validated set for each. Every rule runs on all three. Resolution is only as good as the SCIP
   index — dynamic dispatch, `getattr` and duck typing can be missed, and a
   *stale* index is worse than a missing one, so `check`/`gate` regenerate it
   rather than judging a diff against yesterday's graph.

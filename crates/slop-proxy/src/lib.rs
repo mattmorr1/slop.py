@@ -5,14 +5,16 @@
 //! token usage, and — with `--steer` — augments the request's system prompt
 //! with the repo's sanctioned-channel policy.
 //!
-//! Synchronous, thread-per-connection (`std::net`); upstream calls go through
-//! `ureq`, exactly like `slop-llm`. No tokio.
+//! Synchronous bounded workers (`std::net`); upstream calls go through `ureq`.
 
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -29,14 +31,38 @@ pub struct ProxyConfig {
     pub steer: bool,
     /// JSONL observability log path.
     pub log: Option<PathBuf>,
+    pub max_connections: usize,
+    pub max_request_bytes: usize,
+    pub max_capture_bytes: usize,
+    pub timeout: Duration,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            port: 8787,
+            upstream: "https://api.anthropic.com".into(),
+            repo: None,
+            steer: false,
+            log: None,
+            max_connections: 32,
+            max_request_bytes: 16 * 1024 * 1024,
+            max_capture_bytes: 2 * 1024 * 1024,
+            timeout: Duration::from_secs(300),
+        }
+    }
 }
 
 /// Immutable per-run context shared across connection threads.
 struct Ctx {
     upstream: String,
+    agent: ureq::Agent,
     log: Option<PathBuf>,
     /// Precomputed steering text (None unless `--steer` + a repo with a policy).
     steering: Option<String>,
+    max_request_bytes: usize,
+    max_capture_bytes: usize,
+    timeout: Duration,
 }
 
 /// Bind to the configured port on localhost and serve until the process exits.
@@ -48,7 +74,11 @@ pub fn serve(config: ProxyConfig) -> Result<()> {
         config.port,
         config.upstream,
         config.steer,
-        config.log.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "off".into()),
+        config
+            .log
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "off".into()),
     );
     serve_on(listener, config)
 }
@@ -64,14 +94,17 @@ pub fn serve(config: ProxyConfig) -> Result<()> {
 /// say). Compression stays on the hook path — the proxy is too late for it
 /// (D10).
 fn world_model(repo: &std::path::Path) -> Option<String> {
-    let policy = slop_analyze::policy::Policy::load(repo).ok()?;
     let analysis = slop_analyze::check::load_analysis(repo, None).ok();
+    let fallback_policy = slop_analyze::policy::Policy::load(repo).ok()?;
+    let policy = analysis
+        .as_ref()
+        .map_or(&fallback_policy, |snapshot| &snapshot.policy);
     let env = analysis
         .as_ref()
         .map(|a| slop_analyze::config::env_vars(repo, &a.facts))
         .unwrap_or_default();
     slop_analyze::world::render(
-        &policy,
+        policy,
         analysis.as_ref().map(|a| &a.built),
         &env,
         slop_analyze::world::DEFAULT_BUDGET,
@@ -86,11 +119,24 @@ pub fn serve_on(listener: TcpListener, config: ProxyConfig) -> Result<()> {
     } else {
         None
     };
+    if config.max_connections == 0 {
+        anyhow::bail!("max_connections must be greater than zero");
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(config.timeout)
+        .timeout_write(config.timeout)
+        .build();
     let ctx = Arc::new(Ctx {
         upstream: config.upstream.trim_end_matches('/').to_string(),
+        agent,
         log: config.log,
         steering,
+        max_request_bytes: config.max_request_bytes,
+        max_capture_bytes: config.max_capture_bytes,
+        timeout: config.timeout,
     });
+    let active = Arc::new(AtomicUsize::new(0));
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -100,8 +146,18 @@ pub fn serve_on(listener: TcpListener, config: ProxyConfig) -> Result<()> {
                 continue;
             }
         };
+        let admitted = active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < config.max_connections).then_some(count + 1)
+        });
+        if admitted.is_err() {
+            let mut stream = stream;
+            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            continue;
+        }
         let ctx = Arc::clone(&ctx);
+        let active = Arc::clone(&active);
         std::thread::spawn(move || {
+            let _permit = ConnectionPermit(active);
             if let Err(e) = handle_connection(stream, &ctx) {
                 eprintln!("slop proxy: connection error: {e}");
             }
@@ -110,11 +166,21 @@ pub fn serve_on(listener: TcpListener, config: ProxyConfig) -> Result<()> {
     Ok(())
 }
 
+struct ConnectionPermit(Arc<AtomicUsize>);
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn handle_connection(stream: TcpStream, ctx: &Ctx) -> Result<()> {
+    stream.set_read_timeout(Some(ctx.timeout))?;
+    stream.set_write_timeout(Some(ctx.timeout))?;
     let mut writer = stream.try_clone().context("cloning stream")?;
     let mut reader = BufReader::new(stream);
 
-    let Some(req) = http::parse_request(&mut reader)? else {
+    let Some(req) = http::parse_request_bounded(&mut reader, ctx.max_request_bytes)? else {
         return Ok(()); // client closed with nothing to serve
     };
 
@@ -127,7 +193,7 @@ fn handle_connection(stream: TcpStream, ctx: &Ctx) -> Result<()> {
 
     // Forward upstream via ureq, preserving auth/version headers.
     let url = format!("{}{}", ctx.upstream, req.path);
-    let mut up = ureq::request(&req.method, &url);
+    let mut up = ctx.agent.request(&req.method, &url);
     for (k, v) in &req.headers {
         if !http::skip_request_header(k) {
             up = up.set(k, v);
@@ -167,7 +233,7 @@ fn handle_connection(stream: TcpStream, ctx: &Ctx) -> Result<()> {
     // Stream the body through, teeing a copy for usage extraction. Flush per
     // chunk so SSE tokens reach the client as they arrive.
     let mut body_reader = resp.into_reader();
-    let mut captured = Vec::new();
+    let mut captured = usage::BoundedCapture::new(ctx.max_capture_bytes);
     let mut buf = [0u8; 8192];
     loop {
         let n = body_reader.read(&mut buf)?;
@@ -176,10 +242,10 @@ fn handle_connection(stream: TcpStream, ctx: &Ctx) -> Result<()> {
         }
         writer.write_all(&buf[..n])?;
         writer.flush()?;
-        captured.extend_from_slice(&buf[..n]);
+        captured.extend(&buf[..n]);
     }
 
-    log_usage(ctx, &req.path, status, &captured);
+    log_usage(ctx, &req.path, status, &captured.finish());
     Ok(())
 }
 

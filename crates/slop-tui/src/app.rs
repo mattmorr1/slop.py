@@ -9,9 +9,8 @@ use slop_analyze::check::{AuditFinding, AuditResult};
 use slop_analyze::findings::Severity;
 use slop_analyze::query::Subgraph;
 
-/// Rules `slop fix` can repair mechanically (behaviour-safe comment deletion and
-/// SCIP-verified renames). Everything else is manual — the finding carries
-/// guidance instead.
+/// Rules `slop fix` can repair through a snapshot-bound plan. Comment deletion
+/// remains advisory; the dashboard passes its explicit opt-in for one finding.
 pub const MECHANICAL_RULES: &[&str] = &["over-commenting", "naming-convention"];
 
 pub fn is_mechanical(rule: &str) -> bool {
@@ -55,7 +54,7 @@ impl Cmd {
             Cmd::FixApply => "fix (apply)       write mechanical repairs",
             Cmd::Baseline => "baseline          grandfather current findings",
             Cmd::InitPolicy => "init policy       infer + write slop.toml",
-            Cmd::Install => "install harness   wire MCP + hooks into the repo",
+            Cmd::Install => "setup harness     configure AI/editor + repo harness",
             Cmd::Gate => "gate              CI-style pass/fail verdict",
             Cmd::Test => "run tests         the project's test suite (pytest / npm)",
         }
@@ -132,7 +131,7 @@ pub enum Action {
     Verify,
     /// Copy the selected finding's detail to the system clipboard.
     YankSelected,
-    /// Dispatch the selected finding to Claude Code (headless) to fix, then
+    /// Dispatch the selected finding to the configured AI to fix, then
     /// reindex + gate to verify. For the semantic rules the deterministic
     /// fixer can't touch.
     FixWithClaude,
@@ -207,6 +206,11 @@ impl App {
 
     pub fn selected_finding(&self) -> Option<&AuditFinding> {
         self.visible().into_iter().nth(self.selected)
+    }
+
+    pub fn selected_finding_id(&self) -> Option<String> {
+        self.selected_finding()
+            .map(|finding| finding.finding.id().to_string())
     }
 
     /// Plain-text detail block for the selected finding — what `y` copies to the
@@ -384,19 +388,17 @@ impl App {
                     Action::None
                 }
             }
-            KeyCode::Char('x') => {
-                match self.selected_finding() {
-                    Some(f) if is_mechanical(f.finding.rule) => Action::FixSelected,
-                    Some(f) => {
-                        self.status = Some(format!(
+            KeyCode::Char('x') => match self.selected_finding() {
+                Some(f) if is_mechanical(f.finding.rule) => Action::FixSelected,
+                Some(f) => {
+                    self.status = Some(format!(
                             "{} isn't auto-fixable — press Enter to open it and follow the fix guidance",
                             f.finding.rule
                         ));
-                        Action::None
-                    }
-                    None => Action::None,
+                    Action::None
                 }
-            }
+                None => Action::None,
+            },
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_by(1);
                 Action::None
@@ -477,6 +479,7 @@ impl App {
 mod tests {
     use super::*;
     use slop_analyze::findings::Finding;
+    use slop_analyze::snapshot::SnapshotFreshness;
 
     fn finding(rule: &'static str, sev: Severity, entity: &str) -> Finding {
         Finding {
@@ -485,6 +488,7 @@ mod tests {
             entity: entity.to_string(),
             file: "f.py".to_string(),
             lines: (0, 1),
+            related: Vec::new(),
             message: "m".to_string(),
             fix_guidance: "fix".to_string(),
         }
@@ -493,12 +497,19 @@ mod tests {
     fn app_with(items: Vec<(Finding, bool)>) -> App {
         let findings: Vec<AuditFinding> = items
             .into_iter()
-            .map(|(finding, grandfathered)| AuditFinding { finding, grandfathered })
+            .map(|(finding, grandfathered)| AuditFinding {
+                finding,
+                grandfathered,
+            })
             .collect();
         let grandfathered = findings.iter().filter(|f| f.grandfathered).count();
         App::new(
             "repo".into(),
             AuditResult {
+                snapshot: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .parse()
+                    .unwrap(),
+                freshness: SnapshotFreshness::Current,
                 findings,
                 health_all: 50,
                 health_new: 90,
@@ -559,12 +570,22 @@ mod tests {
     #[test]
     fn x_fixes_mechanical_but_only_advises_on_manual() {
         // over-commenting is mechanical -> FixSelected
-        let mut mech = app_with(vec![(finding("over-commenting", Severity::Advisory, "x"), false)]);
+        let mut mech = app_with(vec![(
+            finding("over-commenting", Severity::Advisory, "x"),
+            false,
+        )]);
         assert_eq!(mech.on_key(KeyCode::Char('x')), Action::FixSelected);
         // infra-bypass is manual -> no action, but a status hint is set
-        let mut manual = app_with(vec![(finding("infra-bypass", Severity::Blocking, "y"), false)]);
+        let mut manual = app_with(vec![(
+            finding("infra-bypass", Severity::Blocking, "y"),
+            false,
+        )]);
         assert_eq!(manual.on_key(KeyCode::Char('x')), Action::None);
-        assert!(manual.status.as_ref().unwrap().contains("isn't auto-fixable"));
+        assert!(manual
+            .status
+            .as_ref()
+            .unwrap()
+            .contains("isn't auto-fixable"));
     }
 
     #[test]
@@ -606,8 +627,14 @@ mod tests {
 
     #[test]
     fn e_opens_explorer_on_selected_entity() {
-        let mut app = app_with(vec![(finding("infra-bypass", Severity::Blocking, "svc::foo"), false)]);
-        assert_eq!(app.on_key(KeyCode::Char('e')), Action::Explore("svc::foo".to_string()));
+        let mut app = app_with(vec![(
+            finding("infra-bypass", Severity::Blocking, "svc::foo"),
+            false,
+        )]);
+        assert_eq!(
+            app.on_key(KeyCode::Char('e')),
+            Action::Explore("svc::foo".to_string())
+        );
         assert_eq!(app.mode, Mode::Explorer);
     }
 
@@ -621,7 +648,10 @@ mod tests {
         assert_eq!(app.explorer_stack, vec!["x".to_string()]);
         app.set_explorer_subgraph(subgraph("y", &[("x", "in")]));
         // back returns to x
-        assert_eq!(app.on_key(KeyCode::Backspace), Action::Explore("x".to_string()));
+        assert_eq!(
+            app.on_key(KeyCode::Backspace),
+            Action::Explore("x".to_string())
+        );
         assert!(app.explorer_stack.is_empty());
         // back again with empty stack closes the explorer
         app.set_explorer_subgraph(subgraph("x", &[("y", "out")]));
@@ -643,7 +673,10 @@ mod tests {
 
     #[test]
     fn y_yanks_and_builds_detail_text() {
-        let mut app = app_with(vec![(finding("infra-bypass", Severity::Blocking, "svc::foo"), false)]);
+        let mut app = app_with(vec![(
+            finding("infra-bypass", Severity::Blocking, "svc::foo"),
+            false,
+        )]);
         assert_eq!(app.on_key(KeyCode::Char('y')), Action::YankSelected);
         let text = app.selected_detail_text().unwrap();
         assert!(text.contains("[infra-bypass] svc::foo"));
@@ -652,7 +685,10 @@ mod tests {
 
     #[test]
     fn a_dispatches_to_claude_with_a_scoped_prompt() {
-        let mut app = app_with(vec![(finding("infra-bypass", Severity::Blocking, "svc::foo"), false)]);
+        let mut app = app_with(vec![(
+            finding("infra-bypass", Severity::Blocking, "svc::foo"),
+            false,
+        )]);
         assert_eq!(app.on_key(KeyCode::Char('a')), Action::FixWithClaude);
         let prompt = app.selected_claude_prompt().unwrap();
         assert!(prompt.contains("infra-bypass"));
@@ -664,7 +700,10 @@ mod tests {
     fn v_triggers_verify_and_panel_dismisses_on_any_key() {
         let mut app = app_with(vec![(finding("a", Severity::Blocking, "x"), false)]);
         assert_eq!(app.on_key(KeyCode::Char('v')), Action::Verify);
-        app.set_verify(VerifyPanel { passed: true, lines: vec!["health 100/100".into()] });
+        app.set_verify(VerifyPanel {
+            passed: true,
+            lines: vec!["health 100/100".into()],
+        });
         assert_eq!(app.mode, Mode::Verify);
         app.on_key(KeyCode::Char('j')); // any key dismisses
         assert_eq!(app.mode, Mode::Normal);

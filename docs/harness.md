@@ -1,9 +1,9 @@
 # The slop harness (v2)
 
-`slop` never drives edits itself (D9). It exposes three surfaces an existing
-agent host (e.g. Claude Code) drives:
+`slop` applies only explicit snapshot-bound repairs itself. Semantic changes
+remain driven by the configured agent host:
 
-1. **MCP tools** — `validate_change`, `get_context_envelope`, `query_subgraph`.
+1. **MCP tools** — `assess_write`, `validate_change`, `get_context_envelope`, `query_subgraph`.
 2. **Hooks** — read-path compression + sanctioned-channel steering.
 3. **Gate** — `slop gate`, the CI/loop entry point (see below).
 4. **Proxy** — `slop proxy`, agent-agnostic steering/observability (see below).
@@ -15,19 +15,25 @@ Build the binary first: `cargo build --release` → `target/release/slop`.
 ### One-command setup
 
 ```
-slop install <repo-root>
+slop setup <repo-root> --ai claude --editor cursor
+# or
+slop setup <repo-root> --ai codex --editor zed
 ```
 
-wires slop into a repo's agent host for you: it merges the MCP server into
-`<repo>/.mcp.json`, the read/prompt hooks into `<repo>/.claude/settings.json`,
-and drops the **slop skill** at `<repo>/.claude/skills/slop/SKILL.md` (an agent
+wires slop into the selected agent host and saves the AI/editor preference in
+the user's slop config. Claude setup merges the MCP server into `.mcp.json`,
+the read/prompt hooks into `.claude/settings.json`, and drops the **slop skill**
+at `.claude/skills/slop/SKILL.md` (an agent
 playbook for `/slop` — check, triage, fix, gate), pointing every entry at the
-binary you invoked (absolute path). It is
-**idempotent** — re-running updates slop's own entries (e.g. after a rebuild
-moves the binary) and preserves every other MCP server and hook you have. It
+binary you invoked. Codex setup adds a delimited project-scoped MCP block to
+`.codex/config.toml`; Codex CLI, the IDE extension, and the desktop app share
+that trusted-project configuration. Setup is transactional and **idempotent**:
+re-running updates slop's entries and preserves every other MCP server, hook,
+and Codex TOML byte-for-byte. It
 refuses to touch a config file that isn't valid JSON unless you pass `--force`.
-Sections 1–2 below document the config it writes, if you'd rather do it by hand.
-Restart the agent host afterwards to load the server and hooks.
+`slop uninstall` structurally removes only owned entries; `slop doctor` checks
+the host, editor, receipt, project markers, and index. `slop install` remains a
+Claude-only compatibility command. Restart the agent host after setup.
 
 ### Local LLM (Ollama)
 
@@ -66,21 +72,22 @@ Register in `.mcp.json` (project scope) or `~/.claude.json`:
 ```
 
 Tools default the `repo` argument to the launch repo; each accepts an explicit
-`repo` override. `validate_change` needs a SCIP index (`<repo>/index.scip` by
-default); generate one with:
+`repo` override. `validate_change` needs SCIP coverage; generate every detected
+language artifact with:
 
 ```
-npx --yes @sourcegraph/scip-python index <repo> --project-name <name> --output <repo>/index.scip
+slop index <repo>
 ```
 
 | Tool | Purpose | Key args |
 | --- | --- | --- |
 | `find_capability` | What the codebase already provides for an intent | `intent`, `effect`, `limit` |
+| `assess_write` | Proposed-source policy findings and existing homes | `file`, `content`, `limit` |
 | `validate_change` | Full detector suite → findings + fix guidance | `all`, `base`, `tier3` |
 | `get_context_envelope` | Effect-typed, budget-packed context around an entity | `target_entity`, `token_budget`, `edit_zone_hops` |
 | `query_subgraph` | Callers/callees/imports + effect signature | `entity`, `depth`, `edge_kinds` |
 
-`find_capability` is the entry point: the other two graph tools take an entity
+`find_capability` is the intent-first entry point: the graph tools take an entity
 id, and until now nothing produced one — the graph's only lookup was an exact
 match on an id the agent had no way to guess. Ask it what exists before writing
 a new implementation, then feed any id it returns to `query_subgraph` or
@@ -91,22 +98,24 @@ token overlap, ties broken by how many places call it): no embeddings, no LLM.
 
 ## 2. Hooks
 
-All three hooks derive steering from `slop.toml` alone (no SCIP index, no graph
-build) so they are cheap enough to run on every read/write/prompt.
+Per-write hooks never build the graph. Session start emits a compact,
+schema-versioned callee-neighborhood sidecar into the system temp directory;
+later writes combine it with the current `slop.toml` policy.
 
 - `slop hook pre-tool-use` — **write-time steering**: judges the content a
   `Write`/`Edit`/`MultiEdit` is *about to* produce, before it lands, and attaches
-  `additionalContext` naming the sanctioned channel it bypasses.
-  - Content-local by design: it parses the proposed text, takes the qualified
-    names it references, and asks the policy whether an effect it acquires
-    already has a channel. No index, no graph — ~7ms including process spawn.
+  `additionalContext` naming the sanctioned channel it bypasses and any existing
+  function whose distinctive callees make it a plausible home for the code.
+  - It parses the proposed text once. Direct effect acquisition is checked
+    against policy; reuse retrieval reads the compact sidecar rather than SCIP
+    or the full graph. Missing sidecar degrades to policy-only steering.
   - An `Edit`'s `new_string` is a dedented fragment that wouldn't parse alone, so
     the replacement is applied to the on-disk file first and the *result* checked.
   - **Warn-only.** It never sets `permissionDecision`, so it cannot block a write.
     Denying is gated on measured per-rule precision — a false deny costs more than
     a missed finding. Promote a rule only once its precision earns it.
-  - Silent when the repo has no `slop.toml` channels (D8), and for files in no
-    supported language.
+  - Policy findings stay silent when the repo has no confirmed channels (D8),
+    while reuse evidence can still surface. Unsupported languages stay silent.
   - Sees *direct* acquisition only (no graph ⇒ no transitive propagation). The
     deeper checks stay in `validate_change` / `slop gate`.
 
@@ -154,7 +163,7 @@ build) so they are cheap enough to run on every read/write/prompt.
     capabilities are trimmed first, so the policy facts always survive.
   - Silent when there is nothing to say (no policy and no graph).
 
-Register in `.claude/settings.json` (or just run `slop install`, which writes
+Register in `.claude/settings.json` (or just run `slop setup --ai claude`, which writes
 exactly this). The matcher covers the write tools too, so the hook can record
 the session edit zone that read compression measures graph distance against:
 
@@ -211,7 +220,7 @@ slop gate <repo> [--base HEAD] [--all] [--tier3] [--fail-on blocking|warning|adv
   the loop act on `duplicate-exact`, `complexity-spike`, and `purity-lie`, not
   just the deterministic blockers (`infra-bypass`, `circular-import`). The JSON
   reports `fail_on`, `failing` (count at/above threshold), and `blocking`.
-- `--reindex` regenerates the SCIP index (via `scip-python`) before checking,
+- `--reindex` regenerates every detected language's SCIP artifact before checking,
   so a re-run after edits sees the new graph.
 - `--worktree` runs inside an isolated `git worktree` of the repo.
 

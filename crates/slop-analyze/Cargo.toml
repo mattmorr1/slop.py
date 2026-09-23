@@ -2,7 +2,13 @@
 name = "slop-analyze"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+description = "Repository-relative judgment, context, policy, and repair planning for slop"
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
@@ -10,6 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 petgraph = { workspace = true }
+blake3 = { workspace = true }
 slop-graph = { workspace = true }
 slop-llm = { workspace = true }
 slop-parse = { workspace = true }

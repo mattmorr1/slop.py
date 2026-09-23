@@ -1,8 +1,9 @@
 //! Source-level facts: parse every indexed file with slop-parse and join
 //! function facts back to graph entities by (file, def line).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 
 use petgraph::graph::NodeIndex;
 use slop_parse::{FunctionFacts, Language};
@@ -37,6 +38,17 @@ pub fn parse_repo(repo_root: &Path, files: &[&str]) -> Vec<FileFacts> {
         });
     }
     all
+}
+
+pub fn parse_corpus(sources: &BTreeMap<String, Arc<str>>) -> Vec<FileFacts> {
+    sources
+        .iter()
+        .filter_map(|(file, source)| {
+            let lang = Language::from_path(file)?;
+            let functions = lang.parse(source).ok()?;
+            Some(FileFacts { file: file.clone(), functions })
+        })
+        .collect()
 }
 
 /// Is `entity_id` defined inside a test module? Rust (and Go) keep tests in the

@@ -12,24 +12,27 @@
 //! That is lossy and largely self-correcting: a name ambiguous enough to collide
 //! across modules is called often enough to fail the distinctiveness cutoff.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
+use serde::{Deserialize, Serialize};
 use slop_graph::{EdgeKind, NodeType};
 
 use crate::build::BuiltGraph;
 use crate::detect::{DISTINCTIVE_DF_DIVISOR, MIN_DISTINCTIVE_CALLEES};
 
 /// A function the repo already has, with the simple names it calls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candidate {
     pub label: String,
     pub file: String,
     pub line: usize,
-    pub callees: HashSet<String>,
+    pub callees: BTreeSet<String>,
 }
 
 /// An existing function whose neighborhood overlaps the proposed content.
+#[derive(Debug, Clone, Serialize)]
 pub struct Match {
     pub label: String,
     pub file: String,
@@ -38,8 +41,8 @@ pub struct Match {
     pub distinctive: Vec<String>,
     /// Every shared callee, distinctive or not.
     pub shared: usize,
-    /// Cosine over the distinctive overlap, normalized by both set sizes.
-    pub score: f64,
+    /// Squared cosine in parts per million. Integer form keeps artifacts stable.
+    pub score_ppm: u32,
 }
 
 /// Callee frequencies plus every candidate function, built once per graph.
@@ -48,25 +51,27 @@ pub struct Match {
 /// counts full entity ids. Deliberately different: that detector compares two
 /// resolved graph nodes and can afford exact ids, while this one has to meet
 /// unresolved source text halfway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Neighborhood {
     callers: usize,
-    df: HashMap<String, usize>,
+    df: BTreeMap<String, usize>,
     pub functions: Vec<Candidate>,
 }
 
 impl Neighborhood {
     pub fn build(built: &BuiltGraph) -> Self {
-        let mut df: HashMap<String, usize> = HashMap::new();
+        let mut df: BTreeMap<String, usize> = BTreeMap::new();
         let mut callers = 0usize;
         let mut functions = Vec::new();
         for (idx, entity) in built.graph.entities() {
             if entity.entity_type != NodeType::Function
                 || crate::source::is_test_file(&entity.file)
                 || crate::source::is_test_entity(&entity.id)
+                || crate::index::ignored_source_path(&entity.file)
             {
                 continue;
             }
-            let callees: HashSet<String> = built
+            let callees: BTreeSet<String> = built
                 .graph
                 .graph
                 .edges_directed(idx, Direction::Outgoing)
@@ -94,7 +99,12 @@ impl Neighborhood {
                 callees,
             });
         }
-        Self { callers, df, functions }
+        functions.sort_by(|a, b| a.label.cmp(&b.label));
+        Self {
+            callers,
+            df,
+            functions,
+        }
     }
 
     /// A callee this many functions share is common vocabulary, not a feature.
@@ -107,7 +117,7 @@ impl Neighborhood {
     /// possible: feed an existing body back in and hide its own entry.
     pub fn matches(
         &self,
-        proposed: &HashSet<String>,
+        proposed: &BTreeSet<String>,
         exclude: Option<&str>,
         limit: usize,
     ) -> Vec<Match> {
@@ -137,22 +147,25 @@ impl Neighborhood {
                 // and ranked above every real match. Normalizing by both set
                 // sizes is what makes overlap mean "does the same job" rather
                 // than "does many jobs".
-                let score = distinctive.len() as f64
-                    / ((c.callees.len() * proposed.len()) as f64).sqrt();
+                let denominator = c.callees.len().saturating_mul(proposed.len()).max(1);
+                let numerator = distinctive.len().saturating_mul(distinctive.len());
+                let score_ppm = numerator
+                    .saturating_mul(1_000_000)
+                    .checked_div(denominator)
+                    .unwrap_or(0) as u32;
                 Some(Match {
                     label: c.label.clone(),
                     file: c.file.clone(),
                     line: c.line,
                     distinctive,
                     shared: shared.len(),
-                    score,
+                    score_ppm,
                 })
             })
             .collect();
         out.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.score_ppm
+                .cmp(&a.score_ppm)
                 .then(b.distinctive.len().cmp(&a.distinctive.len()))
                 .then(a.label.cmp(&b.label))
         });
@@ -171,8 +184,8 @@ pub fn simple_name(id: &str) -> String {
 /// Names it defines are subtracted: `qualified_names` reports a function's own
 /// name from its definition line, which made every caller/callee pair look like a
 /// match — the caller has the name as a real callee, the callee has it as itself.
-pub fn query_from_source(lang: slop_parse::Language, source: &str) -> HashSet<String> {
-    let defined: HashSet<String> = lang
+pub fn query_from_source(lang: slop_parse::Language, source: &str) -> BTreeSet<String> {
+    let defined: BTreeSet<String> = lang
         .parse(source)
         .map(|fns| fns.iter().map(|f| simple_name(&f.name)).collect())
         .unwrap_or_default();
@@ -203,6 +216,9 @@ mod tests {
         let q = query_from_source(Language::Python, src);
         assert!(q.contains("get_settings"), "referenced names stay: {q:?}");
         assert!(q.contains("sanitize"));
-        assert!(!q.contains("before_send_filter"), "own name must be dropped: {q:?}");
+        assert!(
+            !q.contains("before_send_filter"),
+            "own name must be dropped: {q:?}"
+        );
     }
 }

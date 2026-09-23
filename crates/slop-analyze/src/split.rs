@@ -122,10 +122,10 @@ fn components(
     }
 
     let mut uf = UnionFind::<usize>::new(n);
-    for j in 0..n {
-        for i in 0..j {
+    for (j, used) in uses.iter().enumerate() {
+        for (i, defined) in defs[..j].iter().enumerate() {
             // A later statement reading a name an earlier one bound is dataflow.
-            if !defs[i].is_disjoint(&uses[j]) {
+            if !defined.is_disjoint(used) {
                 uf.union(i, j);
             }
         }
@@ -237,6 +237,7 @@ fn finding(entity: &slop_graph::CodeEntity, fact: &FunctionFacts, parts: &[Part]
         entity: entity.id.clone(),
         file: entity.file.clone(),
         lines: (fact.start_line as usize, fact.end_line as usize),
+        related: Vec::new(),
         message: format!(
             "{} statements form {} {shape} groups that exchange no values: lines {spans}",
             fact.stmt_spans.len(),

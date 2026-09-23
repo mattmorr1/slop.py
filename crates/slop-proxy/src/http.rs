@@ -6,6 +6,39 @@
 
 use std::io::{self, BufRead};
 
+fn read_line_bounded<R: BufRead>(
+    reader: &mut R,
+    line: &mut String,
+    limit: usize,
+) -> io::Result<usize> {
+    line.clear();
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(line.len());
+        }
+        let take = buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(buffer.len(), |index| index + 1);
+        if line.len().saturating_add(take) > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HTTP line exceeds configured limit",
+            ));
+        }
+        let chunk = std::str::from_utf8(&buffer[..take]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "HTTP headers are not UTF-8")
+        })?;
+        let ended = chunk.ends_with('\n');
+        line.push_str(chunk);
+        reader.consume(take);
+        if ended {
+            return Ok(line.len());
+        }
+    }
+}
+
 /// A parsed client request. `path` includes the query string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
@@ -27,8 +60,16 @@ impl HttpRequest {
 /// Parse one request from `reader`. Returns `Ok(None)` on a clean EOF before
 /// any request line (connection closed with nothing to serve).
 pub fn parse_request<R: BufRead>(reader: &mut R) -> io::Result<Option<HttpRequest>> {
+    parse_request_bounded(reader, 16 * 1024 * 1024)
+}
+
+pub fn parse_request_bounded<R: BufRead>(
+    reader: &mut R,
+    max_body_bytes: usize,
+) -> io::Result<Option<HttpRequest>> {
+    const MAX_HEADER_BYTES: usize = 64 * 1024;
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
+    if read_line_bounded(reader, &mut request_line, 8 * 1024)? == 0 {
         return Ok(None);
     }
     let mut parts = request_line.split_whitespace();
@@ -43,12 +84,25 @@ pub fn parse_request<R: BufRead>(reader: &mut R) -> io::Result<Option<HttpReques
 
     let mut headers = Vec::new();
     let mut content_length = 0usize;
+    let mut header_bytes = request_line.len();
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        if read_line_bounded(
+            reader,
+            &mut line,
+            MAX_HEADER_BYTES.saturating_sub(header_bytes),
+        )? == 0
+        {
             break;
         }
         let line = line.trim_end_matches(['\r', '\n']);
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_bytes > MAX_HEADER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request headers exceed 64 KiB",
+            ));
+        }
         if line.is_empty() {
             break; // end of headers
         }
@@ -56,7 +110,15 @@ pub fn parse_request<R: BufRead>(reader: &mut R) -> io::Result<Option<HttpReques
             let k = k.trim().to_string();
             let v = v.trim().to_string();
             if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.parse().unwrap_or(0);
+                content_length = v.parse().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length")
+                })?;
+                if content_length > max_body_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "request body exceeds configured limit",
+                    ));
+                }
             }
             headers.push((k, v));
         }

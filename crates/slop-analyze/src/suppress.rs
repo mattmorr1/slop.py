@@ -76,6 +76,7 @@ mod tests {
             entity: "a::f".into(),
             file: "a.py".into(),
             lines,
+            related: Vec::new(),
             message: String::new(),
             fix_guidance: String::new(),
         };

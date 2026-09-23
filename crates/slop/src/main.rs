@@ -6,21 +6,22 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use slop_analyze::baseline::Baseline;
 use slop_analyze::check::{self, CheckRequest, CheckResult};
-use slop_analyze::findings::Severity;
-use std::collections::{HashMap, HashSet};
+use slop_analyze::findings::{FindingId, Severity};
 
 use slop_analyze::compress::{self, CompressConfig};
 use slop_analyze::index::{
     default_project_name, ensure_index, run_indexer, run_scip_index, Indexer,
 };
-use slop_analyze::{
-    detect, fix, gate, harness, infer, inline, policy::Policy, rename, retrieve, suppress,
-};
-use slop_resolve::{Resolver, ScipResolver};
+use slop_analyze::{gate, harness, infer, repair, retrieve};
+use slop_resolve::{IndexSet, Resolver, ScipResolver};
+
+mod setup;
 
 #[derive(Parser)]
 #[command(name = "slop", about = "Codebase-relative AI-slop analyzer", version)]
-#[command(after_help = "Run `slop` with no command in a terminal to open the interactive dashboard.")]
+#[command(
+    after_help = "Start with `slop setup`, then run `slop check`. The dashboard is available as `slop dash`."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -40,7 +41,7 @@ enum HookEvent {
 /// Which SCIP indexer `slop index` runs. Mirrors [`Indexer`]; separate only
 /// because deriving clap's `ValueEnum` on the library type would put clap in
 /// the analysis crate.
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum IndexerArg {
     /// Detect from the repo's project markers.
     Auto,
@@ -88,6 +89,7 @@ impl From<FailOn> for slop_analyze::findings::Severity {
 #[derive(Subcommand)]
 enum Command {
     /// Analyze a repo. Default: judge only the working-tree diff (vs HEAD).
+    #[command(visible_alias = "analyze")]
     Check {
         /// Repo root (default: current directory; must contain slop.toml for
         /// policy-gated checks)
@@ -118,12 +120,8 @@ enum Command {
         #[arg(long)]
         reindex: bool,
     },
-    /// Apply slop's mechanistic auto-fixes (D9 path a). Two rules:
-    /// over-commenting — delete comments that restate the adjacent code
-    /// (behaviour-safe: comments are inert); and naming-convention —
-    /// rename a camelCase free function to snake_case, rewriting every
-    /// SCIP-resolved reference and re-parsing each file (methods and
-    /// throwaway-marker names are left to a human). Dry-run unless --write.
+    /// Preview or transactionally apply snapshot-bound repairs. Index-verified
+    /// renames are enabled by default; graded repairs require an opt-in flag.
     Fix {
         /// Repo root (default: current directory)
         #[arg(default_value = ".")]
@@ -134,6 +132,13 @@ enum Command {
         /// Apply changes to disk (default: report only)
         #[arg(long)]
         write: bool,
+        /// Repair exactly one finding ID from `slop check --json`.
+        #[arg(long)]
+        finding: Option<String>,
+        /// Include graded restating-comment repairs. Tooling directives remain
+        /// protected, but the classification is heuristic and requires review.
+        #[arg(long)]
+        allow_advisory: bool,
         /// Also remove dead free functions (Warning `dead-island`). Opt-in even
         /// with --write: deleting code is riskier than the comment/rename fixes
         /// (SCIP can miss a dynamic caller), so review the dry-run first.
@@ -193,6 +198,18 @@ enum Command {
         /// Append per-request token usage to this JSONL log
         #[arg(long)]
         log: Option<PathBuf>,
+        /// Maximum simultaneous client connections; excess receives HTTP 503.
+        #[arg(long, default_value_t = 32)]
+        max_connections: usize,
+        /// Maximum request body size in MiB.
+        #[arg(long, default_value_t = 16)]
+        max_request_mib: usize,
+        /// Maximum response bytes retained for usage extraction in MiB.
+        #[arg(long, default_value_t = 2)]
+        max_capture_mib: usize,
+        /// Client/upstream I/O timeout in seconds.
+        #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
     },
     /// Validation gate (M5): run the check and exit non-zero if anything
     /// blocks, printing a JSON verdict a CI step or agent fix-loop consumes.
@@ -229,10 +246,7 @@ enum Command {
         /// Which hook event this invocation handles
         event: HookEvent,
     },
-    /// Open the interactive findings dashboard (full-screen TUI). Browse the
-    /// whole-repo audit with arrow keys, filter by severity, toggle
-    /// grandfathered findings, reload in place. Bare `slop` in a terminal opens
-    /// this on the current directory.
+    /// Open the optional interactive findings dashboard (full-screen TUI).
     Dash {
         /// Repo root (default: current directory)
         #[arg(default_value = ".")]
@@ -252,8 +266,8 @@ enum Command {
         #[arg(long)]
         index: Option<PathBuf>,
     },
-    /// Serve slop's MCP tools (validate_change, get_context_envelope,
-    /// query_subgraph) over stdio. Launched per-project by an agent host
+    /// Serve slop's MCP tools (assess_write, validate_change,
+    /// get_context_envelope, query_subgraph) over stdio. Launched by an agent host
     /// (e.g. Claude Code); speaks newline-delimited JSON-RPC 2.0.
     Mcp {
         /// Repo root the tools default to (default: current directory)
@@ -263,11 +277,8 @@ enum Command {
         #[arg(long)]
         index: Option<PathBuf>,
     },
-    /// Generate (or regenerate) the SCIP index slop reads. Wraps the per-language
-    /// indexer (`scip-python`, `scip-typescript`, `rust-analyzer scip`) and
-    /// verifies the result actually has definitions — an indexer can crash
-    /// mid-walk and still write a near-empty index that makes every check
-    /// silently pass.
+    /// Generate SCIP artifacts for every detected language. Explicit
+    /// --indexer/--output retains the single-artifact compatibility seam.
     Index {
         /// Repo root to index (default: current directory)
         #[arg(default_value = ".")]
@@ -282,10 +293,78 @@ enum Command {
         #[arg(long, value_enum, default_value_t = IndexerArg::Auto)]
         indexer: IndexerArg,
     },
+    /// Configure slop for an agent host and editor, then install the repo-local
+    /// harness transactionally. Preferences are user-local; harness files are
+    /// project-local and can be removed with `slop uninstall`.
+    Setup {
+        /// Repo root to configure (default: current directory)
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+        /// Preferred AI host. Required when stdin is not interactive unless a
+        /// preference was saved by an earlier setup.
+        #[arg(long, value_enum)]
+        ai: Option<setup::AgentHost>,
+        /// Preferred editor to open from `slop launch`.
+        #[arg(long, value_enum)]
+        editor: Option<setup::Editor>,
+        /// Replace invalid or conflicting slop-owned generated files.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Verify the saved AI/editor, harness receipt, project markers, and index.
+    Doctor {
+        /// Repo root to diagnose (default: current directory)
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Remove only entries and generated files owned by `slop setup`.
+    Uninstall {
+        /// Repo root to disconnect (default: current directory)
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+        /// Remove generated files even if their content changed after setup.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Open the preferred editor and run the preferred AI in this repository.
+    Launch {
+        /// Repo root (default: current directory)
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+        /// Override the saved AI for this launch.
+        #[arg(long, value_enum)]
+        ai: Option<setup::AgentHost>,
+        /// Override the saved editor for this launch.
+        #[arg(long, value_enum)]
+        editor: Option<setup::Editor>,
+        /// Do not refresh the repo-local harness before launching.
+        #[arg(long)]
+        no_setup: bool,
+        /// Do not open the configured editor.
+        #[arg(long)]
+        no_editor: bool,
+        /// Args passed through to the AI host (everything after `--`).
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Internal adapter used by the dashboard to delegate one scoped repair to
+    /// the AI selected by `slop setup`.
+    #[command(hide = true)]
+    Delegate {
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        prompt: String,
+    },
+    /// Internal adapter used by the dashboard to open a finding in the editor
+    /// selected by `slop setup`.
+    #[command(hide = true)]
+    Open { target: String },
     /// Wire slop's harness into a repo's agent-host config: merge the MCP
     /// server into `<repo>/.mcp.json` and the read/prompt hooks into
     /// `<repo>/.claude/settings.json`, pointing at this binary. Idempotent —
     /// re-running updates slop's own entries and leaves the rest untouched.
+    #[command(hide = true)]
     Install {
         /// Repo root to install into (default: current directory)
         #[arg(default_value = ".")]
@@ -299,6 +378,7 @@ enum Command {
     /// starts `claude` there so it loads them. `--proxy` also routes the session
     /// through slop's steering + token-observability proxy. Args after `--` pass
     /// through to claude (e.g. `slop claude -- --resume`).
+    #[command(hide = true)]
     Claude {
         /// Repo root (default: current directory)
         #[arg(default_value = ".")]
@@ -392,11 +472,6 @@ enum DebugCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let Some(command) = cli.command else {
-        // Bare `slop`: open the dashboard in a terminal, else print help (so
-        // piping / CI still gets something useful instead of a raw-mode error).
-        if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
-            return slop_tui::run(PathBuf::from("."), None);
-        }
         use clap::CommandFactory;
         Cli::command().print_help()?;
         println!();
@@ -404,8 +479,9 @@ fn main() -> Result<()> {
     };
     match command {
         Command::Dash { repo, index } => {
-            let index_path = index.clone().unwrap_or_else(|| repo.join("index.scip"));
-            ensure_index(&repo, &index_path)?;
+            if let Some(index_path) = index.as_deref() {
+                ensure_index(&repo, index_path)?;
+            }
             slop_tui::run(repo, index)?;
         }
         Command::Check {
@@ -441,182 +517,129 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Fix { repo, index, write, remove_dead, inline_wrappers } => {
+        Command::Fix {
+            repo,
+            index,
+            write,
+            finding,
+            allow_advisory,
+            remove_dead,
+            inline_wrappers,
+        } => {
             let analysis = check::load_analysis(&repo, index.as_deref())?;
-            let policy = Policy::load(&repo).unwrap_or_default();
-            let findings = detect::run_all(&analysis.built, &policy, &analysis.facts, &repo);
-
-            // Renames first: they only substitute name tokens (no line-count
-            // change), so the over-commenting pass below still sees valid line
-            // numbers. The resolver drives SCIP-verified reference rewriting.
-            let index_path = index
-                .clone()
-                .unwrap_or_else(|| repo.join("index.scip"));
-            let resolver = ScipResolver::load(&index_path)?;
-            let renames = rename::plan_renames(&analysis.built, &resolver, &repo, &findings);
-            let mut renamed = 0usize;
-            for outcome in &renames.outcomes {
-                match outcome {
-                    rename::RenameOutcome::Planned(p) => {
-                        renamed += 1;
-                        let verb = if write { "rename" } else { "would rename" };
-                        println!(
-                            "{verb} [{}] {} -> {} ({} occurrence(s) across {} file(s))",
-                            p.rule, p.entity, p.new_name, p.occurrences, p.file_count
-                        );
-                    }
-                    rename::RenameOutcome::Skipped { entity, reason } => {
-                        eprintln!("skip rename {entity}: {reason}");
-                    }
-                }
-            }
-            if write {
-                for (file, src) in &renames.files {
-                    std::fs::write(repo.join(file), src)
-                        .with_context(|| format!("writing {file}"))?;
-                }
-            }
-
-            // Dead-code removal (opt-in). Runs after renames (which don't change
-            // line counts, so the parser's spans stay valid) and marks touched
-            // files so the over-commenting pass below skips them — its cached
-            // line numbers would be stale once whole functions are deleted.
-            let mut removed_fns = 0usize;
-            let mut dead_files: HashSet<String> = HashSet::new();
-            if remove_dead {
-                let removals = fix::plan_dead_removals(&analysis.built, &analysis.facts, &findings);
-                let mut by_file: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
-                for r in &removals {
-                    let verb = if write { "remove" } else { "would remove" };
-                    println!("{verb} [dead-island] {} ({})", r.entity, r.file);
-                    by_file.entry(r.file.clone()).or_default().push(r.lines);
-                }
-                for (file, ranges) in by_file {
-                    dead_files.insert(file.clone());
-                    removed_fns += ranges.len();
-                    if write {
-                        let path = repo.join(&file);
-                        let src = std::fs::read_to_string(&path)
-                            .with_context(|| format!("reading {file}"))?;
-                        let new_src = fix::delete_line_ranges(&src, &ranges);
-                        std::fs::write(&path, &new_src)
-                            .with_context(|| format!("writing {file}"))?;
-                    }
-                }
-            }
-
-            let mut by_file: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-            for f in findings.iter().filter(|f| f.rule == "over-commenting") {
-                if dead_files.contains(&f.file) {
-                    continue; // a dead-removal shifted this file's lines; skip
-                }
-                by_file.entry(f.file.clone()).or_default().push(f.lines);
-            }
-            let mut files: Vec<_> = by_file.into_iter().collect();
-            files.sort_by(|a, b| a.0.cmp(&b.0));
-
-            let mut total = 0usize;
-            let mut touched = 0usize;
-            for (file, ranges) in files {
-                let path = repo.join(&file);
-                let Ok(src) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let (new_src, n) = fix::fix_over_commenting(&src, &ranges, slop_parse::Language::from_path(&file));
-                if n == 0 {
-                    continue;
-                }
-                total += n;
-                touched += 1;
-                if write {
-                    std::fs::write(&path, &new_src)
-                        .with_context(|| format!("writing {file}"))?;
-                    println!("fixed {file}: removed {n} restating comment(s)");
-                } else {
-                    println!("would fix {file}: {n} restating comment(s)");
-                }
-            }
-            // Inlining rewrites references and deletes wrapper definitions, so
-            // its SCIP occurrence lines are only valid against unmodified files.
-            // Under --write it must be the sole writing pass this run; re-index
-            // between it and the others. Dry-run reports alongside them safely.
-            let mut inlined = 0usize;
+            let mut findings = check::effective_findings(&analysis, false)?;
             if inline_wrappers {
-                if write && (renamed > 0 || removed_fns > 0 || total > 0) {
-                    bail!(
-                        "--inline-wrappers --write must run alone: other fixes already rewrote files this run, so the index is stale — re-index, then run `slop fix {} --inline-wrappers --write` on its own",
-                        repo.display()
-                    );
-                }
-                let wrapper_findings = check::tier3_wrapper_findings(
+                findings.extend(check::tier3_wrapper_findings(
                     &analysis.built,
-                    &policy,
+                    &analysis.policy,
                     &analysis.facts,
                     &repo,
-                )?;
-                let plan = inline::plan_inlines(
-                    &analysis.built,
-                    &resolver,
-                    &repo,
-                    &analysis.facts,
-                    &wrapper_findings,
-                );
-                for outcome in &plan.outcomes {
-                    match outcome {
-                        inline::InlineOutcome::Planned(p) => {
-                            inlined += 1;
-                            let verb = if write { "inline" } else { "would inline" };
-                            println!(
-                                "{verb} [trivial-wrapper] {} -> {} ({} reference(s) across {} file(s))",
-                                p.entity, p.callee, p.occurrences, p.file_count
-                            );
-                        }
-                        inline::InlineOutcome::Skipped { entity, reason } => {
-                            eprintln!("skip inline {entity}: {reason}");
-                        }
-                    }
-                }
-                if write {
-                    for (file, src) in &plan.files {
-                        std::fs::write(repo.join(file), src)
-                            .with_context(|| format!("writing {file}"))?;
-                    }
-                }
+                )?);
             }
-
-            if total == 0 && renamed == 0 && removed_fns == 0 && inlined == 0 {
+            let selection = match finding {
+                Some(value) => repair::RepairSelection::Finding(
+                    value.parse::<FindingId>().map_err(anyhow::Error::msg)?,
+                ),
+                None => repair::RepairSelection::All,
+            };
+            let eligible: Vec<_> = findings
+                .into_iter()
+                .filter(|finding| match finding.rule {
+                    "naming-convention" => true,
+                    "over-commenting" => allow_advisory,
+                    "dead-island" => remove_dead,
+                    "trivial-wrapper" => inline_wrappers,
+                    _ => false,
+                })
+                .collect();
+            let safety = if allow_advisory || remove_dead || inline_wrappers {
+                repair::SafetyClass::Advisory
+            } else {
+                repair::SafetyClass::IndexVerified
+            };
+            let plan = repair::plan(&analysis, &eligible, selection, safety)?;
+            for action in &plan.actions {
+                println!(
+                    "{} [{}] {} — {} ({})",
+                    if write { "apply" } else { "would apply" },
+                    action.rule,
+                    action.entity,
+                    action.summary,
+                    action.finding
+                );
+            }
+            for skipped in &plan.skipped {
+                eprintln!("skip {}: {}", skipped.entity, skipped.reason);
+            }
+            if plan.files.is_empty() {
                 println!("nothing to fix");
             } else if write {
+                let action_ids: std::collections::HashSet<_> = plan
+                    .actions
+                    .iter()
+                    .map(|action| action.finding.clone())
+                    .collect();
+                let pending = repair::apply(&analysis, &plan)?;
+                let verification = (|| -> Result<_> {
+                    run_scip_index(&repo, index.as_deref())?;
+                    let verified = check::load_analysis_fresh(
+                        &repo,
+                        index.as_deref(),
+                        check::Freshness::Warn,
+                    )?;
+                    let remaining = check::effective_findings(&verified, false)?
+                        .into_iter()
+                        .filter(|finding| action_ids.contains(&finding.id()))
+                        .count();
+                    if remaining > 0 {
+                        bail!("verification left {remaining} selected finding(s)");
+                    }
+                    verified.write_prewrite_sidecar()?;
+                    Ok(verified)
+                })();
+                let verified = match verification {
+                    Ok(verified) => verified,
+                    Err(verification_error) => {
+                        pending.rollback().with_context(|| {
+                            format!("repair verification failed ({verification_error:#}) and rollback failed")
+                        })?;
+                        if let Err(index_error) = run_scip_index(&repo, index.as_deref()) {
+                            bail!(
+                                "repair verification failed and source was rolled back, but restoring the index failed: {verification_error:#}; {index_error:#}"
+                            );
+                        }
+                        let restore_evidence = (|| -> Result<()> {
+                            let restored = check::load_analysis_fresh(
+                                &repo,
+                                index.as_deref(),
+                                check::Freshness::Warn,
+                            )?;
+                            restored.write_prewrite_sidecar()?;
+                            Ok(())
+                        })();
+                        if let Err(restored_error) = restore_evidence {
+                            bail!(
+                                "repair verification failed and source/index were restored, but rebuilding prewrite evidence failed: {verification_error:#}; {restored_error:#}"
+                            );
+                        }
+                        return Err(verification_error
+                            .context("repair verification failed; source and index rolled back"));
+                    }
+                };
+                let receipt = pending.commit()?;
                 println!(
-                    "applied {renamed} rename(s); removed {total} comment(s) across {touched} file(s); removed {removed_fns} dead function(s); inlined {inlined} wrapper(s)"
+                    "applied {} repair(s) across {} file(s); verified snapshot {}",
+                    receipt.actions,
+                    receipt.files.len(),
+                    verified.id()
                 );
-                if renamed > 0 || removed_fns > 0 || inlined > 0 {
-                    println!(
-                        "note: renames/removals/inlines changed the code — re-index (e.g. `slop gate {} --reindex`) before the next check",
-                        repo.display()
-                    );
-                }
             } else {
-                let mut summary =
-                    format!("dry-run: {renamed} rename(s) + {total} comment(s) across {touched} file(s)");
-                if remove_dead {
-                    summary.push_str(&format!(" + {removed_fns} dead function(s)"));
-                }
-                if inline_wrappers {
-                    summary.push_str(&format!(" + {inlined} wrapper inline(s)"));
-                }
-                println!("{summary}");
+                println!(
+                    "dry-run: {} repair(s) across {} file(s)",
+                    plan.actions.len(),
+                    plan.files.len()
+                );
                 println!("apply with: slop fix --write");
-                let mut extras = Vec::new();
-                if !remove_dead {
-                    extras.push("--remove-dead (delete dead free functions)");
-                }
-                if !inline_wrappers {
-                    extras.push("--inline-wrappers (inline confirmed trivial wrappers)");
-                }
-                if !extras.is_empty() {
-                    println!("more fixes available: {}", extras.join(", "));
-                }
             }
         }
         Command::Compress {
@@ -672,14 +695,19 @@ fn main() -> Result<()> {
             );
             print!("{out}");
             if stats {
-                let pct = if st.original_chars > 0 {
-                    100 - (st.compressed_chars * 100 / st.original_chars)
-                } else {
-                    0
-                };
+                let pct = 100usize.saturating_sub(
+                    st.compressed_chars
+                        .saturating_mul(100)
+                        .checked_div(st.original_chars)
+                        .unwrap_or(100),
+                );
                 eprintln!(
                     "compress: {}/{} functions skeletonized, {} -> {} chars (-{}%)",
-                    st.skeletonized, st.total_functions, st.original_chars, st.compressed_chars, pct
+                    st.skeletonized,
+                    st.total_functions,
+                    st.original_chars,
+                    st.compressed_chars,
+                    pct
                 );
             }
         }
@@ -689,6 +717,10 @@ fn main() -> Result<()> {
             repo,
             steer,
             log,
+            max_connections,
+            max_request_mib,
+            max_capture_mib,
+            timeout_seconds,
         } => {
             slop_proxy::serve(slop_proxy::ProxyConfig {
                 port,
@@ -696,6 +728,10 @@ fn main() -> Result<()> {
                 repo,
                 steer,
                 log,
+                max_connections,
+                max_request_bytes: max_request_mib.saturating_mul(1024 * 1024),
+                max_capture_bytes: max_capture_mib.saturating_mul(1024 * 1024),
+                timeout: std::time::Duration::from_secs(timeout_seconds),
             })?;
         }
         Command::Gate {
@@ -786,6 +822,26 @@ fn main() -> Result<()> {
             project_name,
             indexer,
         } => {
+            if indexer == IndexerArg::Auto && output.is_none() {
+                run_scip_index(&repo, None)?;
+                let paths = slop_analyze::index::index_paths(&repo, None);
+                let resolver = IndexSet::load(&paths)?;
+                if resolver.definition_count() == 0 {
+                    bail!(
+                        "indexed {} but the result has no definitions",
+                        repo.display()
+                    );
+                }
+                let snapshot = check::load_analysis_fresh(&repo, None, check::Freshness::Warn)?;
+                snapshot.write_prewrite_sidecar()?;
+                println!(
+                    "indexed {} language artifact(s), {} definitions across {} file(s)",
+                    paths.len(),
+                    resolver.definition_count(),
+                    resolver.files().len()
+                );
+                return Ok(());
+            }
             let out = output.unwrap_or_else(|| repo.join("index.scip"));
             let project = project_name.unwrap_or_else(|| default_project_name(&repo));
             run_indexer(indexer.into(), &repo, &out, &project)?;
@@ -799,6 +855,8 @@ fn main() -> Result<()> {
                     repo.display()
                 );
             }
+            let snapshot = check::load_analysis_fresh(&repo, Some(&out), check::Freshness::Warn)?;
+            snapshot.write_prewrite_sidecar()?;
             println!(
                 "indexed {} -> {} ({} definitions across {} file(s))",
                 repo.display(),
@@ -806,6 +864,45 @@ fn main() -> Result<()> {
                 defs,
                 resolver.files().len()
             );
+        }
+        Command::Setup {
+            repo,
+            ai,
+            editor,
+            force,
+        } => {
+            let preferences = setup::configure(&repo, ai, editor, force)?;
+            println!(
+                "configured {:?} + {:?}; run `slop doctor {}` to verify",
+                preferences.ai,
+                preferences.editor,
+                repo.display()
+            );
+        }
+        Command::Doctor { repo } => {
+            if !setup::doctor(&repo)? {
+                std::process::exit(1);
+            }
+        }
+        Command::Uninstall { repo, force } => {
+            let changed = setup::uninstall(&repo, force)?;
+            println!("removed slop integration from {} file(s)", changed.len());
+        }
+        Command::Launch {
+            repo,
+            ai,
+            editor,
+            no_setup,
+            no_editor,
+            args,
+        } => {
+            setup::launch(&repo, ai, editor, no_setup, no_editor, &args)?;
+        }
+        Command::Delegate { repo, prompt } => {
+            setup::delegate(&repo, &prompt)?;
+        }
+        Command::Open { target } => {
+            setup::open_target(&target)?;
         }
         Command::Install { repo, force } => {
             install_harness(&repo, force)?;
@@ -820,13 +917,9 @@ fn main() -> Result<()> {
             launch_claude(&repo, no_install, proxy, proxy_port, &claude_args)?;
         }
         Command::Baseline { repo, index } => {
-            let policy = Policy::load(&repo)?;
             let analysis = check::load_analysis(&repo, index.as_deref())?;
-            let (built, facts) = (&analysis.built, &analysis.facts);
-            let raw = detect::run_all(built, &policy, facts, &repo);
-            let suppressions = suppress::scan(&repo, facts);
-            let findings = suppress::filter(raw, &suppressions);
-            let baseline = Baseline::from_findings(&findings).with_effects(built);
+            let findings = check::baseline_findings(&analysis);
+            let baseline = Baseline::from_findings(&findings).with_effects(&analysis.built);
             let count = baseline.findings.len();
             baseline.save(&repo)?;
             println!(
@@ -877,8 +970,8 @@ fn run_suggest(
     limit: usize,
     eval: bool,
 ) -> Result<()> {
-    let analysis = check::load_analysis_fresh(repo, index, check::Freshness::Reindex)?;
-    let hood = retrieve::Neighborhood::build(&analysis.built);
+    let analysis = check::load_analysis_fresh(repo, index, check::Freshness::Warn)?;
+    let hood = analysis.neighborhood();
     if !eval {
         let mut source = String::new();
         std::io::stdin().read_to_string(&mut source)?;
@@ -888,13 +981,26 @@ fn run_suggest(
         let query = retrieve::query_from_source(lang, &source);
         let matches = hood.matches(&query, None, limit);
         if matches.is_empty() {
-            println!("nothing in {} shares this code's neighborhood", repo.display());
+            println!(
+                "nothing in {} shares this code's neighborhood",
+                repo.display()
+            );
             return Ok(());
         }
-        println!("this code calls {} known things; closest existing homes:", query.len());
+        println!(
+            "this code calls {} known things; closest existing homes:",
+            query.len()
+        );
         for m in &matches {
+            let score = (m.score_ppm as f64 / 1_000_000.0).sqrt();
             println!("  {}  ({}:{})", m.label, m.file, m.line + 1);
-            println!("      score {:.2}, {} distinctive of {} shared: {}", m.score, m.distinctive.len(), m.shared, m.distinctive.join(", "));
+            println!(
+                "      score {:.2}, {} distinctive of {} shared: {}",
+                score,
+                m.distinctive.len(),
+                m.shared,
+                m.distinctive.join(", ")
+            );
         }
         return Ok(());
     }
@@ -913,7 +1019,10 @@ fn run_suggest(
         };
         let lines: Vec<&str> = text.lines().collect();
         for fact in &ff.functions {
-            let (a, b) = (fact.start_line as usize, (fact.end_line as usize).min(lines.len() - 1));
+            let (a, b) = (
+                fact.start_line as usize,
+                (fact.end_line as usize).min(lines.len() - 1),
+            );
             if a > b {
                 continue;
             }
@@ -928,7 +1037,10 @@ fn run_suggest(
                 .map(|(_, e)| e.id.clone());
             // Inline `mod tests` fixture builders are excluded as candidates by
             // `Neighborhood::build`; without this they still leak in as queries.
-            if label.as_deref().is_some_and(slop_analyze::source::is_test_entity) {
+            if label
+                .as_deref()
+                .is_some_and(slop_analyze::source::is_test_entity)
+            {
                 continue;
             }
             probed += 1;
@@ -937,13 +1049,30 @@ fn run_suggest(
                 continue;
             }
             hits += 1;
-            println!("{}:{}  {}", ff.file, a + 1, label.unwrap_or_else(|| fact.name.clone()));
+            println!(
+                "{}:{}  {}",
+                ff.file,
+                a + 1,
+                label.unwrap_or_else(|| fact.name.clone())
+            );
             for m in &matches {
-                println!("    -> {}  ({}:{})  {:.2} / {} distinctive: {}", m.label, m.file, m.line + 1, m.score, m.distinctive.len(), m.distinctive.join(", "));
+                let score = (m.score_ppm as f64 / 1_000_000.0).sqrt();
+                println!(
+                    "    -> {}  ({}:{})  {:.2} / {} distinctive: {}",
+                    m.label,
+                    m.file,
+                    m.line + 1,
+                    score,
+                    m.distinctive.len(),
+                    m.distinctive.join(", ")
+                );
             }
         }
     }
-    println!("\n{hits} of {probed} functions retrieved an existing neighbor ({:.1}%)", 100.0 * hits as f64 / probed.max(1) as f64);
+    println!(
+        "\n{hits} of {probed} functions retrieved an existing neighbor ({:.1}%)",
+        100.0 * hits as f64 / probed.max(1) as f64
+    );
     Ok(())
 }
 
@@ -1055,13 +1184,24 @@ fn print_check_human(repo: &Path, result: &CheckResult) {
     if result.findings.is_empty() {
         println!("{}", paint("no slop found", "1;32", color)); // bold green
         println!("{}", result.health_line);
+        println!(
+            "coverage: {}/{} indexed · {}/{} parsed",
+            result.coverage.indexed_files,
+            result.coverage.repository_files,
+            result.coverage.parsed_files,
+            result.coverage.repository_files
+        );
         return;
     }
 
     // Group by severity, most severe first, stable within a group.
     let mut counts = [0usize; 3]; // [advisory, warning, blocking] by Severity ordinal
     for sev in [Severity::Blocking, Severity::Warning, Severity::Advisory] {
-        let group: Vec<_> = result.findings.iter().filter(|f| f.severity == sev).collect();
+        let group: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.severity == sev)
+            .collect();
         if group.is_empty() {
             continue;
         }
@@ -1091,6 +1231,13 @@ fn print_check_human(repo: &Path, result: &CheckResult) {
     );
     println!("{summary}");
     println!("{}", result.health_line);
+    println!(
+        "coverage: {}/{} indexed · {}/{} parsed",
+        result.coverage.indexed_files,
+        result.coverage.repository_files,
+        result.coverage.parsed_files,
+        result.coverage.repository_files
+    );
 }
 
 /// The `--json` report for `slop check`: the same verdict shape `slop gate`
@@ -1107,11 +1254,17 @@ fn print_check_json(result: &CheckResult) -> Result<()> {
         .filter(|f| f.severity == Severity::Advisory)
         .count();
     let out = serde_json::json!({
+        "schema_version": result.schema_version,
+        "snapshot": result.snapshot,
+        "freshness": result.freshness,
+        "scope": result.scope,
+        "coverage": result.coverage,
         "blocking": result.blocking,
         "warning": warning,
         "advisory": advisory,
         "total": result.findings.len(),
         "health": result.health_line,
+        "current_health": result.current_health,
         "policy_is_empty": result.policy_is_empty,
         "findings": result.findings,
     });
@@ -1119,89 +1272,10 @@ fn print_check_json(result: &CheckResult) -> Result<()> {
     Ok(())
 }
 
-/// The slop Claude skill, embedded at build time so `slop install` can drop it
-/// into a target repo without needing the slop source tree at runtime.
-const SLOP_SKILL: &str = include_str!("../../../skills/slop/SKILL.md");
-
-/// Read a JSON config file into a `Value`, or `Value::Null` if it's absent.
-/// Refuses to proceed on an unparseable file (would clobber the user's config)
-/// unless `force` is set.
-fn read_json_config(path: &Path, force: bool) -> Result<serde_json::Value> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Ok(serde_json::Value::Null);
-    };
-    if text.trim().is_empty() {
-        return Ok(serde_json::Value::Null);
-    }
-    match serde_json::from_str(&text) {
-        Ok(v) => Ok(v),
-        Err(e) if force => {
-            eprintln!("warning: {} is not valid JSON ({e}); overwriting (--force)", path.display());
-            Ok(serde_json::Value::Null)
-        }
-        Err(e) => bail!(
-            "{} is not valid JSON ({e}) — fix it or pass --force to overwrite",
-            path.display()
-        ),
-    }
-}
-
-/// Wire slop's MCP server + hooks into `<repo>/.mcp.json` and
-/// `<repo>/.claude/settings.json`. Idempotent (see `install::merge_*`).
+/// Compatibility shim for the original Claude-only command.
 fn install_harness(repo: &Path, force: bool) -> Result<()> {
-    use slop_analyze::install;
-
-    let repo = repo
-        .canonicalize()
-        .with_context(|| format!("resolving repo path {}", repo.display()))?;
-    let exe = std::env::current_exe()
-        .context("resolving the slop binary path")?
-        .to_string_lossy()
-        .into_owned();
-    let repo_str = repo.to_string_lossy().into_owned();
-
-    // .mcp.json — the MCP server (validate_change / get_context_envelope /
-    // query_subgraph).
-    let mcp_path = repo.join(".mcp.json");
-    let mcp = install::merge_mcp(read_json_config(&mcp_path, force)?, &exe, &repo_str);
-    std::fs::write(&mcp_path, format!("{}\n", serde_json::to_string_pretty(&mcp)?))
-        .with_context(|| format!("writing {}", mcp_path.display()))?;
-    println!("wrote {} (mcpServers.slop)", mcp_path.display());
-
-    // .claude/settings.json — the read-path + prompt hooks.
-    let claude_dir = repo.join(".claude");
-    std::fs::create_dir_all(&claude_dir)
-        .with_context(|| format!("creating {}", claude_dir.display()))?;
-    let settings_path = claude_dir.join("settings.json");
-    let settings = install::merge_hooks(read_json_config(&settings_path, force)?, &exe);
-    std::fs::write(
-        &settings_path,
-        format!("{}\n", serde_json::to_string_pretty(&settings)?),
-    )
-    .with_context(|| format!("writing {}", settings_path.display()))?;
-    println!(
-        "wrote {} (PostToolUse + UserPromptSubmit hooks)",
-        settings_path.display()
-    );
-
-    // .claude/skills/slop/SKILL.md — the agent playbook (embedded at build
-    // time so install is self-contained). Always refreshed so it tracks the
-    // binary; it's a generated doc, not user config.
-    let skill_dir = claude_dir.join("skills/slop");
-    std::fs::create_dir_all(&skill_dir)
-        .with_context(|| format!("creating {}", skill_dir.display()))?;
-    let skill_path = skill_dir.join("SKILL.md");
-    std::fs::write(&skill_path, SLOP_SKILL)
-        .with_context(|| format!("writing {}", skill_path.display()))?;
-    println!("wrote {} (slop skill)", skill_path.display());
-
-    println!(
-        "\nharness installed. next:\n  \
-         - generate a SCIP index:  slop index {repo_str}\n  \
-         - optional policy:        slop init {repo_str} --write\n  \
-         - gate the fix-loop:      slop gate {repo_str} --reindex\n\
-         Restart the agent host to load the new MCP server and hooks."
-    );
+    let _ = setup::configure_claude(repo, force)?;
+    println!("Claude harness installed; `slop setup` configures other hosts and editors");
     Ok(())
 }
 

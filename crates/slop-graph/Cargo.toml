@@ -2,7 +2,13 @@
 name = "slop-graph"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+description = "Deterministic code graph and effect model used by the slop analyzer"
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 petgraph = { workspace = true }

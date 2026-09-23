@@ -17,5 +17,5 @@ pub fn serve_stdio(repo: PathBuf, index: Option<PathBuf>) -> anyhow::Result<()> 
     let ctx = LspCtx { repo, index };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    server::serve(&ctx, stdin.lock(), stdout.lock())
+    server::serve_async(ctx, stdin.lock(), stdout)
 }

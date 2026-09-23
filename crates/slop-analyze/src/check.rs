@@ -4,16 +4,20 @@
 //! (`--all`) or just the diff against a git ref (D7's diff-relative mode).
 
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
-use slop_resolve::{Resolver, ScipResolver};
+use anyhow::Result;
+use serde::Serialize;
 
-use crate::baseline::Baseline;
 use crate::findings::{Finding, Severity};
 use crate::policy::Policy;
-use crate::{build, diff, effects, health, source, suppress};
+use crate::snapshot::{CaptureRequest, RepositorySnapshot, SnapshotFreshness, SnapshotId};
+use crate::scan::{self, CoverageReport, ScanScope};
+use crate::{build, health, source, suppress};
+
+pub use crate::snapshot::Freshness;
+
+pub const CHECK_SCHEMA_VERSION: u32 = 1;
 
 pub struct CheckRequest {
     pub repo: PathBuf,
@@ -41,8 +45,15 @@ impl Default for CheckRequest {
     }
 }
 
+#[derive(Serialize)]
 pub struct CheckResult {
+    pub schema_version: u32,
+    pub snapshot: SnapshotId,
+    pub freshness: SnapshotFreshness,
+    pub scope: ScanScope,
+    pub coverage: CoverageReport,
     pub findings: Vec<Finding>,
+    pub current_health: u32,
     pub health_line: String,
     pub blocking: usize,
     /// True when the repo has no slop.toml — infra-bypass stays silent.
@@ -101,6 +112,11 @@ fn tier3_findings(
             entity: pair.a.entity.clone(),
             file: pair.a.file.clone(),
             lines: pair.a.lines,
+            related: vec![crate::findings::EvidenceLocus {
+                entity: pair.b.entity.clone(),
+                file: pair.b.file.clone(),
+                lines: pair.b.lines,
+            }],
             message: format!(
                 "`{}` and `{}` appear to serve the same purpose ({} confidence): {}",
                 pair.a.entity, pair.b.entity, verdict.confidence, verdict.reason
@@ -175,6 +191,7 @@ pub fn tier3_wrapper_findings(
             entity: c.entity.clone(),
             file: c.file.clone(),
             lines: c.lines,
+            related: Vec::new(),
             message: format!(
                 "`{}` only forwards to `{}` ({} caller(s)) and its name adds nothing the call site would miss: {}",
                 c.name, c.forward_target, c.callers, v.reason
@@ -240,40 +257,7 @@ fn tier3_structural_verdicts(
         .collect())
 }
 
-/// The graph + parsed source facts every consumer starts from: the
-/// `SCIP load → build → infer effects → parse` sequence, in one place.
-/// `check::run`, the MCP tools, `slop baseline`, and `slop init` all share
-/// it rather than re-deriving the graph three slightly different ways.
-pub struct Analysis {
-    pub built: build::BuiltGraph,
-    pub facts: Vec<source::FileFacts>,
-    /// Kept rather than dropped after the graph build: occurrence-level data is
-    /// the def-use relation (D20), which the graph itself does not carry.
-    pub resolver: ScipResolver,
-}
-
-/// What to do when the index on disk is older than the source it describes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Freshness {
-    /// Regenerate it first. For anything whose answer is only meaningful
-    /// against current code — `check`, `gate`, `validate_change`.
-    Reindex,
-    /// Warn on stderr and carry on. For the per-read hooks and the LSP, which
-    /// run too often to spend an indexer subprocess.
-    Warn,
-}
-
-/// The last analysis built, keyed on the index file's identity. The MCP server
-/// and LSP are long-lived and rebuild the whole graph per request otherwise —
-/// ~36ms on this repo but ~1.2s on a 21MB index, paid on every single call.
-/// One slot: a changed index evicts it.
-type CacheKey = (PathBuf, std::time::SystemTime, u64);
-static CACHE: std::sync::Mutex<Option<(CacheKey, Arc<Analysis>)>> = std::sync::Mutex::new(None);
-
-fn cache_key(index_path: &Path) -> Option<CacheKey> {
-    let meta = std::fs::metadata(index_path).ok()?;
-    Some((index_path.to_path_buf(), meta.modified().ok()?, meta.len()))
-}
+pub type Analysis = RepositorySnapshot;
 
 /// Resolve `index` (default `<repo>/index.scip`), build the effect graph, and
 /// parse the repo's source facts. Errors with an indexing hint when the index
@@ -289,59 +273,7 @@ pub fn load_analysis_fresh(
     index: Option<&Path>,
     freshness: Freshness,
 ) -> Result<Arc<Analysis>> {
-    let index_path = index
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| repo.join("index.scip"));
-    if freshness == Freshness::Reindex {
-        crate::index::ensure_index(repo, &index_path)?;
-        if let Some(reason) = crate::index::index_staleness(repo, &index_path) {
-            eprintln!("slop: {reason} — reindexing");
-            crate::index::run_scip_index(repo, Some(&index_path))?;
-        }
-    } else if let Some(reason) = crate::index::index_staleness(repo, &index_path) {
-        eprintln!("warning: {reason}");
-    }
-
-    if let Some(key) = cache_key(&index_path) {
-        if let Some((cached_key, analysis)) = CACHE.lock().ok().and_then(|c| c.clone()) {
-            if cached_key == key {
-                return Ok(analysis);
-            }
-        }
-        let analysis = Arc::new(build_analysis(repo, &index_path)?);
-        if let Ok(mut c) = CACHE.lock() {
-            *c = Some((key, analysis.clone()));
-        }
-        return Ok(analysis);
-    }
-    build_analysis(repo, &index_path).map(Arc::new)
-}
-
-fn build_analysis(repo: &Path, index_path: &Path) -> Result<Analysis> {
-    let index_path = index_path.to_path_buf();
-    if !index_path.exists() {
-        bail!(
-            "no SCIP index at {} — generate one with:\n  slop index {}",
-            index_path.display(),
-            repo.display(),
-        );
-    }
-    let resolver = ScipResolver::load(&index_path)?;
-    // A syntactically valid but *empty* index (scip-python can crash mid-walk
-    // and still write a near-empty file — see the 61-byte artifacts) makes
-    // every check silently pass. Fail loudly instead: no definitions means the
-    // index is broken, not that the repo is clean.
-    if resolver.definition_count() == 0 {
-        bail!(
-            "SCIP index at {} has no definitions — it's empty or the indexer failed. Regenerate it:\n  slop index {}",
-            index_path.display(),
-            repo.display(),
-        );
-    }
-    let mut built = build::build_graph(&resolver);
-    effects::infer_effects(&mut built);
-    let facts = source::parse_repo(repo, &resolver.files());
-    Ok(Analysis { built, facts, resolver })
+    RepositorySnapshot::capture(CaptureRequest { repo, index, policy: None, freshness })
 }
 
 /// One finding plus whether the baseline already grandfathers it. The
@@ -358,6 +290,8 @@ pub struct AuditFinding {
 /// scored two ways — counting everything vs. counting only what isn't
 /// grandfathered (what `run` reports).
 pub struct AuditResult {
+    pub snapshot: SnapshotId,
+    pub freshness: SnapshotFreshness,
     pub findings: Vec<AuditFinding>,
     /// Health counting every finding (the honest state of the repo).
     pub health_all: u32,
@@ -372,35 +306,41 @@ pub struct AuditResult {
 /// tagging each with whether the baseline grandfathers it. Unlike `run`, this
 /// never hides grandfathered findings — it marks them, so a UI can show the
 /// real state and let the user choose what to look at.
-pub fn audit(repo: &Path, index: Option<&Path>) -> Result<AuditResult> {
-    let policy = Policy::load(repo)?;
-    let analysis = load_analysis_fresh(repo, index, Freshness::Reindex)?;
+fn evaluated_findings(analysis: &RepositorySnapshot, tier3: bool) -> Result<Vec<AuditFinding>> {
     let (built, facts) = (&analysis.built, &analysis.facts);
-    let baseline = Baseline::load(repo)?;
-
-    let mut raw = crate::detect::run_all(built, &policy, facts, repo);
-    raw.extend(crate::detect::effect_creep(built, &baseline));
-    let suppressions = suppress::scan(repo, facts);
-    let submodules = source::submodule_paths(repo);
+    let mut raw = crate::detect::run_all(built, &analysis.policy, facts, analysis.repo());
+    raw.extend(crate::detect::effect_creep(built, &analysis.baseline));
+    if tier3 {
+        for (entity, redundant, reason) in tier3_structural_verdicts(built, facts, analysis.repo())? {
+            let Some(f) = raw.iter_mut().find(|f| f.rule == "duplicate-structural" && f.entity == entity)
+            else {
+                continue;
+            };
+            if redundant {
+                f.severity = Severity::Warning;
+                f.message = format!("{} — confirmed by semantic review: {reason}", f.message);
+            } else {
+                f.message = format!(
+                    "{} (unconfirmed — semantic review found a different purpose: {reason})",
+                    f.message
+                );
+            }
+        }
+        raw.extend(tier3_findings(built, facts, analysis.repo())?);
+        raw.extend(tier3_wrapper_findings(built, &analysis.policy, facts, analysis.repo())?);
+    }
+    let suppressions = suppress::scan(analysis.repo(), facts);
+    let submodules = source::submodule_paths(analysis.repo());
     let all: Vec<_> = suppress::filter(raw, &suppressions)
         .into_iter()
         .filter(|f| !source::in_submodule(&f.file, &submodules))
         .collect();
-
-    // (rule, entity) is the baseline fingerprint — see `Baseline::filter`.
-    let grandfathered_set: std::collections::HashSet<(&str, &str)> = baseline
+    let grandfathered_set: std::collections::HashSet<(&str, &str)> = analysis
+        .baseline
         .findings
         .iter()
         .map(|e| (e.rule.as_str(), e.entity.as_str()))
         .collect();
-
-    let health_all = health::score(&all, built);
-    let new_only: Vec<Finding> = all
-        .iter()
-        .filter(|f| !grandfathered_set.contains(&(f.rule, f.entity.as_str())))
-        .cloned()
-        .collect();
-    let health_new = health::score(&new_only, built);
 
     let mut findings: Vec<AuditFinding> = all
         .into_iter()
@@ -418,112 +358,122 @@ pub fn audit(repo: &Path, index: Option<&Path>) -> Result<AuditResult> {
             .then_with(|| a.finding.entity.cmp(&b.finding.entity))
     });
 
-    let grandfathered = findings.iter().filter(|f| f.grandfathered).count();
+    Ok(findings)
+}
+
+pub fn effective_findings(analysis: &RepositorySnapshot, tier3: bool) -> Result<Vec<Finding>> {
+    Ok(evaluated_findings(analysis, tier3)?
+        .into_iter()
+        .filter(|record| !record.grandfathered)
+        .map(|record| record.finding)
+        .collect())
+}
+
+pub fn baseline_findings(analysis: &RepositorySnapshot) -> Vec<Finding> {
+    let raw = crate::detect::run_all(
+        &analysis.built,
+        &analysis.policy,
+        &analysis.facts,
+        analysis.repo(),
+    );
+    let suppressions = suppress::scan(analysis.repo(), &analysis.facts);
+    let submodules = source::submodule_paths(analysis.repo());
+    let mut findings: Vec<Finding> = suppress::filter(raw, &suppressions)
+        .into_iter()
+        .filter(|finding| !source::in_submodule(&finding.file, &submodules))
+        .collect();
+    findings.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| a.rule.cmp(b.rule))
+            .then_with(|| a.entity.cmp(&b.entity))
+    });
+    findings
+}
+
+pub fn audit_snapshot(analysis: &RepositorySnapshot) -> Result<AuditResult> {
+    let findings = evaluated_findings(analysis, false)?;
+    let all: Vec<Finding> = findings.iter().map(|record| record.finding.clone()).collect();
+    let new_only: Vec<Finding> = findings
+        .iter()
+        .filter(|record| !record.grandfathered)
+        .map(|record| record.finding.clone())
+        .collect();
+    let grandfathered = findings.len() - new_only.len();
     Ok(AuditResult {
+        snapshot: analysis.id().clone(),
+        freshness: analysis.freshness().clone(),
         findings,
-        health_all,
-        health_new,
+        health_all: health::score(&all, &analysis.built),
+        health_new: health::score(&new_only, &analysis.built),
         grandfathered,
-        policy_is_empty: policy.channels.is_empty(),
+        policy_is_empty: analysis.policy.channels.is_empty(),
     })
 }
 
+pub fn audit(repo: &Path, index: Option<&Path>) -> Result<AuditResult> {
+    let analysis = load_analysis_fresh(repo, index, Freshness::Reindex)?;
+    audit_snapshot(&analysis)
+}
+
 pub fn run(req: CheckRequest) -> Result<CheckResult> {
-    let policy = match &req.policy {
-        Some(path) => Policy::load_file(path)?,
-        None => Policy::load(&req.repo)?,
-    };
+    run_with_freshness(req, Freshness::Reindex)
+}
 
-    let analysis = load_analysis_fresh(&req.repo, req.index.as_deref(), Freshness::Reindex)?;
-    let (built, facts) = (&analysis.built, &analysis.facts);
-    let baseline = Baseline::load(&req.repo)?;
-    let mut raw = crate::detect::run_all(built, &policy, facts, &req.repo);
-    // Baseline-relative regression: a function that was pure at baseline and
-    // now does I/O. Lives here, not in run_all, because it needs the baseline
-    // (run_all is the baseline-free set fix/baseline/tests share).
-    raw.extend(crate::detect::effect_creep(built, &baseline));
-    if req.tier3 {
-        for (entity, redundant, reason) in tier3_structural_verdicts(built, facts, &req.repo)? {
-            let Some(f) = raw.iter_mut().find(|f| f.rule == "duplicate-structural" && f.entity == entity)
-            else {
-                continue;
-            };
-            if redundant {
-                // Shape match corroborated by the judge — promote the
-                // candidate from Advisory to a Warning worth acting on.
-                f.severity = Severity::Warning;
-                f.message = format!("{} — confirmed by semantic review: {reason}", f.message);
-            } else {
-                f.message = format!(
-                    "{} (unconfirmed — semantic review found a different purpose: {reason})",
-                    f.message
-                );
-            }
-        }
-        raw.extend(tier3_findings(built, facts, &req.repo)?);
-        raw.extend(tier3_wrapper_findings(built, &policy, facts, &req.repo)?);
-    }
-    let suppressions = suppress::scan(&req.repo, facts);
-    let unsuppressed = suppress::filter(raw, &suppressions);
-    // Git submodules are separate projects vendored in — not this repo's to fix.
-    let submodules = source::submodule_paths(&req.repo);
-    let unsuppressed: Vec<_> = unsuppressed
-        .into_iter()
-        .filter(|f| !source::in_submodule(&f.file, &submodules))
-        .collect();
-    let effective = baseline.filter(unsuppressed);
+pub fn run_with_freshness(req: CheckRequest, freshness: Freshness) -> Result<CheckResult> {
+    let analysis = RepositorySnapshot::capture(CaptureRequest {
+        repo: &req.repo,
+        index: req.index.as_deref(),
+        policy: req.policy.as_deref(),
+        freshness,
+    })?;
+    let built = &analysis.built;
+    let effective = effective_findings(&analysis, req.tier3)?;
 
-    let (findings, health_line) = if req.all {
-        let s = health::score(&effective, built);
-        (effective, format!("health: {s}/100"))
+    let current_health = health::score(&effective, built);
+    let coverage = scan::coverage(&analysis);
+    let (scope, findings, health_line) = if req.all {
+        (
+            ScanScope::Repository,
+            effective,
+            format!("health: {current_health}/100"),
+        )
     } else {
-        let output = Process::new("git")
-            .args(["-C"])
-            .arg(&req.repo)
-            .args(["diff", "-U0", "--no-color", &req.base, "--"])
-            .args(slop_parse::SOURCE_EXTS.iter().map(|e| format!("*.{e}")))
-            .output()
-            .context("running git diff (use all=true for a non-git tree)")?;
-        if !output.status.success() {
-            bail!(
-                "git diff failed: {} — use all=true to judge the whole repo",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let changed = diff::parse_unified_diff(&String::from_utf8_lossy(&output.stdout));
-        let new = diff::filter_to_changes(effective.clone(), &changed);
-        let new_keys: std::collections::HashSet<(&str, String)> =
-            new.iter().map(|f| (f.rule, f.entity.clone())).collect();
-        let before: Vec<_> = effective
-            .iter()
-            .filter(|f| !new_keys.contains(&(f.rule, f.entity.clone())))
-            .cloned()
-            .collect();
+        let changed = scan::worktree_changes(&analysis, &req.base)?;
+        let findings = scan::filter_to_changes(effective, &changed);
         let line = format!(
-            "health: {} -> {}",
-            health::score(&before, built),
-            health::score(&effective, built)
+            "health: {current_health}/100 · {} finding(s) affect worktree",
+            findings.len()
         );
-        (new, line)
+        (
+            ScanScope::Worktree { base: req.base },
+            findings,
+            line,
+        )
     };
 
     let blocking = findings.iter().filter(|f| f.severity == Severity::Blocking).count();
     Ok(CheckResult {
+        schema_version: CHECK_SCHEMA_VERSION,
+        snapshot: analysis.id().clone(),
+        freshness: analysis.freshness().clone(),
+        scope,
+        coverage,
         findings,
+        current_health,
         health_line,
         blocking,
-        policy_is_empty: policy.channels.is_empty(),
+        policy_is_empty: analysis.policy.channels.is_empty(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempFixture;
 
-    fn fixture(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures")
-            .join(name)
+    fn fixture(name: &str) -> TempFixture {
+        TempFixture::new(name)
     }
 
     #[test]
@@ -545,5 +495,34 @@ mod tests {
         let out = audit(&fixture("toy_repo"), None).expect("audit");
         assert!(out.findings.is_empty());
         assert_eq!(out.health_all, 100);
+    }
+
+    #[test]
+    fn check_audit_and_fix_projection_share_fingerprints() {
+        let repo = fixture("toy_repo_slopped");
+        let snapshot = load_analysis_fresh(&repo, None, Freshness::Reindex).expect("snapshot");
+        let audit = audit_snapshot(&snapshot).expect("audit");
+        let fix = effective_findings(&snapshot, false).expect("fix projection");
+        let check = run(CheckRequest {
+            repo: repo.to_path_buf(),
+            all: true,
+            ..Default::default()
+        })
+        .expect("check");
+        let keys = |findings: &[Finding]| {
+            findings
+                .iter()
+                .map(|finding| (finding.rule, finding.entity.clone()))
+                .collect::<Vec<_>>()
+        };
+        let active: Vec<Finding> = audit
+            .findings
+            .into_iter()
+            .filter(|record| !record.grandfathered)
+            .map(|record| record.finding)
+            .collect();
+        assert_eq!(keys(&active), keys(&fix));
+        assert_eq!(keys(&fix), keys(&check.findings));
+        assert_eq!(snapshot.id(), &check.snapshot);
     }
 }

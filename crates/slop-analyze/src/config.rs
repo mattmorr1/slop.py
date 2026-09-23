@@ -103,6 +103,7 @@ pub fn config_sprawl(repo: &Path, facts: &[FileFacts]) -> Vec<Finding> {
             entity: format!("env::{var}"),
             file,
             lines: (line as usize, line as usize),
+            related: Vec::new(),
             message: format!(
                 "`{var}` is read straight from the environment in {} modules: {names}",
                 modules.len()

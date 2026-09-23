@@ -6,7 +6,7 @@ use petgraph::Direction;
 use slop_graph::{CodeEntity, EdgeKind, Effect, NodeType};
 
 use crate::build::BuiltGraph;
-use crate::findings::{Finding, Severity};
+use crate::findings::{EvidenceLocus, Finding, Severity};
 use crate::policy::Policy;
 
 /// Infra-bypass: an entity acquires a raw effect *directly* (a `HasEffect`
@@ -67,6 +67,7 @@ pub fn infra_bypass(built: &BuiltGraph, policy: &Policy) -> Vec<Finding> {
                 entity: entity.id.clone(),
                 file: entity.file.clone(),
                 lines: entity.source_range,
+                related: Vec::new(),
                 message: format!(
                     "`{}` acquires a raw {:?} effect directly via `{}`; this codebase routes {:?} I/O through {}",
                     entity.id,
@@ -156,6 +157,7 @@ pub fn circular_import(built: &BuiltGraph) -> Vec<Finding> {
                 entity: entity.id.clone(),
                 file: entity.file.clone(),
                 lines: entity.source_range,
+                related: Vec::new(),
                 message: format!("`{}` is part of an import cycle: {cycle}", entity.id),
                 fix_guidance: format!(
                     "Break the cycle {cycle} — move the shared dependency into a module neither imports, or defer the import into the function that needs it"
@@ -289,6 +291,7 @@ pub fn dead_island(
             entity: entity.id.clone(),
             file: entity.file.clone(),
             lines: entity.source_range,
+            related: Vec::new(),
             message,
             fix_guidance: format!(
                 "Delete `{}`, or declare it in slop.toml `entry_points` if it is a public API",
@@ -347,6 +350,7 @@ pub fn effect_layer_violation(built: &BuiltGraph, policy: &Policy) -> Vec<Findin
                 entity: entity.id.clone(),
                 file: entity.file.clone(),
                 lines: entity.source_range,
+                related: Vec::new(),
                 message: format!(
                     "`{}` is in the `{}` layer but directly performs {:?} I/O",
                     entity.id, layer.name, violated
@@ -411,6 +415,7 @@ pub fn effect_creep(built: &BuiltGraph, baseline: &crate::baseline::Baseline) ->
             entity: entity.id.clone(),
             file: entity.file.clone(),
             lines: entity.source_range,
+            related: Vec::new(),
             message: format!(
                 "`{}` was pure at baseline but now performs {io:?} I/O",
                 entity.id
@@ -457,6 +462,7 @@ pub fn purity_lie(built: &BuiltGraph) -> Vec<Finding> {
             entity: entity.id.clone(),
             file: entity.file.clone(),
             lines: entity.source_range,
+            related: Vec::new(),
             message: format!(
                 "`{name}` is named like a pure computation but its effect signature is {io:?}",
             ),
@@ -651,6 +657,7 @@ pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) 
                     entity: entity_label.clone(),
                     file: ff.file.clone(),
                     lines,
+                    related: Vec::new(),
                     message: format!(
                         "`{}` is tangled: {} control-flow branches nested {} deep (cyclomatic {})",
                         fact.name, fact.branch_points, fact.max_nesting_depth, fact.complexity
@@ -676,6 +683,7 @@ pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) 
                     entity: entity_label.clone(),
                     file: ff.file.clone(),
                     lines,
+                    related: Vec::new(),
                     message: format!(
                         "`{}` has {} comment lines against {} code lines",
                         fact.name, fact.comment_lines, fact.code_lines
@@ -708,6 +716,15 @@ pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) 
             entity: members[rep].label.clone(),
             file: members[rep].file.clone(),
             lines: members[rep].lines,
+            related: group
+                .iter()
+                .filter(|&&index| index != rep)
+                .map(|&index| EvidenceLocus {
+                    entity: members[index].label.clone(),
+                    file: members[index].file.clone(),
+                    lines: members[index].lines,
+                })
+                .collect(),
             message: format!(
                 "`{}` has a body identical to `{}` (modulo comments/whitespace)",
                 members[rep].label,
@@ -743,6 +760,15 @@ pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) 
             entity: group.canonical.entity.clone(),
             file: group.canonical.file.clone(),
             lines: group.canonical.lines,
+            related: group
+                .peers
+                .iter()
+                .map(|peer| EvidenceLocus {
+                    entity: peer.entity.clone(),
+                    file: peer.file.clone(),
+                    lines: peer.lines,
+                })
+                .collect(),
             message: format!(
                 "`{}` is structurally identical to `{}` (same shape, renamed variables/literals) — candidate duplicate; confirm with --tier3",
                 group.canonical.entity,
@@ -1021,6 +1047,14 @@ pub fn parallel_implementation(built: &BuiltGraph, facts: &[crate::source::FileF
             entity: rep_m.label.clone(),
             file: rep_m.file.clone(),
             lines: rep_m.lines,
+            related: peers
+                .iter()
+                .map(|peer| EvidenceLocus {
+                    entity: peer.label.clone(),
+                    file: peer.file.clone(),
+                    lines: peer.lines,
+                })
+                .collect(),
             message: format!(
                 "`{}` and {names} call the same {shared} things but share no code — likely the same job implemented more than once",
                 rep_m.label

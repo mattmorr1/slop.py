@@ -9,7 +9,53 @@ mod scip_backend;
 
 pub use scip_backend::ScipResolver;
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+
+/// A repository-wide resolver composed from one SCIP artifact per detected
+/// language. Files are owned by exactly one artifact; symbol lookup spans all
+/// artifacts, allowing one graph to represent a polyglot monorepo without
+/// concatenating protobufs or hiding coverage behind a dominant language.
+pub struct IndexSet {
+    resolvers: Vec<ScipResolver>,
+    file_owner: BTreeMap<String, usize>,
+}
+
+impl IndexSet {
+    pub fn load(paths: &[PathBuf]) -> Result<Self> {
+        if paths.is_empty() {
+            bail!("no SCIP indexes were selected");
+        }
+        let mut resolvers = Vec::with_capacity(paths.len());
+        let mut file_owner = BTreeMap::new();
+        for path in paths {
+            let resolver = ScipResolver::load(path)?;
+            let owner = resolvers.len();
+            for file in resolver.files() {
+                file_owner.entry(file.to_string()).or_insert(owner);
+            }
+            resolvers.push(resolver);
+        }
+        Ok(Self {
+            resolvers,
+            file_owner,
+        })
+    }
+
+    pub fn artifact_count(&self) -> usize {
+        self.resolvers.len()
+    }
+
+    pub fn definition_count(&self) -> usize {
+        self.resolvers
+            .iter()
+            .map(ScipResolver::definition_count)
+            .sum()
+    }
+}
 
 /// Zero-based source range, end-exclusive (SCIP convention).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,4 +175,28 @@ pub trait Resolver {
 
     /// Repo-relative paths of every indexed file.
     fn files(&self) -> Vec<&str>;
+}
+
+impl Resolver for IndexSet {
+    fn resolve(&self, file: &str, line: u32, col: u32) -> Option<&Definition> {
+        self.file_owner
+            .get(file)
+            .and_then(|owner| self.resolvers[*owner].resolve(file, line, col))
+    }
+
+    fn definition_of(&self, symbol: &str) -> Option<&Definition> {
+        self.resolvers
+            .iter()
+            .find_map(|resolver| resolver.definition_of(symbol))
+    }
+
+    fn occurrences_in(&self, file: &str) -> &[Occurrence] {
+        self.file_owner
+            .get(file)
+            .map_or(&[], |owner| self.resolvers[*owner].occurrences_in(file))
+    }
+
+    fn files(&self) -> Vec<&str> {
+        self.file_owner.keys().map(String::as_str).collect()
+    }
 }

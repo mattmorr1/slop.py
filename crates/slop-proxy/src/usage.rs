@@ -6,6 +6,64 @@
 
 use serde_json::Value;
 
+/// Keeps the beginning and a rolling tail of a streamed response. Anthropic's
+/// input usage is in `message_start` and final output usage is near the end, so
+/// this preserves both without retaining an unbounded generation in memory.
+pub struct BoundedCapture {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    head_limit: usize,
+    tail_limit: usize,
+    cursor: usize,
+    wrapped: bool,
+}
+
+impl BoundedCapture {
+    pub fn new(limit: usize) -> Self {
+        let head_limit = if limit < 2 {
+            limit
+        } else {
+            (limit / 2).min(64 * 1024)
+        };
+        Self {
+            head: Vec::with_capacity(head_limit),
+            tail: Vec::with_capacity(limit.saturating_sub(head_limit)),
+            head_limit,
+            tail_limit: limit.saturating_sub(head_limit),
+            cursor: 0,
+            wrapped: false,
+        }
+    }
+
+    pub fn extend(&mut self, bytes: &[u8]) {
+        let head_take = (self.head_limit - self.head.len()).min(bytes.len());
+        self.head.extend_from_slice(&bytes[..head_take]);
+        if self.tail_limit == 0 {
+            return;
+        }
+        for &byte in &bytes[head_take..] {
+            if self.tail.len() < self.tail_limit {
+                self.tail.push(byte);
+            } else {
+                self.tail[self.cursor] = byte;
+                self.cursor = (self.cursor + 1) % self.tail_limit;
+                self.wrapped = true;
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> Vec<u8> {
+        if self.wrapped {
+            self.tail.rotate_left(self.cursor);
+        }
+        if !self.head.is_empty() && !self.tail.is_empty() {
+            self.head.push(b'\n');
+        }
+        self.head.extend_from_slice(&self.tail);
+        self.head
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Usage {
     pub model: Option<String>,
@@ -111,5 +169,15 @@ data: [DONE]
     #[test]
     fn unparseable_body_is_empty_not_an_error() {
         assert_eq!(extract(b"not json at all"), Usage::default());
+    }
+
+    #[test]
+    fn bounded_capture_keeps_head_and_tail() {
+        let mut capture = BoundedCapture::new(10);
+        capture.extend(b"abcdefghijklmnop");
+        let out = capture.finish();
+        assert!(out.starts_with(b"abcde"));
+        assert!(out.ends_with(b"lmnop"));
+        assert!(out.len() <= 11);
     }
 }

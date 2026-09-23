@@ -19,7 +19,7 @@
 //! reporting every function in it.
 //!
 //! It also wants *logic*, not wiring. Dogfooding this rule on slop itself, the
-//! findings split cleanly: `install_harness` and `Baseline::save` are untested
+//! findings split cleanly: setup delivery and `Baseline::save` are untested
 //! behaviour, while `serve_stdio` and `run` are straight-line delegations whose
 //! only effect is to hand off. A branchless effectful function has no path to
 //! regress silently down, so the branch count from the parser (already computed
@@ -50,8 +50,8 @@ const MIN_COVERAGE: f64 = 0.5;
 /// Branches a function needs before "untested" is worth saying. At zero it is a
 /// straight line: it cannot take a wrong path, so a test asserts only that the
 /// wiring is wired. Dogfooding bore this out — it dropped `Baseline::save` (three
-/// statements) and `install_harness` (which delegates every decision to
-/// `install::merge_*`, and those *are* tested) while keeping every function with
+/// statements) and setup delivery (whose merge decisions are separately tested)
+/// while keeping every function with
 /// real logic behind it.
 pub const MIN_BRANCH_POINTS: u32 = 1;
 
@@ -148,6 +148,7 @@ pub fn untested_effect(
                 entity: entity.id.clone(),
                 file: entity.file.clone(),
                 lines: entity.source_range,
+                related: Vec::new(),
                 message: format!(
                     "`{}` performs {} I/O and no test reaches it, in a codebase that tests {}% of its effectful functions",
                     entity.id, effects, percent

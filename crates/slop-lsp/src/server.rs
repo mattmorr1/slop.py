@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::{mpsc, Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -18,9 +19,95 @@ pub struct LspCtx {
     pub index: Option<PathBuf>,
 }
 
+/// Production server: protocol reads and replies stay responsive while one
+/// background worker coalesces analysis requests. A single worker prevents
+/// concurrent index rebuilds and avoids CPU-bound analysis on the LSP loop.
+pub fn serve_async<R, W>(ctx: LspCtx, mut input: R, output: W) -> anyhow::Result<()>
+where
+    R: BufRead,
+    W: Write + Send + 'static,
+{
+    let output = Arc::new(Mutex::new(output));
+    let (requests, pending) = mpsc::channel::<HashSet<String>>();
+    let worker_output = Arc::clone(&output);
+    let worker = std::thread::spawn(move || {
+        let mut published = HashSet::new();
+        while let Ok(mut open) = pending.recv() {
+            while let Ok(newer) = pending.try_recv() {
+                open = newer;
+            }
+            let result = diagnostics::compute(&ctx.repo, ctx.index.as_deref());
+            let Ok(mut output) = worker_output.lock() else {
+                return;
+            };
+            let _ = publish_analysis(result, &open, &mut published, &mut *output);
+        }
+    });
+    let mut open = HashSet::new();
+    while let Some(msg) = read_message(&mut input)? {
+        let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = msg.get("id").cloned();
+        match method {
+            "initialize" => reply(
+                &mut *output
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("LSP output lock poisoned"))?,
+                id,
+                initialize_result(),
+            )?,
+            "shutdown" => reply(
+                &mut *output
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("LSP output lock poisoned"))?,
+                id,
+                Value::Null,
+            )?,
+            "exit" => break,
+            "textDocument/didOpen" => {
+                if let Some(uri) = doc_uri(&msg) {
+                    open.insert(uri);
+                }
+                requests.send(open.clone()).ok();
+            }
+            "textDocument/didSave" => {
+                requests.send(open.clone()).ok();
+            }
+            "textDocument/didClose" => {
+                if let Some(uri) = doc_uri(&msg) {
+                    open.remove(&uri);
+                    publish(
+                        &mut *output
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("LSP output lock poisoned"))?,
+                        &uri,
+                        &[],
+                    )?;
+                }
+            }
+            "initialized" | "textDocument/didChange" | "$/setTrace" => {}
+            _ if id.is_some() => error(
+                &mut *output
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("LSP output lock poisoned"))?,
+                id,
+                -32601,
+                &format!("method not found: {method}"),
+            )?,
+            _ => {}
+        }
+    }
+    drop(requests);
+    drop(worker);
+    Ok(())
+}
+
 /// Serve the LSP protocol on the given reader/writer until `exit` (or EOF).
 /// Split from `serve_stdio` so tests can drive it with in-memory buffers.
-pub fn serve<R: BufRead, W: Write>(ctx: &LspCtx, mut input: R, mut output: W) -> anyhow::Result<()> {
+pub fn serve<R: BufRead, W: Write>(
+    ctx: &LspCtx,
+    mut input: R,
+    mut output: W,
+) -> anyhow::Result<()> {
     // URIs we have open, and the URIs we last published non-empty diagnostics
     // for — together they tell us which files to clear on the next analysis.
     let mut open: HashSet<String> = HashSet::new();
@@ -61,7 +148,12 @@ pub fn serve<R: BufRead, W: Write>(ctx: &LspCtx, mut input: R, mut output: W) ->
                 // Unknown *requests* (those with an id) get an error; unknown
                 // notifications are silently ignored, per JSON-RPC.
                 if id.is_some() {
-                    error(&mut output, id, -32601, &format!("method not found: {method}"))?;
+                    error(
+                        &mut output,
+                        id,
+                        -32601,
+                        &format!("method not found: {method}"),
+                    )?;
                 }
             }
         }
@@ -91,7 +183,21 @@ fn analyze_and_publish<W: Write>(
     published: &mut HashSet<String>,
     output: &mut W,
 ) -> anyhow::Result<()> {
-    match diagnostics::compute(&ctx.repo, ctx.index.as_deref()) {
+    publish_analysis(
+        diagnostics::compute(&ctx.repo, ctx.index.as_deref()),
+        open,
+        published,
+        output,
+    )
+}
+
+fn publish_analysis<W: Write>(
+    result: anyhow::Result<std::collections::BTreeMap<String, Vec<Value>>>,
+    open: &HashSet<String>,
+    published: &mut HashSet<String>,
+    output: &mut W,
+) -> anyhow::Result<()> {
+    match result {
         Ok(by_uri) => {
             let current: HashSet<String> = by_uri.keys().cloned().collect();
             // Anything previously flagged or currently open but now clean gets
@@ -132,7 +238,11 @@ fn publish<W: Write>(output: &mut W, uri: &str, diagnostics: &[Value]) -> anyhow
 
 /// A `window/showMessage` warning (type 2 = Warning).
 fn show_message<W: Write>(output: &mut W, message: String) -> anyhow::Result<()> {
-    notify(output, "window/showMessage", json!({ "type": 2, "message": message }))
+    notify(
+        output,
+        "window/showMessage",
+        json!({ "type": 2, "message": message }),
+    )
 }
 
 fn reply<W: Write>(output: &mut W, id: Option<Value>, result: Value) -> anyhow::Result<()> {
@@ -155,7 +265,10 @@ fn error<W: Write>(
 }
 
 fn notify<W: Write>(output: &mut W, method: &str, params: Value) -> anyhow::Result<()> {
-    write_message(output, &json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+    write_message(
+        output,
+        &json!({ "jsonrpc": "2.0", "method": method, "params": params }),
+    )
 }
 
 /// Write one LSP message: `Content-Length` header, blank line, JSON body.

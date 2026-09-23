@@ -158,54 +158,6 @@ pub(crate) fn render_wrapper_prompt(wrappers: &[JudgeInput]) -> String {
     prompt
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::RefCell;
-
-    #[derive(Default)]
-    struct Spy(RefCell<String>);
-    impl Judge for Spy {
-        fn model(&self) -> &str {
-            "spy"
-        }
-        fn judge_prompt(&self, prompt: &str) -> Result<Vec<Verdict>> {
-            *self.0.borrow_mut() = prompt.to_string();
-            Ok(Vec::new())
-        }
-    }
-
-    fn input() -> JudgeInput {
-        JudgeInput {
-            index: 0,
-            a_label: "load".into(),
-            a_context: "def load(path):".into(),
-            b_label: "read_file".into(),
-            b_context: String::new(),
-        }
-    }
-
-    #[test]
-    fn wrapper_and_redundancy_route_distinct_prompts() {
-        let spy = Spy::default();
-        spy.judge_wrappers(&[input()]).unwrap();
-        let wrapper = spy.0.borrow().clone();
-        spy.judge(&[input()]).unwrap();
-        let redundancy = spy.0.borrow().clone();
-        assert!(wrapper.contains("trivial wrapper") && wrapper.contains("delegates_to=\"read_file\""));
-        assert!(redundancy.contains("semantic redundancy"));
-        assert_ne!(wrapper, redundancy);
-    }
-
-    #[test]
-    fn empty_inputs_skip_the_transport() {
-        let spy = Spy::default();
-        assert!(spy.judge_wrappers(&[]).unwrap().is_empty());
-        assert!(spy.judge(&[]).unwrap().is_empty());
-        assert!(spy.0.borrow().is_empty(), "transport must not run for empty input");
-    }
-}
-
 impl Judge for ClaudeJudge {
     fn model(&self) -> &str {
         &self.model
@@ -264,5 +216,53 @@ impl Judge for ClaudeJudge {
         let list: VerdictList =
             serde_json::from_str(text).context("parsing structured verdicts")?;
         Ok(list.verdicts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct Spy(RefCell<String>);
+    impl Judge for Spy {
+        fn model(&self) -> &str {
+            "spy"
+        }
+        fn judge_prompt(&self, prompt: &str) -> Result<Vec<Verdict>> {
+            *self.0.borrow_mut() = prompt.to_string();
+            Ok(Vec::new())
+        }
+    }
+
+    fn input() -> JudgeInput {
+        JudgeInput {
+            index: 0,
+            a_label: "load".into(),
+            a_context: "def load(path):".into(),
+            b_label: "read_file".into(),
+            b_context: String::new(),
+        }
+    }
+
+    #[test]
+    fn wrapper_and_redundancy_route_distinct_prompts() {
+        let spy = Spy::default();
+        spy.judge_wrappers(&[input()]).unwrap();
+        let wrapper = spy.0.borrow().clone();
+        spy.judge(&[input()]).unwrap();
+        let redundancy = spy.0.borrow().clone();
+        assert!(wrapper.contains("trivial wrapper") && wrapper.contains("delegates_to=\"read_file\""));
+        assert!(redundancy.contains("semantic redundancy"));
+        assert_ne!(wrapper, redundancy);
+    }
+
+    #[test]
+    fn empty_inputs_skip_the_transport() {
+        let spy = Spy::default();
+        assert!(spy.judge_wrappers(&[]).unwrap().is_empty());
+        assert!(spy.judge(&[]).unwrap().is_empty());
+        assert!(spy.0.borrow().is_empty(), "transport must not run for empty input");
     }
 }

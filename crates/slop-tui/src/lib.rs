@@ -10,11 +10,11 @@ use std::ffi::OsStr;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use slop_analyze::build::BuiltGraph;
 use slop_analyze::{check, query};
 
 pub mod app;
@@ -25,10 +25,9 @@ pub use app::{Action, App, Cmd, VerifyPanel};
 /// Run the dashboard for `repo` until the user quits. Computes the initial
 /// audit, then drives the draw/input loop. Restores the terminal even on error.
 pub fn run(repo: PathBuf, index: Option<PathBuf>) -> Result<()> {
-    // Keep the graph alive for the whole session — the explorer queries it on
-    // every focus change.
-    let analysis = check::load_analysis(&repo, index.as_deref())?;
-    let result = check::audit(&repo, index.as_deref())?;
+    let mut analysis =
+        check::load_analysis_fresh(&repo, index.as_deref(), check::Freshness::Reindex)?;
+    let result = check::audit_snapshot(&analysis)?;
     let name = repo
         .canonicalize()
         .ok()
@@ -37,7 +36,13 @@ pub fn run(repo: PathBuf, index: Option<PathBuf>) -> Result<()> {
     let mut app = App::new(name, result);
 
     let mut terminal = ratatui::init();
-    let outcome = event_loop(&mut terminal, &mut app, &analysis.built, &repo, index.as_deref());
+    let outcome = event_loop(
+        &mut terminal,
+        &mut app,
+        &mut analysis,
+        &repo,
+        index.as_deref(),
+    );
     ratatui::restore();
     outcome
 }
@@ -45,7 +50,7 @@ pub fn run(repo: PathBuf, index: Option<PathBuf>) -> Result<()> {
 fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    built: &BuiltGraph,
+    analysis: &mut Arc<check::Analysis>,
     repo: &Path,
     index: Option<&Path>,
 ) -> Result<()> {
@@ -78,13 +83,29 @@ fn event_loop(
                 Action::Quit => break,
                 Action::None => {}
                 Action::Reload => {
-                    reload(app, repo, index);
+                    reload(app, analysis, repo, index);
                     app.status = Some("reloaded".to_string());
                 }
                 Action::OpenSelected => open_selected(app, repo),
                 Action::FixSelected => {
                     let before = snapshot(app);
-                    let args = cmd_args(Cmd::FixApply, repo, index);
+                    let Some(id) = app.selected_finding_id() else {
+                        continue;
+                    };
+                    let advisory = app
+                        .selected_finding()
+                        .is_some_and(|finding| finding.finding.rule == "over-commenting");
+                    let mut args = vec![
+                        "fix".to_string(),
+                        repo.display().to_string(),
+                        "--write".to_string(),
+                        "--finding".to_string(),
+                        id,
+                    ];
+                    if advisory {
+                        args.push("--allow-advisory".to_string());
+                    }
+                    push_index(&mut args, index);
                     let panel = suspend_fix_and_verify(
                         terminal,
                         exe.as_os_str(),
@@ -94,32 +115,30 @@ fn event_loop(
                         index,
                         false,
                     );
-                    reload(app, repo, index);
-                    app.status =
-                        Some(format!("mechanical fix — {}", delta(before, snapshot(app))));
+                    reload(app, analysis, repo, index);
+                    app.status = Some(format!("mechanical fix — {}", delta(before, snapshot(app))));
                     app.set_verify(panel);
                 }
                 Action::FixWithClaude => {
                     if let Some(prompt) = app.selected_claude_prompt() {
                         let before = snapshot(app);
                         let args = vec![
-                            "-p".to_string(),
+                            "delegate".to_string(),
+                            repo.display().to_string(),
+                            "--prompt".to_string(),
                             prompt,
-                            "--permission-mode".to_string(),
-                            "acceptEdits".to_string(),
                         ];
                         let panel = suspend_fix_and_verify(
                             terminal,
-                            OsStr::new("claude"),
+                            exe.as_os_str(),
                             &args,
                             &exe,
                             repo,
                             index,
-                            true, // ensure the context layer so claude sees slop's MCP + hooks
+                            false,
                         );
-                        reload(app, repo, index);
-                        app.status =
-                            Some(format!("Claude fix — {}", delta(before, snapshot(app))));
+                        reload(app, analysis, repo, index);
+                        app.status = Some(format!("AI fix — {}", delta(before, snapshot(app))));
                         app.set_verify(panel);
                     }
                 }
@@ -128,7 +147,7 @@ fn event_loop(
                     match test_command(repo) {
                         Some((prog, args)) => {
                             suspend_run(terminal, OsStr::new(&prog), &args, repo)?;
-                            reload(app, repo, index);
+                            reload(app, analysis, repo, index);
                             app.status = Some(format!("ran `{prog} {}`", args.join(" ")));
                         }
                         None => {
@@ -142,15 +161,18 @@ fn event_loop(
                     let before = snapshot(app);
                     let args = cmd_args(cmd, repo, index);
                     suspend_run(terminal, exe.as_os_str(), &args, repo)?;
-                    reload(app, repo, index);
-                    app.status =
-                        Some(format!("ran `slop {}` — {}", args.join(" "), delta(before, snapshot(app))));
+                    reload(app, analysis, repo, index);
+                    app.status = Some(format!(
+                        "ran `slop {}` — {}",
+                        args.join(" "),
+                        delta(before, snapshot(app))
+                    ));
                 }
                 Action::Verify => {
                     // Manual verify is a fast check against the current index
                     // (no reindex); post-fix verification reindexes for accuracy.
                     app.set_verify(run_gate(&exe, repo, index, false));
-                    reload(app, repo, index);
+                    reload(app, analysis, repo, index);
                 }
                 Action::YankSelected => {
                     app.status = Some(match app.selected_detail_text() {
@@ -163,7 +185,7 @@ fn event_loop(
                         None => "nothing selected".to_string(),
                     });
                 }
-                Action::Explore(id) => match query::subgraph(built, &id, 1, None) {
+                Action::Explore(id) => match query::subgraph(&analysis.built, &id, 1, None) {
                     Some(sg) => app.set_explorer_subgraph(sg),
                     None => {
                         app.status = Some(format!("no graph node for {id}"));
@@ -181,16 +203,17 @@ fn event_loop(
 
 /// Re-run the audit in place; a failure keeps the last good state (so a broken
 /// reindex mid-session doesn't blank the dashboard).
-fn reload(app: &mut App, repo: &Path, index: Option<&Path>) {
-    if let Ok(result) = check::audit(repo, index) {
+fn reload(app: &mut App, analysis: &mut Arc<check::Analysis>, repo: &Path, index: Option<&Path>) {
+    let Ok(next) = check::load_analysis_fresh(repo, index, check::Freshness::Reindex) else {
+        return;
+    };
+    if let Ok(result) = check::audit_snapshot(&next) {
+        *analysis = next;
         app.set_result(result);
     }
 }
 
-/// Open the selected finding's file at its line in the user's editor. Tries
-/// `$SLOP_EDITOR`, then `cursor`, then `code` — all of which accept
-/// `-g <file>:<line>` and return immediately (GUI editors). Terminal editors
-/// aren't supported from here (use Enter for the path, edit however you like).
+/// Open the selected finding through the editor adapter configured by setup.
 fn open_selected(app: &mut App, repo: &Path) {
     let Some(f) = app.selected_finding() else {
         return;
@@ -201,30 +224,12 @@ fn open_selected(app: &mut App, repo: &Path) {
         f.finding.lines.0 + 1
     );
 
-    let mut candidates: Vec<String> = Vec::new();
-    if let Ok(ed) = std::env::var("SLOP_EDITOR") {
-        if !ed.is_empty() {
-            candidates.push(ed);
-        }
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("slop"));
+    match Command::new(exe).args(["open", &target]).status() {
+        Ok(status) if status.success() => app.status = Some(format!("opened {target}")),
+        Ok(status) => app.status = Some(format!("editor adapter exited with {status}")),
+        Err(error) => app.status = Some(format!("could not open editor: {error}")),
     }
-    candidates.push("cursor".to_string());
-    candidates.push("code".to_string());
-
-    for ed in &candidates {
-        let spawned = Command::new(ed)
-            .arg("-g")
-            .arg(&target)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        if spawned.is_ok() {
-            app.status = Some(format!("opened {target} in {ed}"));
-            return;
-        }
-    }
-    app.status = Some(
-        "no editor found — set SLOP_EDITOR, or put `code`/`cursor` on PATH".to_string(),
-    );
 }
 
 /// Leave the alt-screen, run `program <args>` in `cwd` with inherited stdio (so
@@ -299,7 +304,11 @@ fn suspend_fix_and_verify(
 /// verdict into a panel. This is the canonical CI check — the honest "does this
 /// pass right now" answer.
 fn run_gate(exe: &Path, repo: &Path, index: Option<&Path>, reindex: bool) -> VerifyPanel {
-    let mut args = vec!["gate".to_string(), repo.display().to_string(), "--all".to_string()];
+    let mut args = vec![
+        "gate".to_string(),
+        repo.display().to_string(),
+        "--all".to_string(),
+    ];
     if reindex {
         args.push("--reindex".to_string());
     }
@@ -370,6 +379,9 @@ fn context_layer_present(repo: &Path) -> bool {
 
 /// The project's test command, by ecosystem marker. `None` if we can't tell.
 fn test_command(repo: &Path) -> Option<(String, Vec<String>)> {
+    if repo.join("Cargo.toml").exists() {
+        return Some(("cargo".to_string(), vec!["test".to_string()]));
+    }
     if repo.join("package.json").exists() {
         return Some(("npm".to_string(), vec!["test".to_string()]));
     }
@@ -429,7 +441,7 @@ fn cmd_args(cmd: Cmd, repo: &Path, index: Option<&Path>) -> Vec<String> {
             push_index(&mut a, index);
             a
         }
-        Cmd::Install => vec!["install".to_string(), repo_s],
+        Cmd::Install => vec!["setup".to_string(), repo_s],
         Cmd::Gate => {
             let mut a = vec!["gate".to_string(), repo_s, "--all".to_string()];
             push_index(&mut a, index);

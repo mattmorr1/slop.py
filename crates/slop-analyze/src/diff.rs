@@ -84,6 +84,7 @@ diff --git a/utils/dates.py b/utils/dates.py
             entity: "x".into(),
             file: file.into(),
             lines,
+            related: Vec::new(),
             message: String::new(),
             fix_guidance: String::new(),
         }

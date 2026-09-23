@@ -15,13 +15,14 @@
 
 use std::collections::BTreeMap;
 
+use serde::Serialize;
 use slop_graph::Effect;
 use slop_parse::{names::qualified_names, Language};
 
 use crate::effects::seed_effects_for;
 use crate::policy::Policy;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrecheckFinding {
     pub effect: Effect,
     /// The unsanctioned name the proposed content acquires it through.

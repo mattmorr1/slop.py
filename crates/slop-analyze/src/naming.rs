@@ -70,6 +70,7 @@ pub fn naming_convention(built: &BuiltGraph) -> Vec<Finding> {
                         entity: entity.id.clone(),
                         file: entity.file.clone(),
                         lines: entity.source_range,
+                        related: Vec::new(),
                         message: format!(
                             "`{name}` deviates from this codebase's dominant {style_name} style ({count}/{} functions)",
                             named.len()
@@ -101,6 +102,7 @@ pub fn naming_convention(built: &BuiltGraph) -> Vec<Finding> {
                 entity: entity.id.clone(),
                 file: entity.file.clone(),
                 lines: entity.source_range,
+                related: Vec::new(),
                 message: format!(
                     "`{name}` carries the throwaway marker `{pattern}` — a versioned/placeholder name that outlives its intent"
                 ),

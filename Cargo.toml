@@ -14,10 +14,19 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
+rust-version = "1.94"
 license = "MIT"
-repository = "https://github.com/matthewmorris/slop.py"
+repository = "https://github.com/mattmorr1/slop.py"
+readme = "README.md"
+keywords = ["static-analysis", "developer-tools", "scip", "ai"]
+categories = ["development-tools"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -34,12 +43,12 @@ ruff_python_ast = "0.0.3"
 ruff_text_size = "0.0.3"
 ureq = { version = "2", features = ["json"] }
 
-slop-graph = { path = "crates/slop-graph" }
-slop-llm = { path = "crates/slop-llm" }
-slop-lsp = { path = "crates/slop-lsp" }
-slop-mcp = { path = "crates/slop-mcp" }
-slop-parse = { path = "crates/slop-parse" }
-slop-tui = { path = "crates/slop-tui" }
-slop-proxy = { path = "crates/slop-proxy" }
-slop-resolve = { path = "crates/slop-resolve" }
-slop-analyze = { path = "crates/slop-analyze" }
+slop-graph = { version = "0.1.0", path = "crates/slop-graph" }
+slop-llm = { version = "0.1.0", path = "crates/slop-llm" }
+slop-lsp = { version = "0.1.0", path = "crates/slop-lsp" }
+slop-mcp = { version = "0.1.0", path = "crates/slop-mcp" }
+slop-parse = { version = "0.1.0", path = "crates/slop-parse" }
+slop-tui = { version = "0.1.0", path = "crates/slop-tui" }
+slop-proxy = { version = "0.1.0", path = "crates/slop-proxy" }
+slop-resolve = { version = "0.1.0", path = "crates/slop-resolve" }
+slop-analyze = { version = "0.1.0", path = "crates/slop-analyze" }

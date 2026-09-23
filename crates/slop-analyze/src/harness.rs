@@ -20,9 +20,10 @@ use serde_json::{json, Value};
 
 use slop_parse::Language;
 
-use crate::compress::{self, CompressConfig};
+use crate::compress::CompressConfig;
 use crate::policy::Policy;
 use crate::precheck::precheck;
+use crate::prewrite;
 use crate::world;
 
 /// Only bother remapping when the strip saves at least this fraction of
@@ -189,31 +190,11 @@ pub fn compress_read(
     source: &str,
     edit_files: &[String],
 ) -> Option<String> {
-    let config = CompressConfig::default();
-    if source.lines().count() < config.min_lines {
-        return None;
-    }
     let analysis = crate::check::load_analysis(repo, None).ok()?;
-    let loci: Vec<String> = analysis
-        .built
-        .graph
-        .entities()
-        .filter(|(_, e)| edit_files.contains(&e.file))
-        .map(|(_, e)| e.id.clone())
-        .collect();
-    if loci.is_empty() {
-        return None;
+    match analysis.compress_read(rel_file, source, edit_files, &CompressConfig::default()) {
+        crate::context::ReadContext::Compressed { source, .. } => Some(source),
+        crate::context::ReadContext::Verbatim { .. } => None,
     }
-    let (out, stats) = compress::compress_file(
-        &analysis.built,
-        &analysis.facts,
-        source,
-        rel_file,
-        &loci,
-        &config,
-        None,
-    );
-    (stats.skeletonized > 0).then_some(out)
 }
 
 /// The full proposed content of the file a write tool is about to produce.
@@ -270,21 +251,31 @@ pub fn handle_pre_tool_use(input: &Value) -> Value {
     };
     let repo = find_repo_root(&cwd);
     let policy = Policy::load(&repo).unwrap_or_default();
-    // No policy => silent (D8), and we skip reading the file at all.
-    if policy.channels.is_empty() {
-        return json!({});
-    }
     let Some(rel) = repo_relative(&repo, &file) else {
         return json!({});
     };
     let Some(content) = proposed_content(tool, input, Path::new(&file)) else {
         return json!({});
     };
-    let findings = precheck(lang, &rel, &content, &policy);
-    if findings.is_empty() {
+    let mut context = match prewrite::assess_from_sidecar(&repo, &policy, &rel, &content, 3) {
+        Ok(Some(assessment)) => assessment.steering(),
+        Ok(None) => precheck(lang, &rel, &content, &policy)
+            .iter()
+            .map(|finding| finding.steering())
+            .collect(),
+        Err(error) => {
+            let mut context: Vec<String> = precheck(lang, &rel, &content, &policy)
+                .iter()
+                .map(|finding| finding.steering())
+                .collect();
+            context.push(format!("slop: reuse suggestions unavailable: {error:#}"));
+            context
+        }
+    };
+    context.dedup();
+    if context.is_empty() {
         return json!({});
     }
-    let context: Vec<String> = findings.iter().map(|f| f.steering()).collect();
     json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -384,17 +375,26 @@ pub fn handle_session_start(input: &Value, event: &str) -> Value {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let repo = find_repo_root(&cwd);
-    let policy = Policy::load(&repo).unwrap_or_default();
     let analysis = crate::check::load_analysis(&repo, None).ok();
+    let sidecar_error = analysis
+        .as_ref()
+        .and_then(|snapshot| snapshot.write_prewrite_sidecar().err());
+    let fallback_policy = Policy::load(&repo).unwrap_or_default();
+    let policy = analysis
+        .as_ref()
+        .map_or(&fallback_policy, |snapshot| &snapshot.policy);
     let built = analysis.as_ref().map(|a| &a.built);
     let env = analysis
         .as_ref()
         .map(|a| crate::config::env_vars(&repo, &a.facts))
         .unwrap_or_default();
 
-    let Some(context) = world::render(&policy, built, &env, world::DEFAULT_BUDGET) else {
+    let Some(mut context) = world::render(policy, built, &env, world::DEFAULT_BUDGET) else {
         return json!({});
     };
+    if let Some(error) = sidecar_error {
+        context.push_str(&format!("\nslop: prewrite sidecar unavailable: {error:#}"));
+    }
     json!({
         "hookSpecificOutput": {
             "hookEventName": event,
@@ -429,6 +429,7 @@ pub fn handle_user_prompt_submit(input: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempFixture;
 
     fn input_in_dir_without_policy() -> Value {
         json!({"cwd": "/does/not/matter"})
@@ -554,6 +555,33 @@ mod tests {
         // Warn-only: never asserts a permission decision.
         assert!(out["hookSpecificOutput"].get("permissionDecision").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_tool_use_surfaces_snapshot_bound_reuse_suggestion() {
+        let repo = TempFixture::new("toy_repo_slopped");
+        let snapshot =
+            crate::snapshot::RepositorySnapshot::capture(crate::snapshot::CaptureRequest {
+                repo: &repo,
+                index: None,
+                policy: None,
+                freshness: crate::snapshot::Freshness::Warn,
+            })
+            .unwrap();
+        let sidecar = snapshot.write_prewrite_sidecar().unwrap();
+        let out = handle_pre_tool_use(&json!({
+            "tool_name": "Write",
+            "cwd": repo.to_string_lossy(),
+            "tool_input": {
+                "file_path": repo.join("services/new_notify.py").to_string_lossy(),
+                "content": "def emit(rows):\n    report = build_report(rows)\n    send_notification(report)\n"
+            }
+        }));
+        let context = out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(context.contains("notify_with_report"), "{context}");
+        let _ = std::fs::remove_file(sidecar);
     }
 
     #[test]

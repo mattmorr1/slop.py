@@ -77,6 +77,7 @@ impl Default for CompressConfig {
 }
 
 /// A per-function decision, for reporting/measurement.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct CompressStats {
     pub total_functions: usize,
     pub skeletonized: usize,
@@ -281,7 +282,7 @@ mod tests {
             &facts,
             &src,
             file,
-            &[locus.clone()],
+            std::slice::from_ref(&locus),
             &CompressConfig {
                 edit_zone_hops: 0,
                 min_lines: 0,

@@ -58,6 +58,27 @@ fn words(s: &str) -> HashSet<String> {
 
 /// Does `comment` (a comment line, marker already stripped) restate `code`?
 fn restates(comment: &str, code: &str) -> bool {
+    let directive = comment.to_ascii_lowercase();
+    if [
+        "noqa",
+        "type: ignore",
+        "fmt:",
+        "rustfmt::",
+        "clippy::",
+        "coverage:",
+        "pragma:",
+        "istanbul",
+        "eslint",
+        "prettier",
+        "generated",
+        "codegen",
+        "region",
+    ]
+    .iter()
+    .any(|marker| directive.contains(marker))
+    {
+        return false;
+    }
     let stop: HashSet<&str> = STOPWORDS.iter().copied().collect();
     let cw: HashSet<String> = words(comment)
         .into_iter()
@@ -248,6 +269,13 @@ mod tests {
         let (out, n) = fix_over_commenting(src, &[(0, 2)], Some(Language::Python));
         assert_eq!(n, 0);
         assert!(out.contains("WHOOP"));
+    }
+
+    #[test]
+    fn keeps_tooling_directives_even_when_they_restate_code() {
+        for directive in ["# noqa: return result", "# type: ignore return result", "// coverage: ignore return result"] {
+            assert!(!restates(directive, "return result"), "{directive}");
+        }
     }
 
     #[test]

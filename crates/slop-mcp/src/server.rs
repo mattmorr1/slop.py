@@ -78,6 +78,7 @@ fn handle(ctx: &ToolCtx, msg: &Value) -> Option<Value> {
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "slop", "version": env!("CARGO_PKG_VERSION") },
+                "instructions": "Use find_capability before adding parallel infrastructure and assess_write before creating a new implementation. Use get_context_envelope before editing unfamiliar code. After edits, call validate_change and resolve blocking findings before finishing. Context and findings are snapshot-bound; refresh after writes.",
             })))
         }
         // Post-initialize handshake and keepalives.

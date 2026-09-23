@@ -32,12 +32,18 @@ pub fn evaluate(req: CheckRequest, fail_on: Severity) -> Result<GateOutcome> {
         .filter(|f| f.severity >= fail_on)
         .count();
     let json = serde_json::to_string_pretty(&json!({
+        "schema_version": result.schema_version,
+        "snapshot": result.snapshot,
+        "freshness": result.freshness,
+        "scope": result.scope,
+        "coverage": result.coverage,
         "passed": failing == 0,
         "fail_on": fail_on.to_string(),
         "failing": failing,
         "blocking": result.blocking,
         "total": result.findings.len(),
         "health": result.health_line,
+        "current_health": result.current_health,
         "policy_is_empty": result.policy_is_empty,
         "findings": result.findings,
     }))?;
@@ -47,18 +53,17 @@ pub fn evaluate(req: CheckRequest, fail_on: Severity) -> Result<GateOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::test_support::TempFixture;
 
-    fn fixture(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures")
-            .join(name)
+    fn fixture(name: &str) -> TempFixture {
+        TempFixture::new(name)
     }
 
     fn gate_all(name: &str, fail_on: Severity) -> GateOutcome {
+        let repo = fixture(name);
         evaluate(
             CheckRequest {
-                repo: fixture(name),
+                repo: repo.to_path_buf(),
                 all: true, // whole-repo, so the test doesn't depend on git diff
                 ..Default::default()
             },
@@ -72,6 +77,7 @@ mod tests {
         let out = gate_all("toy_repo_slopped", Severity::Blocking);
         assert!(out.failing > 0, "{}", out.json);
         assert!(out.json.contains("\"passed\": false"));
+        assert!(out.json.contains("\"schema_version\": 1"));
     }
 
     #[test]

@@ -66,6 +66,7 @@ fn relays_sse_and_logs_usage() {
                 repo: None,
                 steer: false,
                 log: Some(log_for_proxy),
+                ..ProxyConfig::default()
             },
         )
         .unwrap();
@@ -86,8 +87,14 @@ fn relays_sse_and_logs_usage() {
     let mut response = String::new();
     client.read_to_string(&mut response).unwrap();
 
-    assert!(response.starts_with("HTTP/1.1 200"), "status line: {response}");
-    assert!(response.contains("message_start"), "body relayed: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "status line: {response}"
+    );
+    assert!(
+        response.contains("message_start"),
+        "body relayed: {response}"
+    );
     assert!(response.contains("claude-x"));
     // The SSE payload is passed through verbatim.
     assert!(response.contains(SSE_BODY.trim_end()));

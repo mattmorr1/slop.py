@@ -104,6 +104,7 @@ fn inlines_same_module_identity_forwarder_across_files() {
         entity: "m::load".to_string(),
         file: "m.py".to_string(),
         lines: (4, 5),
+        related: Vec::new(),
         message: String::new(),
         fix_guidance: String::new(),
     };

@@ -3,8 +3,6 @@
 //! Proves a free-function rename rewrites the definition *and* its reference,
 //! and that a method is skipped (framework/dynamic-dispatch safety).
 
-use std::path::PathBuf;
-
 use slop_analyze::build;
 use slop_analyze::findings::{Finding, Severity};
 use slop_analyze::rename::{self, RenameOutcome};
@@ -92,6 +90,7 @@ fn renames_free_function_with_references_and_skips_methods() {
         entity: entity.to_string(),
         file: "m.py".to_string(),
         lines: (0, 0),
+        related: Vec::new(),
         message: String::new(),
         fix_guidance: String::new(),
     };

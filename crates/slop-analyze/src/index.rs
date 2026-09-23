@@ -11,10 +11,13 @@ use std::process::Command as Process;
 
 use anyhow::{bail, Context, Result};
 
+pub const SCIP_PYTHON_PACKAGE: &str = "@sourcegraph/scip-python@0.6.6";
+pub const SCIP_TYPESCRIPT_PACKAGE: &str = "@sourcegraph/scip-typescript@0.4.0";
+
 /// The SCIP indexer for a language. slop's graph/effect detectors consume any
 /// SCIP index; picking the right indexer per repo is all the multi-language
 /// index path needs.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Indexer {
     /// Detect from project markers (pyproject/setup/*.py vs Cargo.toml vs package.json/tsconfig).
     Auto,
@@ -24,6 +27,17 @@ pub enum Indexer {
     Typescript,
     /// `rust-analyzer scip` (Rust) — the one indexer that needs no npx.
     Rust,
+}
+
+impl Indexer {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Python => "python",
+            Self::Typescript => "typescript",
+            Self::Rust => "rust",
+        }
+    }
 }
 
 impl Indexer {
@@ -37,7 +51,11 @@ impl Indexer {
         // parser-based rules cover Python most fully, so it's the richer target.
         // Cargo.toml is checked before the JS markers because a Rust repo often
         // carries a package.json for web assets, but not the reverse.
-        if has("pyproject.toml") || has("setup.py") || has("requirements.txt") || has_top_level_ext(repo, "py") {
+        if has("pyproject.toml")
+            || has("setup.py")
+            || has("requirements.txt")
+            || has_top_level_ext(repo, "py")
+        {
             Indexer::Python
         } else if has("Cargo.toml") {
             Indexer::Rust
@@ -49,20 +67,117 @@ impl Indexer {
     }
 }
 
+/// Every language family with source in this repository, in stable order.
+/// Marker files are insufficient for monorepos, so detection walks supported
+/// source extensions while skipping generated/vendor trees.
+pub fn detected_indexers(repo: &Path) -> Vec<Indexer> {
+    let mut found = [false; 3];
+    detect_source_languages(repo, &mut found);
+    let mut indexers = Vec::with_capacity(3);
+    if found[0] {
+        indexers.push(Indexer::Python);
+    }
+    if found[1] {
+        indexers.push(Indexer::Typescript);
+    }
+    if found[2] {
+        indexers.push(Indexer::Rust);
+    }
+    if indexers.is_empty() {
+        indexers.push(Indexer::Auto.resolve(repo));
+    }
+    indexers
+}
+
+fn detect_source_languages(dir: &Path, found: &mut [bool; 3]) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
+            let name = entry.file_name();
+            if !SKIP_DIRS.iter().any(|skip| name == *skip) {
+                detect_source_languages(&path, found);
+            }
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(ignored_source_path)
+        {
+            continue;
+        }
+        match path.extension().and_then(|value| value.to_str()) {
+            Some("py") => found[0] = true,
+            Some("js" | "jsx" | "ts" | "tsx") => found[1] = true,
+            Some("rs") => found[2] = true,
+            _ => {}
+        }
+    }
+}
+
+/// Resolve the artifact set for a repository. An explicit path keeps the
+/// single-index compatibility seam. Auto mode stores one artifact per language
+/// only when the repository is actually polyglot.
+pub fn index_paths(repo: &Path, explicit: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(path) = explicit {
+        return vec![path.to_path_buf()];
+    }
+    let indexers = detected_indexers(repo);
+    if indexers.len() == 1 {
+        return vec![repo.join("index.scip")];
+    }
+    indexers
+        .into_iter()
+        .map(|indexer| {
+            repo.join(".slop/index")
+                .join(format!("{}.scip", indexer.label()))
+        })
+        .collect()
+}
+
 /// Is there a top-level file with extension `ext` in `repo`? A cheap language
 /// signal for repos without config-file markers.
 fn has_top_level_ext(repo: &Path, ext: &str) -> bool {
     std::fs::read_dir(repo)
         .map(|entries| {
-            entries.flatten().any(|e| {
-                e.path().extension().and_then(|s| s.to_str()) == Some(ext)
-            })
+            entries
+                .flatten()
+                .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some(ext))
         })
         .unwrap_or(false)
 }
 
 /// Directories never worth walking for source-file mtimes.
-const SKIP_DIRS: &[&str] = &[".git", "node_modules", ".venv", "venv", "target", "__pycache__"];
+pub(crate) const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "target",
+    "__pycache__",
+    "build",
+    "dist",
+    "htmlcov",
+    "coverage",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+];
+
+pub(crate) fn ignored_source_path(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|component| SKIP_DIRS.contains(&component))
+        || path.ends_with(".min.js")
+}
 
 /// A human-readable reason the index at `index_path` is out of date, or `None`
 /// if it looks current. "Stale" means a tracked source file has been modified
@@ -99,7 +214,11 @@ fn stamp_path(index_path: &Path) -> PathBuf {
 }
 
 fn read_stamp(index_path: &Path) -> Option<std::time::SystemTime> {
-    let nanos: u128 = std::fs::read_to_string(stamp_path(index_path)).ok()?.trim().parse().ok()?;
+    let nanos: u128 = std::fs::read_to_string(stamp_path(index_path))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
     Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos as u64))
 }
 
@@ -130,6 +249,12 @@ fn newest_source_mtime(dir: &Path, newest: &mut Option<(std::time::SystemTime, P
             }
             newest_source_mtime(&path, newest);
         } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(ignored_source_path)
+        {
+            continue;
+        } else if path
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| slop_parse::SOURCE_EXTS.contains(&e))
@@ -147,10 +272,28 @@ fn newest_source_mtime(dir: &Path, newest: &mut Option<(std::time::SystemTime, P
 /// `<repo>/index.scip`). Used by `slop gate --reindex`; auto-detects the
 /// indexer.
 pub fn run_scip_index(repo: &Path, index: Option<&Path>) -> Result<()> {
-    let out = index
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| repo.join("index.scip"));
-    run_indexer(Indexer::Auto, repo, &out, "slop-gate")
+    if let Some(out) = index {
+        return run_indexer(Indexer::Auto, repo, out, "slop-gate");
+    }
+    let indexers = detected_indexers(repo);
+    let paths = index_paths(repo, None);
+    for (indexer, out) in indexers.into_iter().zip(paths) {
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        run_indexer(indexer, repo, &out, &default_project_name(repo))?;
+    }
+    Ok(())
+}
+
+pub fn ensure_indexes(repo: &Path, explicit: Option<&Path>) -> Result<Vec<PathBuf>> {
+    let paths = index_paths(repo, explicit);
+    if paths.iter().all(|path| path.exists()) {
+        return Ok(paths);
+    }
+    eprintln!("SCIP coverage is incomplete — indexing detected languages first...");
+    run_scip_index(repo, explicit)?;
+    Ok(index_paths(repo, explicit))
 }
 
 /// Build the index if it isn't there yet, so no command dead-ends on a missing
@@ -165,12 +308,7 @@ pub fn ensure_index(repo: &Path, index_path: &Path) -> Result<bool> {
         return Ok(false);
     }
     eprintln!("no {} — indexing first...", index_path.display());
-    run_indexer(
-        Indexer::Auto,
-        repo,
-        index_path,
-        &default_project_name(repo),
-    )?;
+    run_indexer(Indexer::Auto, repo, index_path, &default_project_name(repo))?;
     Ok(true)
 }
 
@@ -194,13 +332,17 @@ pub fn run_indexer(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> 
             // rust-analyzer emits SCIP natively, so Rust needs no Node toolchain.
             let mut cmd = Process::new("rust-analyzer");
             cmd.arg("scip").arg(repo).arg("--output").arg(out);
-            ("rust-analyzer scip", "install it with: rustup component add rust-analyzer", cmd)
+            (
+                "rust-analyzer scip",
+                "install it with: rustup component add rust-analyzer",
+                cmd,
+            )
         }
         Indexer::Typescript => {
             // scip-typescript reads the project's tsconfig from its cwd and
             // takes just an output path.
             let mut cmd = npx();
-            cmd.args(["@sourcegraph/scip-typescript", "index", "--output"])
+            cmd.args([SCIP_TYPESCRIPT_PACKAGE, "index", "--output"])
                 .arg(out)
                 .current_dir(repo);
             ("scip-typescript", "is npx on PATH?", cmd)
@@ -212,7 +354,7 @@ pub fn run_indexer(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> 
             // `slop check <other-repo>`.
             let mut cmd = npx();
             cmd.current_dir(repo);
-            cmd.args(["@sourcegraph/scip-python", "index"])
+            cmd.args([SCIP_PYTHON_PACKAGE, "index"])
                 .arg(repo)
                 .args(["--project-name", project, "--output"])
                 .arg(out);
@@ -234,6 +376,14 @@ pub fn run_indexer(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_paths_do_not_enter_source_discovery() {
+        assert!(ignored_source_path("clients/web/build/assets/app.js"));
+        assert!(ignored_source_path("services/agent/dist/index.js"));
+        assert!(ignored_source_path("src/vendor.min.js"));
+        assert!(!ignored_source_path("src/distribution.rs"));
+    }
 
     /// A stamp that didn't round-trip would silently stop suppressing, and the
     /// symptom is an indexer subprocess on every invocation.
@@ -264,6 +414,25 @@ mod tests {
         assert!(index_staleness(&dir, &index).is_some());
         write_stamp(&dir, &index);
         assert!(index_staleness(&dir, &index).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detects_every_language_in_a_monorepo() {
+        let dir = std::env::temp_dir().join(format!("slop-polyglot-detect-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("web")).unwrap();
+        std::fs::create_dir_all(dir.join("native")).unwrap();
+        std::fs::write(dir.join("tool.py"), "pass\n").unwrap();
+        std::fs::write(dir.join("web/app.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(dir.join("native/lib.rs"), "pub fn x() {}\n").unwrap();
+        assert_eq!(
+            detected_indexers(&dir),
+            vec![Indexer::Python, Indexer::Typescript, Indexer::Rust]
+        );
+        let paths = index_paths(&dir, None);
+        assert!(paths.iter().any(|path| path.ends_with("python.scip")));
+        assert!(paths.iter().any(|path| path.ends_with("typescript.scip")));
+        assert!(paths.iter().any(|path| path.ends_with("rust.scip")));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

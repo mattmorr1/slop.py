@@ -10,8 +10,9 @@
 //! greedily by score under a token budget: full fidelity inside the edit
 //! zone (target + its direct neighborhood), skeletons beyond.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -23,10 +24,10 @@ use crate::infer;
 use crate::skeleton::{skeleton_for, strip_noise};
 use crate::source::{entity_for, location_index, FileFacts};
 
-const DISTANCE_WEIGHT: f64 = 3.0;
-const ADJACENCY_WEIGHT: f64 = 2.0;
-const EFFECT_WEIGHT: f64 = 2.0;
-const EXEMPLAR_WEIGHT: f64 = 1.0;
+const DISTANCE_WEIGHT: u32 = 3000;
+const ADJACENCY_WEIGHT: u32 = 2000;
+const EFFECT_WEIGHT: u32 = 2000;
+const EXEMPLAR_WEIGHT: u32 = 1000;
 
 /// Distance-independent edge kinds that count as "the same call/containment
 /// neighborhood" for BFS proximity.
@@ -44,8 +45,23 @@ pub struct EnvelopeItem {
     pub entity: String,
     pub file: String,
     pub fidelity: Fidelity,
-    pub score: f64,
+    pub score: u32,
+    pub reasons: ScoreReasons,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct ScoreReasons {
+    pub distance: u32,
+    pub adjacency: u32,
+    pub effect_overlap: u32,
+    pub sanctioned_exemplar: u32,
+}
+
+impl ScoreReasons {
+    fn total(self) -> u32 {
+        self.distance + self.adjacency + self.effect_overlap + self.sanctioned_exemplar
+    }
 }
 
 pub struct EnvelopeConfig {
@@ -120,18 +136,18 @@ fn container_of(built: &BuiltGraph, idx: NodeIndex) -> Option<NodeIndex> {
         .map(|e| e.source())
 }
 
-fn jaccard(a: &slop_graph::EffectSet, b: &slop_graph::EffectSet) -> f64 {
+fn effect_overlap(a: &slop_graph::EffectSet, b: &slop_graph::EffectSet) -> u32 {
     if a.0.is_empty() && b.0.is_empty() {
-        return 0.0;
+        return 0;
     }
     let sa: HashSet<_> = a.0.iter().collect();
     let sb: HashSet<_> = b.0.iter().collect();
     let inter = sa.intersection(&sb).count();
     let union = sa.union(&sb).count();
     if union == 0 {
-        0.0
+        0
     } else {
-        inter as f64 / union as f64
+        EFFECT_WEIGHT * inter as u32 / union as u32
     }
 }
 
@@ -156,6 +172,20 @@ fn render_full(repo_root: &Path, entity: &CodeEntity) -> Option<String> {
     ))
 }
 
+fn render_captured(sources: &BTreeMap<String, Arc<str>>, entity: &CodeEntity) -> Option<String> {
+    let source = sources.get(&entity.file)?;
+    let lines: Vec<&str> = source.lines().collect();
+    let (start, end) = entity.source_range;
+    let end = end.min(lines.len().saturating_sub(1));
+    if start > end || start >= lines.len() {
+        return None;
+    }
+    Some(strip_noise(
+        &lines[start..=end].join("\n"),
+        slop_parse::Language::from_path(&entity.file),
+    ))
+}
+
 /// Build the envelope around `target_entity` (a dotted `id`, `::`-joined).
 /// Empty if the target isn't in the graph.
 pub fn build_envelope(
@@ -165,6 +195,33 @@ pub fn build_envelope(
     target_entity: &str,
     config: &EnvelopeConfig,
 ) -> Vec<EnvelopeItem> {
+    build_envelope_with(built, facts, target_entity, config, |entity| {
+        render_full(repo_root, entity)
+    })
+}
+
+pub fn build_captured_envelope(
+    built: &BuiltGraph,
+    facts: &[FileFacts],
+    sources: &BTreeMap<String, Arc<str>>,
+    target_entity: &str,
+    config: &EnvelopeConfig,
+) -> Vec<EnvelopeItem> {
+    build_envelope_with(built, facts, target_entity, config, |entity| {
+        render_captured(sources, entity)
+    })
+}
+
+fn build_envelope_with<F>(
+    built: &BuiltGraph,
+    facts: &[FileFacts],
+    target_entity: &str,
+    config: &EnvelopeConfig,
+    render: F,
+) -> Vec<EnvelopeItem>
+where
+    F: Fn(&CodeEntity) -> Option<String>,
+{
     let Some(target_idx) = built.graph.node(target_entity) else {
         return Vec::new();
     };
@@ -184,7 +241,7 @@ pub fn build_envelope(
     let target_entity_ref = built.graph.entity(target_idx);
     let target_container = container_of(built, target_idx);
 
-    let mut scored: Vec<(NodeIndex, f64, usize)> = Vec::new();
+    let mut scored: Vec<(NodeIndex, u32, usize, ScoreReasons)> = Vec::new();
     for (idx, entity) in built.graph.entities() {
         if idx == target_idx {
             continue;
@@ -199,15 +256,16 @@ pub fn build_envelope(
         let same_container = (target_container.is_some() && target_container == idx_container)
             || Some(idx) == target_container
             || Some(target_idx) == idx_container;
-        let score = DISTANCE_WEIGHT * (1.0 / (1.0 + distance as f64))
-            + ADJACENCY_WEIGHT * if same_container { 1.0 } else { 0.0 }
-            + EFFECT_WEIGHT * jaccard(&target_entity_ref.effect_signature, &entity.effect_signature)
-            + EXEMPLAR_WEIGHT * if is_exemplar(&entity.id, &proposals) { 1.0 } else { 0.0 };
-        scored.push((idx, score, distance));
+        let reasons = ScoreReasons {
+            distance: DISTANCE_WEIGHT / (1 + distance as u32),
+            adjacency: if same_container { ADJACENCY_WEIGHT } else { 0 },
+            effect_overlap: effect_overlap(&target_entity_ref.effect_signature, &entity.effect_signature),
+            sanctioned_exemplar: if is_exemplar(&entity.id, &proposals) { EXEMPLAR_WEIGHT } else { 0 },
+        };
+        scored.push((idx, reasons.total(), distance, reasons));
     }
     scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap()
+        b.1.cmp(&a.1)
             .then_with(|| a.2.cmp(&b.2))
             .then_with(|| built.graph.entity(a.0).id.cmp(&built.graph.entity(b.0).id))
     });
@@ -218,21 +276,22 @@ pub fn build_envelope(
     // The target is always included, full fidelity, outside the budget —
     // an envelope that can't afford to show you the thing you're editing
     // isn't an envelope.
-    if let Some(text) = render_full(repo_root, target_entity_ref) {
+    if let Some(text) = render(target_entity_ref) {
         items.push(EnvelopeItem {
             entity: target_entity_ref.id.clone(),
             file: target_entity_ref.file.clone(),
             fidelity: Fidelity::Full,
-            score: f64::INFINITY,
+            score: u32::MAX,
+            reasons: ScoreReasons::default(),
             text,
         });
     }
 
-    for (idx, score, distance) in scored {
+    for (idx, score, distance, reasons) in scored {
         let entity = built.graph.entity(idx);
         let in_zone = distance <= config.edit_zone_hops;
         if in_zone {
-            if let Some(text) = render_full(repo_root, entity) {
+            if let Some(text) = render(entity) {
                 let cost = estimate_tokens(&text);
                 if cost <= budget {
                     budget -= cost;
@@ -241,6 +300,7 @@ pub fn build_envelope(
                         file: entity.file.clone(),
                         fidelity: Fidelity::Full,
                         score,
+                        reasons,
                         text,
                     });
                     continue;
@@ -260,6 +320,7 @@ pub fn build_envelope(
                 file: entity.file.clone(),
                 fidelity: Fidelity::Skeleton,
                 score,
+                reasons,
                 text,
             });
         }
@@ -327,6 +388,7 @@ mod tests {
             .find(|i| i.entity == "core.http_client::HttpClient::get")
             .expect("direct neighbor present");
         assert_eq!(neighbor.fidelity, Fidelity::Full);
+        assert!(neighbor.reasons.effect_overlap > 0);
     }
 
     #[test]
