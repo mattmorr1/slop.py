@@ -20,14 +20,12 @@ use petgraph::Direction;
 use slop_graph::{CodeEntity, EdgeKind, NodeType};
 
 use crate::build::BuiltGraph;
-use crate::infer;
+use crate::relevance::{entity_text, Features, Lexical, RelevanceModel};
 use crate::skeleton::{skeleton_for, strip_noise};
 use crate::source::{entity_for, location_index, FileFacts};
 
-const DISTANCE_WEIGHT: u32 = 3000;
-const ADJACENCY_WEIGHT: u32 = 2000;
-const EFFECT_WEIGHT: u32 = 2000;
-const EXEMPLAR_WEIGHT: u32 = 1000;
+/// Graph hops a candidate may be from the target (the model's distance features).
+const MAX_HOPS: usize = 4;
 
 /// Distance-independent edge kinds that count as "the same call/containment
 /// neighborhood" for BFS proximity.
@@ -55,17 +53,32 @@ pub struct EnvelopeItem {
     pub text: String,
 }
 
+/// Each feature's contribution to the relevance log-odds, in thousandths: why an
+/// item is in the envelope, in the model's own terms (the intercept is omitted).
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct ScoreReasons {
-    pub distance: u32,
-    pub adjacency: u32,
-    pub effect_overlap: u32,
-    pub sanctioned_exemplar: u32,
+    pub distance: i32,
+    pub same_file: i32,
+    pub same_dir: i32,
+    pub line_gap: i32,
+    pub container: i32,
+    pub effect: i32,
+    pub kind: i32,
+    pub lexical: i32,
 }
 
 impl ScoreReasons {
-    fn total(self) -> u32 {
-        self.distance + self.adjacency + self.effect_overlap + self.sanctioned_exemplar
+    fn from_contributions(c: &[i32; 12]) -> Self {
+        Self {
+            distance: c[1] + c[2] + c[3] + c[4],
+            same_file: c[5],
+            same_dir: c[6],
+            line_gap: c[7],
+            container: c[8],
+            effect: c[9],
+            kind: c[10],
+            lexical: c[11],
+        }
     }
 }
 
@@ -98,19 +111,12 @@ impl Default for EnvelopeConfig {
     }
 }
 
-/// Unit weights are relevance to the target, never constants: a hub such as a CLI
-/// `main` calls everything, so a flat per-callee weight rewarded breadth over need.
-const CALLEE_UNIT_DIVISOR: u64 = 4;
-const EFFECT_UNIT_WEIGHT: u64 = 200;
-
-/// One thing an agent learns from seeing an entity. A function's E-class is one
-/// unit, so a second provably equivalent function teaches nothing new.
+/// What choosing an entity covers, weighted by its calibrated relevance. A
+/// function's E-class is one unit, so a provably equivalent copy adds nothing.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Unit {
     Class(String),
     Entity(NodeIndex),
-    Callee(NodeIndex),
-    Effect(String),
 }
 
 struct Candidate {
@@ -267,49 +273,9 @@ fn bfs_distance(built: &BuiltGraph, start: NodeIndex) -> HashMap<NodeIndex, usiz
 }
 
 /// The Contains-parent of `idx` (the class/module a function lives in), if any.
-fn container_of(built: &BuiltGraph, idx: NodeIndex) -> Option<NodeIndex> {
-    built
-        .graph
-        .graph
-        .edges_directed(idx, Direction::Incoming)
-        .find(|e| *e.weight() == EdgeKind::Contains)
-        .map(|e| e.source())
-}
-
-fn effect_overlap(a: &slop_graph::EffectSet, b: &slop_graph::EffectSet) -> u32 {
-    if a.0.is_empty() && b.0.is_empty() {
-        return 0;
-    }
-    let sa: HashSet<_> = a.0.iter().collect();
-    let sb: HashSet<_> = b.0.iter().collect();
-    let inter = sa.intersection(&sb).count();
-    let union = sa.union(&sb).count();
-    if union == 0 {
-        0
-    } else {
-        EFFECT_WEIGHT * inter as u32 / union as u32
-    }
-}
-
-fn is_exemplar(entity_id: &str, proposals: &HashMap<String, Vec<String>>) -> bool {
-    let dotted = entity_id.replace("::", ".");
-    proposals.values().flatten().any(|chan| {
-        dotted == *chan || (dotted.starts_with(chan.as_str()) && dotted[chan.len()..].starts_with('.'))
-    })
-}
-
-fn render_full(repo_root: &Path, entity: &CodeEntity) -> Option<String> {
-    let source = std::fs::read_to_string(repo_root.join(&entity.file)).ok()?;
-    let lines: Vec<&str> = source.lines().collect();
-    let (start, end) = entity.source_range;
-    let end = end.min(lines.len().saturating_sub(1));
-    if start > end || start >= lines.len() {
-        return None;
-    }
-    Some(strip_noise(
-        &lines[start..=end].join("\n"),
-        slop_parse::Language::from_path(&entity.file),
-    ))
+/// The id prefix before the last `::`, the benchmark's definition the weights were fit on.
+fn container(id: &str) -> &str {
+    id.rsplit_once("::").map_or(id, |(prefix, _)| prefix)
 }
 
 fn render_captured(sources: &BTreeMap<String, Arc<str>>, entity: &CodeEntity) -> Option<String> {
@@ -328,6 +294,7 @@ fn render_captured(sources: &BTreeMap<String, Arc<str>>, entity: &CodeEntity) ->
 
 /// Build the envelope around `target_entity` (a dotted `id`, `::`-joined).
 /// Empty if the target isn't in the graph.
+/// [`build_captured_envelope`] over source read from disk, with the default model.
 pub fn build_envelope(
     built: &BuiltGraph,
     facts: &[FileFacts],
@@ -335,9 +302,18 @@ pub fn build_envelope(
     target_entity: &str,
     config: &EnvelopeConfig,
 ) -> Vec<EnvelopeItem> {
-    build_envelope_with(built, facts, target_entity, config, |entity| {
-        render_full(repo_root, entity)
-    })
+    let sources: BTreeMap<String, Arc<str>> = built
+        .graph
+        .entities()
+        .filter_map(|(_, entity)| {
+            let text = std::fs::read_to_string(repo_root.join(&entity.file)).ok()?;
+            Some((entity.file.clone(), Arc::from(text)))
+        })
+        .collect();
+    let model = RelevanceModel::default_model();
+    let lexical = Lexical::build(built, &sources);
+    let relevance = Relevance { model: &model, lexical: &lexical };
+    build_captured_envelope(built, facts, &sources, target_entity, config, &relevance, |_| true).0
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -386,9 +362,16 @@ pub fn build_captured_envelope(
     sources: &BTreeMap<String, Arc<str>>,
     target_entity: &str,
     config: &EnvelopeConfig,
+    relevance: &Relevance<'_>,
     resolved: impl Fn(&str) -> bool,
 ) -> (Vec<EnvelopeItem>, usize) {
-    let mut items = build_envelope_with(built, facts, target_entity, config, |entity| {
+    let target_text = built
+        .graph
+        .node(target_entity)
+        .map(|idx| built.graph.entity(idx))
+        .and_then(|entity| sources.get(&entity.file).and_then(|source| entity_text(source, entity)))
+        .unwrap_or_default();
+    let mut items = build_envelope_with(built, facts, target_entity, config, relevance, &target_text, |entity| {
         render_captured(sources, entity)
     });
     let before = items.len();
@@ -397,11 +380,23 @@ pub fn build_captured_envelope(
     (items, omitted)
 }
 
+/// The calibrated model and the snapshot's lexical index an envelope ranks with.
+pub struct Relevance<'a> {
+    pub model: &'a RelevanceModel,
+    pub lexical: &'a Lexical,
+}
+
+fn directory(file: &str) -> &str {
+    file.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
 fn build_envelope_with<F>(
     built: &BuiltGraph,
     facts: &[FileFacts],
     target_entity: &str,
     config: &EnvelopeConfig,
+    relevance: &Relevance<'_>,
+    target_text: &str,
     render: F,
 ) -> Vec<EnvelopeItem>
 where
@@ -426,49 +421,75 @@ where
         }
     }
 
-    let proposals = infer::infer_channels(built);
     let distances = bfs_distance(built, target_idx);
-    let target_entity_ref = built.graph.entity(target_idx);
-    let target_container = container_of(built, target_idx);
+    let target = built.graph.entity(target_idx);
+    let target_dir = directory(&target.file);
+    let lexical = relevance.lexical.scores(target_text);
 
-    let mut scored: Vec<(NodeIndex, u32, usize, ScoreReasons)> = Vec::new();
-    for (idx, entity) in built.graph.entities() {
-        if idx == target_idx {
-            continue;
-        }
-        if !matches!(entity.entity_type, NodeType::Function | NodeType::Class) {
-            continue;
-        }
-        let Some(&distance) = distances.get(&idx) else {
-            continue; // unreachable from the target: out of scope
-        };
-        let idx_container = container_of(built, idx);
-        let same_container = (target_container.is_some() && target_container == idx_container)
-            || Some(idx) == target_container
-            || Some(target_idx) == idx_container;
-        let reasons = ScoreReasons {
-            distance: DISTANCE_WEIGHT / (1 + distance as u32),
-            adjacency: if same_container { ADJACENCY_WEIGHT } else { 0 },
-            effect_overlap: effect_overlap(&target_entity_ref.effect_signature, &entity.effect_signature),
-            sanctioned_exemplar: if is_exemplar(&entity.id, &proposals) { EXEMPLAR_WEIGHT } else { 0 },
-        };
-        scored.push((idx, reasons.total(), distance, reasons));
-    }
-    scored.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| a.2.cmp(&b.2))
-            .then_with(|| built.graph.entity(a.0).id.cmp(&built.graph.entity(b.0).id))
+    // Candidates: the graph neighbourhood and the target's directory. Co-change
+    // history says locality matters as much as edges (B4), so both are in play.
+    let mut pool: std::collections::BTreeSet<NodeIndex> = distances
+        .iter()
+        .filter(|(_, distance)| (1..=MAX_HOPS).contains(*distance))
+        .map(|(idx, _)| *idx)
+        .collect();
+    pool.extend(
+        built.graph.entities().filter(|(_, entity)| directory(&entity.file) == target_dir).map(|(idx, _)| idx),
+    );
+    pool.remove(&target_idx);
+
+    let mut candidates: Vec<Candidate> = pool
+        .into_iter()
+        .filter_map(|idx| {
+            let entity = built.graph.entity(idx);
+            if !matches!(entity.entity_type, NodeType::Function | NodeType::Class) {
+                return None;
+            }
+            let distance = distances.get(&idx).copied().filter(|distance| *distance <= MAX_HOPS);
+            let features = Features {
+                distance,
+                same_file: entity.file == target.file,
+                same_dir: directory(&entity.file) == target_dir,
+                line_gap: entity.source_range.0.abs_diff(target.source_range.0),
+                same_container: container(&entity.id) == container(&target.id),
+                shared_effect: entity.effect_signature.0.iter().any(|effect| target.effect_signature.0.contains(effect)),
+                is_class: entity.entity_type == NodeType::Class,
+                lexical: lexical.get(&idx).copied().unwrap_or(0.0),
+            };
+            let (probability, contributions) = relevance.model.probability_ppm(&features);
+            let skeleton = skeleton_for(entity, signatures.get(&entity.id).map(String::as_str));
+            let full = distance.is_some_and(|d| d <= config.edit_zone_hops).then(|| render(entity)).flatten();
+            let (fidelity, text, fallback) = match full {
+                Some(text) => (Fidelity::Full, text, (!skeleton.is_empty()).then_some(skeleton)),
+                None if skeleton.is_empty() => return None,
+                None => (Fidelity::Skeleton, skeleton, None),
+            };
+            let class = classes.get(&entity.id).cloned();
+            let own = class.clone().map_or(Unit::Entity(idx), Unit::Class);
+            Some(Candidate {
+                idx,
+                score: probability,
+                reasons: ScoreReasons::from_contributions(&contributions),
+                fidelity,
+                text,
+                fallback,
+                class,
+                units: vec![(own, u64::from(probability))],
+            })
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        b.score.cmp(&a.score).then_with(|| built.graph.entity(a.idx).id.cmp(&built.graph.entity(b.idx).id))
     });
 
     let mut items = Vec::new();
-
     // The target is always included, full fidelity, outside the budget —
     // an envelope that can't afford to show you the thing you're editing
     // isn't an envelope.
-    if let Some(text) = render(target_entity_ref) {
+    if let Some(text) = render(target) {
         items.push(EnvelopeItem {
-            entity: target_entity_ref.id.clone(),
-            file: target_entity_ref.file.clone(),
+            entity: target.id.clone(),
+            file: target.file.clone(),
             fidelity: Fidelity::Full,
             score: u32::MAX,
             reasons: ScoreReasons::default(),
@@ -478,40 +499,6 @@ where
         });
     }
 
-    let candidates: Vec<Candidate> = scored
-        .into_iter()
-        .filter_map(|(idx, score, distance, reasons)| {
-            let entity = built.graph.entity(idx);
-            let skeleton = skeleton_for(entity, signatures.get(&entity.id).map(String::as_str));
-            let full = (distance <= config.edit_zone_hops).then(|| render(entity)).flatten();
-            let (fidelity, text, fallback) = match full {
-                Some(text) => (Fidelity::Full, text, (!skeleton.is_empty()).then_some(skeleton)),
-                None if skeleton.is_empty() => return None,
-                None => (Fidelity::Skeleton, skeleton, None),
-            };
-            let class = classes.get(&entity.id).cloned();
-            let own = class.clone().map_or(Unit::Entity(idx), Unit::Class);
-            // A callee is worth its own proximity to the target (a usage example of a
-            // nearby API); an effect counts only if the target itself performs it.
-            let callee_weight = |callee: NodeIndex| {
-                distances.get(&callee).map_or(0, |d| u64::from(DISTANCE_WEIGHT) / (1 + *d as u64) / CALLEE_UNIT_DIVISOR)
-            };
-            let units = std::iter::once((own, u64::from(score)))
-                .chain(
-                    built.graph.graph.edges_directed(idx, Direction::Outgoing)
-                        .filter(|edge| *edge.weight() == EdgeKind::Calls)
-                        .map(|edge| (Unit::Callee(edge.target()), callee_weight(edge.target())))
-                        .filter(|(_, weight)| *weight > 0),
-                )
-                .chain(
-                    entity.effect_signature.0.iter()
-                        .filter(|effect| target_entity_ref.effect_signature.0.contains(effect))
-                        .map(|effect| (Unit::Effect(format!("{effect:?}")), EFFECT_UNIT_WEIGHT)),
-                )
-                .collect();
-            Some(Candidate { idx, score, reasons, fidelity, text, fallback, class, units })
-        })
-        .collect();
     let picked = match config.selection {
         Selection::Coverage => select_coverage(&candidates, config.token_budget),
         Selection::Ranked => select_ranked(&candidates, config.token_budget),
@@ -608,7 +595,7 @@ mod tests {
             .find(|i| i.entity == "core.http_client::HttpClient::get")
             .expect("direct neighbor present");
         assert_eq!(neighbor.fidelity, Fidelity::Full);
-        assert!(neighbor.reasons.effect_overlap > 0);
+        assert!(neighbor.reasons.distance > 0, "a direct edge raises relevance: {:?}", neighbor.reasons);
     }
 
     #[test]
@@ -642,7 +629,7 @@ mod tests {
 mod selection {
     use super::*;
 
-    fn candidate(i: usize, class: &str, callee: usize, text_len: usize) -> Candidate {
+    fn candidate(i: usize, class: &str, text_len: usize) -> Candidate {
         Candidate {
             idx: NodeIndex::new(i),
             score: 1000,
@@ -651,7 +638,7 @@ mod selection {
             text: "x".repeat(text_len),
             fallback: None,
             class: Some(class.into()),
-            units: vec![(Unit::Class(class.into()), 1000), (Unit::Callee(NodeIndex::new(100 + callee)), 300)],
+            units: vec![(Unit::Class(class.into()), 1000)],
         }
     }
 
@@ -659,7 +646,7 @@ mod selection {
     /// twice, while score-ranked packing spends budget on every copy.
     #[test]
     fn coverage_skips_equivalent_copies_ranked_does_not() {
-        let candidates = vec![candidate(0, "E", 0, 40), candidate(1, "E", 0, 40), candidate(2, "F", 1, 40)];
+        let candidates = vec![candidate(0, "E", 40), candidate(1, "E", 40), candidate(2, "F", 40)];
         let coverage: Vec<usize> = select_coverage(&candidates, 1_000).into_iter().map(|(i, _, _)| i).collect();
         let ranked: Vec<usize> = select_ranked(&candidates, 1_000).into_iter().map(|(i, _, _)| i).collect();
         assert_eq!(coverage, [0, 2]);
@@ -669,7 +656,7 @@ mod selection {
     /// A full rendering that no longer fits falls back to its skeleton.
     #[test]
     fn coverage_falls_back_to_the_skeleton_when_full_does_not_fit() {
-        let mut full = candidate(0, "E", 0, 4_000);
+        let mut full = candidate(0, "E", 4_000);
         full.fidelity = Fidelity::Full;
         full.fallback = Some("s".repeat(40));
         let picked = select_coverage(&[full], 100);

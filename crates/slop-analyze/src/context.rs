@@ -6,7 +6,7 @@ use crate::compress::{self, CompressConfig, CompressStats};
 use crate::envelope::{self, EnvelopeConfig, EnvelopeItem, Selection};
 use crate::snapshot::{DocumentState, RepositorySnapshot, SnapshotFreshness, SnapshotId};
 
-pub const CONTEXT_SCHEMA_VERSION: u32 = 3;
+pub const CONTEXT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct ContextRequest<'a> {
@@ -116,6 +116,7 @@ impl RepositorySnapshot {
                     edit_zone_hops: request.edit_zone_hops,
                     selection: request.selection,
                 },
+                &envelope::Relevance { model: &self.relevance, lexical: self.lexical() },
                 |file| self.document_state(file) == DocumentState::Resolved,
             )
         } else {

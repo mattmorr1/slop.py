@@ -269,6 +269,10 @@ def training_rows(repos: list[Repo], seed: int):
     return np.array(rows), np.array(labels), np.array(weights)
 
 
+def model_json(beta: np.ndarray, source: str) -> dict:
+    return {"features": FEATURES, "weights": [round(float(w), 6) for w in beta], "source": source}
+
+
 def cluster_bootstrap(values: dict[str, list[float]], seed: int, rounds: int = 1000):
     clusters = [v for v in values.values() if v]
     if not clusters:
@@ -290,6 +294,7 @@ def main() -> None:
     parser.add_argument("--budgets", default="1000,2000,4000,8000,16000")
     parser.add_argument("--seed", type=int, default=20260923)
     parser.add_argument("--out", type=Path, default=ROOT / "bench/results/context.jsonl")
+    parser.add_argument("--fit-all", type=Path, help="also write the model fit on every repo, as .slop/relevance.json")
     args = parser.parse_args()
     budgets = [int(b) for b in args.budgets.split(",")]
     started = time.time()
@@ -318,7 +323,29 @@ def main() -> None:
         others = [repo for repo in repos if repo is not held_out] or [held_out]
         models[held_out.name] = fit(*training_rows(others, args.seed))
 
-    arm_names = ["slop-coverage", "slop-ranked", "calibrated-ratio", "calibrated-rank", "bm25", "proximity", "random"]
+    # The shipped selector, scored out of sample: each repo's snapshot gets the model
+    # fit without it, slop re-runs, and the file is removed again (scratch copies only).
+    for repo in repos:
+        model_file = repo.snapshot / ".slop/relevance.json"
+        if model_file.exists():
+            raise SystemExit(f"{model_file} exists; refusing to overwrite a repository's own model")
+        model_file.parent.mkdir(exist_ok=True)
+        model_file.write_text(json.dumps(model_json(models[repo.name], f"B4 leave-one-out, {repo.name} held out")))
+        try:
+            targets = sorted({task["target"] for task in repo.tasks})
+            for selection in ("coverage", "ranked"):
+                _, _, repo.picks[f"calibrated-{selection}"], repo.micros[f"calibrated-{selection}"] = slop_runs(
+                    repo.snapshot, targets, budgets, selection)
+        finally:
+            model_file.unlink()
+    if args.fit_all:
+        pooled_model = fit(*training_rows(repos, args.seed))
+        args.fit_all.write_text(json.dumps(model_json(pooled_model, "B4 pooled: " + ", ".join(
+            f"{repo.name}@{git(repo.history, 'rev-parse', '--short', 'HEAD').strip()}" for repo in repos)), indent=2) + "\n")
+        print(f"pooled model written to {args.fit_all}")
+
+    arm_names = ["slop-coverage", "slop-ranked", "slop-calibrated-coverage", "slop-calibrated-ranked",
+                 "calibrated-ratio", "calibrated-rank", "bm25", "proximity", "random"]
     recall = {(arm, b, repo.name): defaultdict(list) for arm in arm_names for b in budgets for repo in repos}
     no_edge = {(arm, b, repo.name): defaultdict(list) for arm in arm_names for b in budgets for repo in repos}
     rng = random.Random(args.seed)
@@ -345,6 +372,8 @@ def main() -> None:
                 chosen = {
                     "slop-coverage": repo.picks["coverage"].get((target, budget), set()),
                     "slop-ranked": repo.picks["ranked"].get((target, budget), set()),
+                    "slop-calibrated-coverage": repo.picks["calibrated-coverage"].get((target, budget), set()),
+                    "slop-calibrated-ranked": repo.picks["calibrated-ranked"].get((target, budget), set()),
                     "calibrated-ratio": pack(by_ratio, repo.cost, budget),
                     "calibrated-rank": pack(by_rank, repo.cost, budget),
                     "bm25": pack(bm25_order, repo.cost, budget),

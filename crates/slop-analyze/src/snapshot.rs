@@ -13,6 +13,7 @@ use crate::build::{self, BuiltGraph};
 use crate::effects;
 use crate::index::{self, Digest, Stamp};
 use crate::policy::Policy;
+use crate::relevance::{self, Lexical, RelevanceModel};
 use crate::retrieve::Neighborhood;
 use crate::source::{self, FileFacts};
 
@@ -85,7 +86,9 @@ pub struct RepositorySnapshot {
     pub resolver: IndexSet,
     pub policy: Policy,
     pub baseline: Baseline,
+    pub relevance: RelevanceModel,
     neighborhood: OnceLock<Neighborhood>,
+    lexical: OnceLock<Lexical>,
 }
 
 impl RepositorySnapshot {
@@ -120,6 +123,10 @@ impl RepositorySnapshot {
     pub fn neighborhood(&self) -> &Neighborhood {
         self.neighborhood
             .get_or_init(|| Neighborhood::build(&self.built))
+    }
+
+    pub fn lexical(&self) -> &Lexical {
+        self.lexical.get_or_init(|| Lexical::build(&self.built, &self.sources))
     }
 }
 
@@ -268,6 +275,7 @@ fn cache_key(
     for path in [
         policy_path.to_path_buf(),
         repo.join(crate::baseline::BASELINE_FILE),
+        repo.join(relevance::MODEL_FILE),
     ] {
         hasher.update(&std::fs::read(path).unwrap_or_default());
         hasher.update(&[0]);
@@ -297,7 +305,8 @@ fn snapshot_id(
         hasher.update(source.as_bytes());
     }
     let baseline_path = repo.join(crate::baseline::BASELINE_FILE);
-    for path in [policy_path, baseline_path.as_path()] {
+    let model_path = repo.join(relevance::MODEL_FILE);
+    for path in [policy_path, baseline_path.as_path(), model_path.as_path()] {
         hasher.update(
             path.file_name()
                 .and_then(|s| s.to_str())
@@ -474,6 +483,7 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
     let facts = source::parse_corpus(&sources);
     let policy = Policy::load_file(&policy_path)?;
     let baseline = Baseline::load(&repo)?;
+    let relevance = RelevanceModel::load(&repo)?;
     let id = snapshot_id(&repo, &index_paths, &policy_path, &sources)?;
     if index_paths
         .iter()
@@ -496,7 +506,9 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
         resolver,
         policy,
         baseline,
+        relevance,
         neighborhood: OnceLock::new(),
+        lexical: OnceLock::new(),
     });
     if let Ok(mut cache) = CACHE.lock() {
         *cache = Some((key, snapshot.clone()));

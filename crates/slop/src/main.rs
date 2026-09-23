@@ -1524,7 +1524,7 @@ fn run_context_bench(repo: &Path, targets: &Path, budgets: &[usize], selection: 
             let items: Vec<serde_json::Value> = artifact
                 .items
                 .iter()
-                .map(|item| serde_json::json!({ "entity": item.entity, "fidelity": item.fidelity, "tokens": item.text.len() / 4 + 1 }))
+                .map(|item| serde_json::json!({ "entity": item.entity, "fidelity": item.fidelity, "score": item.score, "tokens": item.text.len() / 4 + 1 }))
                 .collect();
             println!(
                 "{}",
