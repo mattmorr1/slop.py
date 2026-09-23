@@ -29,7 +29,7 @@ functions whose names lie about their effects, and tangled control flow.
    - `slop check <repo> --all` — audits everything
 3. **Triage by severity** (every finding carries a `fix_guidance` line):
    - **BLOCKING** — `infra-bypass`, `circular-import`, `effect-creep`. Fix these.
-   - **WARNING** — `duplicate-exact`, `complexity-spike`, `purity-lie`,
+   - **WARNING** — `duplicate-exact`, `duplicate-equivalent`, `complexity-spike`, `purity-lie`,
      `effect-layer-violation`, `dead-island`. Should fix.
    - **ADVISORY** — `naming-convention`, `slop-name`, `over-commenting`,
      `duplicate-structural`, `semantic-redundancy`. Consider.
@@ -40,7 +40,7 @@ functions whose names lie about their effects, and tangled control flow.
 5. **Act on `fix_guidance`** for the rest, using what each rule tells you:
    - `infra-bypass` / `effect-layer-violation` → route the I/O through the named
      sanctioned channel / a lower layer, don't do it inline.
-   - `duplicate-exact` / `duplicate-structural` / `semantic-redundancy` → unify
+   - `duplicate-exact` / `duplicate-equivalent` / `duplicate-structural` / `semantic-redundancy` → unify
      behind one implementation and delete the copies.
    - `complexity-spike` → extract the deepest nested block it names into a helper.
    - `purity-lie` → rename to reflect the I/O, or extract the pure part.

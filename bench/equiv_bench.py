@@ -373,7 +373,23 @@ def b_default(fn, rng):
     return fn
 
 
+def b_async(fn, rng):
+    """A coroutine function returns an awaitable, not its value."""
+    return ast.AsyncFunctionDef(fn.name, fn.args, fn.body, fn.decorator_list, fn.returns, fn.type_comment,
+                                getattr(fn, "type_params", []))
+
+
+def b_annotation(fn, rng):
+    """FastAPI/pydantic-style frameworks validate by annotation, so it is behaviour."""
+    sites = [a for a in fn.args.args + fn.args.kwonlyargs if a.annotation is not None]
+    if not sites:
+        return None
+    rng.choice(sites).annotation = ast.Name("bytes")
+    return fn
+
+
 BREAKING = {"const": ("real", b_const), "callee": ("real", b_callee), "kwarg": ("real", b_kwarg),
+            "async": ("real", b_async), "annotation": ("real", b_annotation),
             "negate_only": ("real", b_negate_only), "cmp": ("real", b_cmp), "swap_calls": ("real", b_swap),
             "default": ("real", b_default), "aug_assign": ("trap", b_aug), "commute": ("trap", b_commute),
             "demorgan": ("trap", b_demorgan), "cmp_flip": ("trap", b_flip)}

@@ -510,6 +510,8 @@ struct Member {
     lines: (usize, usize),
     body_hash: String,
     structural_hash: String,
+    /// E-sound class (ADR 0004); falls back to the body hash where none is computed.
+    equiv_hash: String,
     docstring: Option<String>,
 }
 
@@ -530,6 +532,7 @@ fn collect_members(built: &BuiltGraph, facts: &[crate::source::FileFacts]) -> Ve
                 lines: (fact.start_line as usize, fact.end_line as usize),
                 body_hash: fact.body_hash.clone(),
                 structural_hash: fact.structural_hash.clone(),
+                equiv_hash: if fact.equiv_hash.is_empty() { fact.body_hash.clone() } else { fact.equiv_hash.clone() },
                 docstring: entity.and_then(|e| e.docstring.clone()),
             });
         }
@@ -575,6 +578,31 @@ fn dup_entity(m: &Member) -> DupEntity {
     }
 }
 
+/// Groups sharing an E-sound class but not one body: the equivalent copies
+/// Tier-1 cannot see. No convention cap: an identity is a duplicate however common.
+fn equivalence_groups(members: &[Member]) -> Vec<StructuralGroup> {
+    let mut by_class: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+    for (i, m) in members.iter().enumerate() {
+        by_class.entry(m.equiv_hash.as_str()).or_default().push(i);
+    }
+    let mut groups: Vec<StructuralGroup> = by_class
+        .values()
+        .filter_map(|group| {
+            let rep = canonical(members, group);
+            let peers: Vec<DupEntity> = group
+                .iter()
+                .filter(|&&j| members[j].body_hash != members[rep].body_hash)
+                .map(|&j| dup_entity(&members[j]))
+                .collect();
+            (!peers.is_empty()).then(|| StructuralGroup { canonical: dup_entity(&members[rep]), peers })
+        })
+        .collect();
+    groups.sort_by(|a, b| {
+        (a.canonical.file.as_str(), a.canonical.lines.0).cmp(&(b.canonical.file.as_str(), b.canonical.lines.0))
+    });
+    groups
+}
+
 fn shape_groups(members: &[Member]) -> Vec<StructuralGroup> {
     use std::collections::HashMap;
     let mut by_shape: HashMap<&str, Vec<usize>> = HashMap::new();
@@ -586,15 +614,15 @@ fn shape_groups(members: &[Member]) -> Vec<StructuralGroup> {
         .values()
         .filter(|g| g.len() > 1 && g.len() <= CONVENTION_FAMILY_MAX)
     {
-        let distinct_bodies: std::collections::HashSet<&str> =
-            group.iter().map(|&i| members[i].body_hash.as_str()).collect();
-        if distinct_bodies.len() < 2 {
-            continue; // fully covered by Tier-1
+        let distinct_classes: std::collections::HashSet<&str> =
+            group.iter().map(|&i| members[i].equiv_hash.as_str()).collect();
+        if distinct_classes.len() < 2 {
+            continue; // fully covered by Tier-1 and the equivalence tier
         }
         let rep = canonical(members, group);
         let peers: Vec<DupEntity> = group
             .iter()
-            .filter(|&&j| j != rep && members[j].body_hash != members[rep].body_hash)
+            .filter(|&&j| j != rep && members[j].equiv_hash != members[rep].equiv_hash)
             .map(|&j| dup_entity(&members[j]))
             .collect();
         if peers.is_empty() {
@@ -731,6 +759,37 @@ pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) 
                 others.join("`, `")
             ),
             fix_guidance: format!("Keep one implementation and delete or delegate the rest: `{}`", others.join("`, `")),
+        });
+    }
+
+    // Tier-1.5: provably the same function modulo renames and sound rewrite laws
+    // (ADR 0004). An identity, so Warning like Tier-1; exact copies stay Tier-1's.
+    for group in equivalence_groups(&members) {
+        let peer_labels: Vec<&str> = group.peers.iter().map(|peer| peer.entity.as_str()).collect();
+        findings.push(Finding {
+            rule: "duplicate-equivalent",
+            severity: Severity::Warning,
+            entity: group.canonical.entity.clone(),
+            file: group.canonical.file.clone(),
+            lines: group.canonical.lines,
+            related: group
+                .peers
+                .iter()
+                .map(|peer| EvidenceLocus {
+                    entity: peer.entity.clone(),
+                    file: peer.file.clone(),
+                    lines: peer.lines,
+                })
+                .collect(),
+            message: format!(
+                "`{}` is provably equivalent to `{}` (same function up to renaming and control-flow rewrites)",
+                group.canonical.entity,
+                peer_labels.join("`, `")
+            ),
+            fix_guidance: format!(
+                "Keep one implementation and delete or delegate the rest: `{}`",
+                peer_labels.join("`, `")
+            ),
         });
     }
 
@@ -1167,6 +1226,7 @@ mod tests {
             lines: (0, 1),
             body_hash: body.into(),
             structural_hash: shape.into(),
+            equiv_hash: body.into(),
             docstring: None,
         }
     }
@@ -1254,6 +1314,22 @@ mod tests {
         built.graph.add_edge(cls, wrap, EdgeKind::Contains);
         built.graph.add_edge(caller, wrap, EdgeKind::Calls);
         assert!(trivial_wrapper_candidates(&built, &Policy::default(), &facts).is_empty());
+    }
+
+    #[test]
+    fn equivalent_bodies_group_once_and_leave_the_shape_tier() {
+        let classed = |label: &str, body: &str, class: &str| Member {
+            equiv_hash: class.into(),
+            ..member(label, "S", body)
+        };
+        let members = vec![classed("m::a", "b1", "E"), classed("m::b", "b2", "E"), classed("m::c", "b3", "F")];
+        let equivalent = equivalence_groups(&members);
+        assert_eq!(equivalent.len(), 1);
+        assert_eq!(equivalent[0].canonical.entity, "m::a");
+        assert_eq!(equivalent[0].peers.iter().map(|p| p.entity.as_str()).collect::<Vec<_>>(), ["m::b"]);
+        let shapes = shape_groups(&members);
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(shapes[0].peers.iter().map(|p| p.entity.as_str()).collect::<Vec<_>>(), ["m::c"]);
     }
 
     #[test]

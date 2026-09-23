@@ -217,7 +217,7 @@ slop gate <repo> [--base HEAD] [--all] [--tier3] [--fail-on blocking|warning|adv
 ```
 
 - `--fail-on warning` makes the gate fail on Warnings too — this is what lets
-  the loop act on `duplicate-exact`, `complexity-spike`, and `purity-lie`, not
+  the loop act on `duplicate-exact`, `duplicate-equivalent`, `complexity-spike` and `purity-lie`, not
   just the deterministic blockers (`infra-bypass`, `circular-import`). The JSON
   reports `fail_on`, `failing` (count at/above threshold), and `blocking`.
 - `--reindex` regenerates every detected language's SCIP artifact before checking,

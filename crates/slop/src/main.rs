@@ -69,7 +69,7 @@ impl From<IndexerArg> for Indexer {
 enum FailOn {
     /// Only deterministic blockers (infra-bypass, circular-import). Default.
     Blocking,
-    /// ...also Warnings (duplicate-exact, complexity-spike, purity-lie).
+    /// ...also Warnings (duplicate-exact, duplicate-equivalent, complexity-spike, purity-lie).
     Warning,
     /// ...also Advisories (everything).
     Advisory,
@@ -230,7 +230,7 @@ enum Command {
         #[arg(long, default_value = "HEAD")]
         base: String,
         /// Severity at or above which the gate fails. Lower it to `warning` to
-        /// make the loop act on duplicate-exact / complexity-spike.
+        /// make the loop act on duplicate-exact / duplicate-equivalent / complexity-spike.
         #[arg(long, value_enum, default_value_t = FailOn::Blocking)]
         fail_on: FailOn,
         /// Regenerate the SCIP index (auto-detected indexer) before checking

@@ -121,6 +121,7 @@ baselined repo doesn't look falsely pristine.
 | `effect-layer-violation` | Warning | An entity in a declared layer directly does an effect that layer forbids (e.g. DB/net in a `pure-utils` or presentation layer) |
 | `effect-creep` | Blocking | A function that was **pure** at `slop baseline` time now performs I/O — a purity regression (delta vs baseline) |
 | `duplicate-exact` | Warning | Functions with identical bodies (modulo comments/whitespace) |
+| `duplicate-equivalent` | Warning | Python functions provably equal up to renaming and sound rewrite laws (a ternary vs. its `if`, a negated test with swapped branches, a single-use temporary): an identity, not a similarity score (ADR 0004) |
 | `duplicate-structural` | Advisory → Warning | Same control-flow shape, renamed vars/literals — a *candidate*; `--tier3` promotes ones an LLM judge confirms |
 | `parallel-implementation` | Advisory | Functions calling the same *distinctive* set of things while sharing no code — one job implemented twice, in different words. Duplication found on graph shape, where the `duplicate-*` rules find it on token shape |
 | `complexity-spike` | Warning | Genuinely tangled functions — deep nesting or many independent branches, not just a fat boolean guard |

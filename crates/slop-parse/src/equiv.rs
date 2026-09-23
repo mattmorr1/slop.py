@@ -65,16 +65,23 @@ pub fn equivalence_facts(source: &str) -> Result<Vec<EquivFacts>> {
     let lines = crate::LineIndex::new(source);
     let mut facts = Vec::new();
     crate::collect_functions(parsed.syntax().body.as_slice(), &mut |func| {
-        let (term, params) = lower_function(func, source, tokens.as_ref());
+        let (raw, params) = lower_function(func, source, tokens.as_ref());
+        let positional = number_params(raw.clone(), &params);
         facts.push(EquivFacts {
             name: func.name.to_string(),
             line: lines.line(func.name.start()),
-            sound: term_hash(&canonical(term.clone(), params, Tier::Sound)),
-            graded: term_hash(&canonical(term.clone(), params, Tier::Graded)),
-            term,
+            sound: term_hash(&canonical(positional.clone(), params.len(), Tier::Sound)),
+            graded: term_hash(&canonical(positional, params.len(), Tier::Graded)),
+            term: number_locals(raw, &params),
         });
     });
     Ok(facts)
+}
+
+/// The E-sound hash of one parsed function, for callers that already hold its parse.
+pub(crate) fn sound_hash(func: &ast::StmtFunctionDef, source: &str, tokens: &[Token]) -> String {
+    let (raw, params) = lower_function(func, source, tokens);
+    term_hash(&canonical(number_params(raw, &params), params.len(), Tier::Sound))
 }
 
 pub fn term_hash(term: &Term) -> String {
@@ -349,7 +356,8 @@ impl Lower<'_> {
     }
 }
 
-fn lower_function(func: &ast::StmtFunctionDef, source: &str, tokens: &[Token]) -> (Term, usize) {
+/// The function as a term with source names, plus its parameters in positional order.
+fn lower_function(func: &ast::StmtFunctionDef, source: &str, tokens: &[Token]) -> (Term, Vec<String>) {
     let lower = Lower {
         source,
         tokens,
@@ -366,20 +374,24 @@ fn lower_function(func: &ast::StmtFunctionDef, source: &str, tokens: &[Token]) -
         .chain(parameters.kwarg.iter().map(|parameter| parameter.name.to_string()))
         .collect();
     // Defaults and parameter kinds are part of the function; names are not.
+    // `async` changes what a call returns, and annotations drive runtime behaviour in
+    // FastAPI/pydantic-style frameworks, so both belong to the function's identity.
+    let annotation = |parameter: &ast::Parameter| parameter.annotation.as_deref().map_or_else(none, |a| lower.expr(a));
     let signature = node(
-        "sig",
+        if func.is_async { "sig:async" } else { "sig" },
         [&parameters.posonlyargs, &parameters.args, &parameters.kwonlyargs]
             .into_iter()
             .enumerate()
             .flat_map(|(kind, group)| {
-                let lower = &lower;
+                let (lower, annotation) = (&lower, &annotation);
                 group.iter().map(move |parameter| {
                     let default = parameter.default.as_deref().map_or_else(|| Term::Lit("nodefault".into()), |d| lower.expr(d));
-                    node(format!("param:{kind}"), vec![default])
+                    node(format!("param:{kind}"), vec![default, annotation(&parameter.parameter)])
                 })
             })
-            .chain(parameters.vararg.iter().map(|_| node("param:*", Vec::new())))
-            .chain(parameters.kwarg.iter().map(|_| node("param:**", Vec::new())))
+            .chain(parameters.vararg.iter().map(|p| node("param:*", vec![annotation(p)])))
+            .chain(parameters.kwarg.iter().map(|p| node("param:**", vec![annotation(p)])))
+            .chain([node("returns", vec![func.returns.as_deref().map_or_else(none, |r| lower.expr(r))])])
             .chain(func.decorator_list.iter().map(|decorator| node("decorator", vec![lower.expr(&decorator.expression)])))
             .collect(),
     );
@@ -391,7 +403,7 @@ fn lower_function(func: &ast::StmtFunctionDef, source: &str, tokens: &[Token]) -
         }
     }
     let body = inline_temps(body, &params);
-    (number_locals(fold_ints(node("fn", vec![signature, body])), &params), params.len())
+    (fold_ints(node("fn", vec![signature, body])), params)
 }
 
 // ---------------------------------------------------------------- pre-pass
@@ -490,7 +502,7 @@ fn mask(term: &Term) -> Term {
 
 fn first_seen(term: &Term, order: &mut Vec<String>) {
     match term {
-        Term::Local(name) if !order.contains(name) => order.push(name.clone()),
+        Term::Local(name) if !order.iter().any(|seen| seen == name) => order.push(name.clone()),
         Term::Node(_, children) | Term::Block(children) => children.iter().for_each(|child| first_seen(child, order)),
         _ => {}
     }
@@ -520,6 +532,14 @@ fn rename(term: Term, map: &HashMap<String, String>) -> Term {
     }
 }
 
+/// Parameters renamed to their positions; other locals keep source names until
+/// [`canonical`] renumbers them in the normal form.
+fn number_params(term: Term, params: &[String]) -> Term {
+    let map = params.iter().enumerate().map(|(index, name)| (name.clone(), format!("#{index}"))).collect();
+    rename(term, &map)
+}
+
+/// The egglog input: no normal form to renumber in, so it needs law-invariant keys.
 /// Parameters by position, then other locals by definition key (ties by first
 /// appearance). Any consistent renaming under which two terms are equal is itself
 /// a valid α-renaming, so an unlucky tie can only cost recall.
@@ -608,6 +628,9 @@ fn renumber(term: Term, params: usize) -> Term {
 /// Graded ordering breaks exact ties by name, so it iterates to a fixpoint.
 pub fn canonical(term: Term, params: usize, tier: Tier) -> Term {
     let mut current = renumber(normalize(term, tier), params);
+    if tier == Tier::Sound {
+        return current; // no sound rule orders by name, so one pass is canonical
+    }
     for _ in 0..4 {
         let next = renumber(normalize(current.clone(), tier), params);
         if next == current {
@@ -837,5 +860,26 @@ mod numbering {
         let a = "def f(self, q):\n    if self.ready:\n        try:\n            return self.db.count(q)\n        except Exception as e:\n            log(e)\n            return 0\n    else:\n        rows = [r for r in self.rows if q in r]\n        return len(rows)\n";
         let b = "def f(self, q):\n    if not self.ready:\n        rows = [r for r in self.rows if q in r]\n        return len(rows)\n    else:\n        try:\n            return self.db.count(q)\n        except Exception as e:\n            log(e)\n            return 0\n";
         assert_eq!(sound(a), sound(b));
+    }
+}
+
+#[cfg(test)]
+mod signature {
+    use super::*;
+
+    fn sound(src: &str) -> String {
+        equivalence_facts(src).unwrap().remove(0).sound
+    }
+
+    /// Found reviewing real output: the signature node ignored both.
+    #[test]
+    fn async_and_annotations_are_part_of_the_function() {
+        let body = "(self, x{ann}):\n    total = self.fetch(x)\n    return total + 1\n";
+        let sync = sound(&format!("def f{}", body.replace("{ann}", "")));
+        let asynchronous = sound(&format!("async def f{}", body.replace("{ann}", "")));
+        assert_ne!(sync, asynchronous, "a coroutine is not a value");
+        let as_int = sound(&format!("def f{}", body.replace("{ann}", ": int")));
+        let as_str = sound(&format!("def f{}", body.replace("{ann}", ": str")));
+        assert_ne!(as_int, as_str, "annotations validate in FastAPI/pydantic");
     }
 }

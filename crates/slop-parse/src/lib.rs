@@ -134,6 +134,9 @@ pub struct FunctionFacts {
     /// design — a name we cannot prove is locally bound stays verbatim, so the
     /// hash under-matches rather than over-matching.
     pub alpha_hash: String,
+    /// E-sound equivalence (ADR 0004): α-equivalence modulo rewrite laws true for
+    /// every value. Python only; empty for other languages and below the floor.
+    pub equiv_hash: String,
     /// Number of body tokens that fed the hashes (significance measure).
     pub significant_tokens: u32,
     pub comment_lines: u32,
@@ -433,6 +436,7 @@ fn function_facts(
     }
 
     let (body_hash, structural_hash, alpha_hash) = hasher.finish(MIN_SIGNIFICANT_TOKENS);
+    let equiv_hash = if alpha_hash.is_empty() { String::new() } else { equiv::sound_hash(func, source, tokens) };
 
     let params = &func.parameters;
     let param_count = (params.posonlyargs.len()
@@ -464,6 +468,7 @@ fn function_facts(
         body_hash,
         structural_hash,
         alpha_hash,
+        equiv_hash,
         significant_tokens: significant,
         comment_lines,
         code_lines: code_line_set.len() as u32,

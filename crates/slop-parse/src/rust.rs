@@ -126,6 +126,7 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
         body_hash,
         structural_hash,
         alpha_hash,
+        equiv_hash: String::new(),
         significant_tokens,
         comment_lines,
         code_lines,
