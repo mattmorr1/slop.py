@@ -65,12 +65,12 @@ pub fn equivalence_facts(source: &str) -> Result<Vec<EquivFacts>> {
     let lines = crate::LineIndex::new(source);
     let mut facts = Vec::new();
     crate::collect_functions(parsed.syntax().body.as_slice(), &mut |func| {
-        let term = lower_function(func, source, tokens.as_ref());
+        let (term, params) = lower_function(func, source, tokens.as_ref());
         facts.push(EquivFacts {
             name: func.name.to_string(),
             line: lines.line(func.name.start()),
-            sound: term_hash(&normalize(term.clone(), Tier::Sound)),
-            graded: term_hash(&normalize(term.clone(), Tier::Graded)),
+            sound: term_hash(&canonical(term.clone(), params, Tier::Sound)),
+            graded: term_hash(&canonical(term.clone(), params, Tier::Graded)),
             term,
         });
     });
@@ -349,7 +349,7 @@ impl Lower<'_> {
     }
 }
 
-fn lower_function(func: &ast::StmtFunctionDef, source: &str, tokens: &[Token]) -> Term {
+fn lower_function(func: &ast::StmtFunctionDef, source: &str, tokens: &[Token]) -> (Term, usize) {
     let lower = Lower {
         source,
         tokens,
@@ -391,7 +391,7 @@ fn lower_function(func: &ast::StmtFunctionDef, source: &str, tokens: &[Token]) -
         }
     }
     let body = inline_temps(body, &params);
-    number_locals(fold_ints(node("fn", vec![signature, body])), &params)
+    (number_locals(fold_ints(node("fn", vec![signature, body])), &params), params.len())
 }
 
 // ---------------------------------------------------------------- pre-pass
@@ -577,6 +577,47 @@ fn single_return(block: &Term) -> Option<&Term> {
 
 const COMMUTATIVE: &[&str] = &["+", "*", "==", "!=", "&", "|", "^"];
 
+/// `term` with every local erased: the primary ordering key, so a canonical
+/// choice between two forms never depends on how locals happen to be numbered.
+fn shape(term: &Term) -> Term {
+    match term {
+        Term::Local(_) => Term::Local(String::new()),
+        Term::Node(label, children) => Term::Node(label.clone(), children.iter().map(shape).collect()),
+        Term::Block(children) => Term::Block(children.iter().map(shape).collect()),
+        leaf => leaf.clone(),
+    }
+}
+
+/// Non-parameter locals renumbered by first appearance in `term`. Injective, so
+/// two terms equal after renumbering are equal up to a bijective α-renaming.
+fn renumber(term: Term, params: usize) -> Term {
+    let mut order = Vec::new();
+    first_seen(&term, &mut order);
+    let is_param = |name: &str| name.strip_prefix('#').and_then(|k| k.parse::<usize>().ok()).is_some_and(|k| k < params);
+    let map = order
+        .into_iter()
+        .filter(|name| !is_param(name))
+        .enumerate()
+        .map(|(index, name)| (name, format!("#{}", params + index)))
+        .collect();
+    rename(term, &map)
+}
+
+/// The tier's normal form with locals numbered by where they first appear in it,
+/// which the laws cannot perturb (unlike source order, which a branch swap does).
+/// Graded ordering breaks exact ties by name, so it iterates to a fixpoint.
+pub fn canonical(term: Term, params: usize, tier: Tier) -> Term {
+    let mut current = renumber(normalize(term, tier), params);
+    for _ in 0..4 {
+        let next = renumber(normalize(current.clone(), tier), params);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
 /// Rewrite to the tier's canonical form: bottom-up, each node to a local fixpoint.
 /// Every rule shrinks the term or moves it toward a fixed orientation, so this
 /// terminates; the rule set is confluent by construction of those orientations.
@@ -651,7 +692,7 @@ fn rewrite(term: &Term, tier: Tier) -> Option<Term> {
         ("if" | "ifexp", [test, a, b]) => {
             let negated = normalize(node("not", vec![test.clone()]), tier);
             let flipped = node(label.clone(), vec![negated, b.clone(), a.clone()]);
-            (flipped < *term).then_some(flipped)
+            ((shape(&flipped), &flipped) < (shape(term), term)).then_some(flipped)
         }
         (">", [a, b]) => Some(node("<", vec![b.clone(), a.clone()])),
         (">=", [a, b]) => Some(node("<=", vec![b.clone(), a.clone()])),
@@ -673,7 +714,7 @@ fn rewrite(term: &Term, tier: Tier) -> Option<Term> {
                     other => vec![other.clone()],
                 })
                 .collect();
-            flat.sort();
+            flat.sort_by_cached_key(|child| (shape(child), child.clone()));
             (flat != *children).then(|| node(op, flat))
         }
         _ => None,
@@ -778,5 +819,23 @@ mod termination {
         let src = "def f(self, key):\n    if key not in self.seen:\n        self.seen.add(key)\n        log(key)\n    return key\n";
         let facts = equivalence_facts(src).unwrap();
         assert!(!facts[0].graded.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod numbering {
+    use super::*;
+
+    fn sound(src: &str) -> String {
+        equivalence_facts(src).unwrap().remove(0).sound
+    }
+
+    /// Locals with no plain assignment (an `except ... as e`, a comprehension
+    /// variable) used to be numbered by source order, which a branch swap changes.
+    #[test]
+    fn numbering_follows_the_normal_form_not_the_source() {
+        let a = "def f(self, q):\n    if self.ready:\n        try:\n            return self.db.count(q)\n        except Exception as e:\n            log(e)\n            return 0\n    else:\n        rows = [r for r in self.rows if q in r]\n        return len(rows)\n";
+        let b = "def f(self, q):\n    if not self.ready:\n        rows = [r for r in self.rows if q in r]\n        return len(rows)\n    else:\n        try:\n            return self.db.count(q)\n        except Exception as e:\n            log(e)\n            return 0\n";
+        assert_eq!(sound(a), sound(b));
     }
 }

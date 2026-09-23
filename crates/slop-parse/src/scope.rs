@@ -103,7 +103,10 @@ impl<'a> Visitor<'a> for Scope {
         match stmt {
             Stmt::FunctionDef(def) => {
                 self.bind(def.name.as_str(), def.name.start());
+                // A method's parameters and locals are not attributes of its class.
+                let class_depth = std::mem::take(&mut self.class_depth);
                 self.nested(|scope| visitor::walk_stmt(scope, stmt));
+                self.class_depth = class_depth;
             }
             Stmt::ClassDef(class) => {
                 self.bind(class.name.as_str(), class.name.start());
