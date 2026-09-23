@@ -360,6 +360,19 @@ enum Command {
     /// selected by `slop setup`.
     #[command(hide = true)]
     Open { target: String },
+    /// Research adapter for the context benchmark: one capture, then a context
+    /// artifact per (target, budget), after one line with the shared cost catalog.
+    #[command(hide = true)]
+    ContextBench {
+        repo: PathBuf,
+        /// One target entity id per line.
+        targets: PathBuf,
+        #[arg(long, value_delimiter = ',', default_value = "1000,2000,4000,8000,16000")]
+        budgets: Vec<usize>,
+        /// `coverage` (default) or `ranked` (the ablation baseline).
+        #[arg(long, default_value = "coverage")]
+        selection: String,
+    },
     /// Research adapter for the equivalence benchmark: each JSONL line
     /// `{"a": src, "b": src}` (one Python function each) yields every tier's verdict.
     #[command(hide = true)]
@@ -913,6 +926,7 @@ fn main() -> Result<()> {
         Command::Open { target } => {
             setup::open_target(&target)?;
         }
+        Command::ContextBench { repo, targets, budgets, selection } => run_context_bench(&repo, &targets, &budgets, &selection)?,
         Command::Equiv { pairs, iterations } => run_equiv(&pairs, iterations)?,
         Command::Install { repo, force } => {
             install_harness(&repo, force)?;
@@ -1479,6 +1493,50 @@ fn run_equiv(pairs: &Path, iterations: usize) -> Result<()> {
         #[cfg(not(feature = "egraph"))]
         let _ = iterations;
         println!("{verdict}");
+    }
+    Ok(())
+}
+
+fn run_context_bench(repo: &Path, targets: &Path, budgets: &[usize], selection: &str) -> Result<()> {
+    use slop_analyze::context::ContextRequest;
+    use slop_analyze::envelope::{self, Selection};
+    let selection = match selection {
+        "coverage" => Selection::Coverage,
+        "ranked" => Selection::Ranked,
+        other => bail!("unknown selection {other:?}: use coverage or ranked"),
+    };
+    let snapshot = check::load_analysis(repo, None)?;
+    let catalog = envelope::catalog(&snapshot.built, &snapshot.facts);
+    println!("{}", serde_json::json!({ "snapshot": snapshot.id(), "catalog": catalog }));
+    let text = std::fs::read_to_string(targets).with_context(|| format!("reading {}", targets.display()))?;
+    for target in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "target": target,
+                "neighbors": envelope::neighbors(&snapshot.built, target),
+                "distances": envelope::distances(&snapshot.built, target, 4),
+            })
+        );
+        for &budget in budgets {
+            let start = std::time::Instant::now();
+            let artifact = snapshot.context(ContextRequest { target_entity: target, token_budget: budget, edit_zone_hops: 1, selection });
+            let items: Vec<serde_json::Value> = artifact
+                .items
+                .iter()
+                .map(|item| serde_json::json!({ "entity": item.entity, "fidelity": item.fidelity, "tokens": item.text.len() / 4 + 1 }))
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "target": target,
+                    "budget": budget,
+                    "items": items,
+                    "fallback": artifact.fallback.map(|fallback| fallback.reason),
+                    "micros": start.elapsed().as_micros() as u64,
+                })
+            );
+        }
     }
     Ok(())
 }

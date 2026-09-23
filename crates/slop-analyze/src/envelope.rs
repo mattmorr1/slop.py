@@ -98,8 +98,9 @@ impl Default for EnvelopeConfig {
     }
 }
 
-/// Weights of the non-class information units a candidate can cover.
-const CALLEE_UNIT_WEIGHT: u64 = 300;
+/// Unit weights are relevance to the target, never constants: a hub such as a CLI
+/// `main` calls everything, so a flat per-callee weight rewarded breadth over need.
+const CALLEE_UNIT_DIVISOR: u64 = 4;
 const EFFECT_UNIT_WEIGHT: u64 = 200;
 
 /// One thing an agent learns from seeing an entity. A function's E-class is one
@@ -339,6 +340,46 @@ pub fn build_envelope(
     })
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CatalogEntry {
+    pub entity: String,
+    pub file: String,
+    pub lines: (usize, usize),
+    pub skeleton_tokens: usize,
+    pub class: bool,
+    pub effects: Vec<String>,
+}
+
+/// Every function and class an envelope could show, with its skeleton's token
+/// cost: the one cost model a benchmark charges every selector with.
+pub fn catalog(built: &BuiltGraph, facts: &[FileFacts]) -> Vec<CatalogEntry> {
+    let by_location = location_index(built);
+    let signatures: HashMap<String, String> = facts
+        .iter()
+        .flat_map(|file_facts| {
+            let by_location = &by_location;
+            file_facts.functions.iter().filter_map(move |fact| {
+                entity_for(built, by_location, &file_facts.file, fact).map(|e| (e.id.clone(), fact.signature.clone()))
+            })
+        })
+        .collect();
+    let mut entries: Vec<CatalogEntry> = built
+        .graph
+        .entities()
+        .filter(|(_, entity)| matches!(entity.entity_type, NodeType::Function | NodeType::Class))
+        .map(|(_, entity)| CatalogEntry {
+            entity: entity.id.clone(),
+            file: entity.file.clone(),
+            lines: entity.source_range,
+            skeleton_tokens: estimate_tokens(&skeleton_for(entity, signatures.get(&entity.id).map(String::as_str))),
+            class: entity.entity_type == NodeType::Class,
+            effects: entity.effect_signature.0.iter().map(|effect| format!("{effect:?}")).collect(),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.entity.cmp(&b.entity));
+    entries
+}
+
 pub fn build_captured_envelope(
     built: &BuiltGraph,
     facts: &[FileFacts],
@@ -450,13 +491,23 @@ where
             };
             let class = classes.get(&entity.id).cloned();
             let own = class.clone().map_or(Unit::Entity(idx), Unit::Class);
+            // A callee is worth its own proximity to the target (a usage example of a
+            // nearby API); an effect counts only if the target itself performs it.
+            let callee_weight = |callee: NodeIndex| {
+                distances.get(&callee).map_or(0, |d| u64::from(DISTANCE_WEIGHT) / (1 + *d as u64) / CALLEE_UNIT_DIVISOR)
+            };
             let units = std::iter::once((own, u64::from(score)))
                 .chain(
                     built.graph.graph.edges_directed(idx, Direction::Outgoing)
                         .filter(|edge| *edge.weight() == EdgeKind::Calls)
-                        .map(|edge| (Unit::Callee(edge.target()), CALLEE_UNIT_WEIGHT)),
+                        .map(|edge| (Unit::Callee(edge.target()), callee_weight(edge.target())))
+                        .filter(|(_, weight)| *weight > 0),
                 )
-                .chain(entity.effect_signature.0.iter().map(|effect| (Unit::Effect(format!("{effect:?}")), EFFECT_UNIT_WEIGHT)))
+                .chain(
+                    entity.effect_signature.0.iter()
+                        .filter(|effect| target_entity_ref.effect_signature.0.contains(effect))
+                        .map(|effect| (Unit::Effect(format!("{effect:?}")), EFFECT_UNIT_WEIGHT)),
+                )
                 .collect();
             Some(Candidate { idx, score, reasons, fidelity, text, fallback, class, units })
         })
@@ -600,7 +651,7 @@ mod selection {
             text: "x".repeat(text_len),
             fallback: None,
             class: Some(class.into()),
-            units: vec![(Unit::Class(class.into()), 1000), (Unit::Callee(NodeIndex::new(100 + callee)), CALLEE_UNIT_WEIGHT)],
+            units: vec![(Unit::Class(class.into()), 1000), (Unit::Callee(NodeIndex::new(100 + callee)), 300)],
         }
     }
 
@@ -625,4 +676,28 @@ mod selection {
         assert_eq!(picked.len(), 1);
         assert!(picked[0].1, "the skeleton was used");
     }
+}
+
+/// Entities one proximity hop (Contains/Calls/Imports, either direction) from `entity`.
+pub fn neighbors(built: &BuiltGraph, entity: &str) -> Vec<String> {
+    let Some(start) = built.graph.node(entity) else { return Vec::new() };
+    let mut out: Vec<String> = proximity_distances(built, &[start])
+        .into_iter()
+        .filter(|(_, distance)| *distance == 1)
+        .map(|(idx, _)| built.graph.entity(idx).id.clone())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Proximity distance from `entity` to every entity within `max_hops`.
+pub fn distances(built: &BuiltGraph, entity: &str, max_hops: usize) -> Vec<(String, usize)> {
+    let Some(start) = built.graph.node(entity) else { return Vec::new() };
+    let mut out: Vec<(String, usize)> = proximity_distances(built, &[start])
+        .into_iter()
+        .filter(|(_, distance)| (1..=max_hops).contains(distance))
+        .map(|(idx, distance)| (built.graph.entity(idx).id.clone(), distance))
+        .collect();
+    out.sort();
+    out
 }
