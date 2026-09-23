@@ -251,7 +251,10 @@ Original item: **Per-repo calibration as a product command.** `slop calibrate` (
 history miner or ship the script) writing `.slop/relevance.json`; time-split
 validation printed. *Gate:* on vigil, calibrated-own ≥ file proximity at 4k.
 
-**R4 — Incremental freshness.** On save, re-parse changed documents, keep
+**R4 — Incremental freshness. Done (ADR 0006).** Reparse overlay plus a
+coalesced background `Refresher` in LSP and MCP; vigil edit-to-fresh-context
+p95 408 ms without a reindex.
+Original item: **Incremental freshness.** On save, re-parse changed documents, keep
 resolved evidence for unchanged ones, reindex in the background (coalesced).
 *Gate:* edit-to-fresh-context p95 < 1 s on vigil without a full reindex.
 

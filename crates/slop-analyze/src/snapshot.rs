@@ -55,6 +55,9 @@ pub enum DocumentState {
     Resolved,
     /// Indexed, but from different content: its graph edges may be wrong.
     Stale,
+    /// Edited since indexing, line ranges re-derived by the parser (`overlay`):
+    /// fit for context, but edges are the last index's, so never for a deny.
+    Reparsed,
     /// No index document: parser facts only.
     Unresolved,
 }
@@ -89,6 +92,8 @@ pub struct RepositorySnapshot {
     pub relevance: RelevanceModel,
     neighborhood: OnceLock<Neighborhood>,
     lexical: OnceLock<Lexical>,
+    /// Entities of reparsed documents whose function no longer exists.
+    gone: std::collections::HashSet<petgraph::graph::NodeIndex>,
 }
 
 impl RepositorySnapshot {
@@ -114,6 +119,16 @@ impl RepositorySnapshot {
             None if self.sources.contains_key(file) => DocumentState::Resolved,
             None => DocumentState::Unresolved,
         }
+    }
+
+    /// Whether any document changed since its index was built (stale or reparsed).
+    pub fn has_unindexed_edits(&self) -> bool {
+        self.degraded.values().any(|state| matches!(state, DocumentState::Stale | DocumentState::Reparsed))
+    }
+
+    /// Whether `entity` was deleted by an edit the index has not seen yet.
+    pub fn is_gone(&self, entity: &str) -> bool {
+        self.built.graph.node(entity).is_some_and(|idx| self.gone.contains(&idx))
     }
 
     pub fn indexed_files(&self) -> &BTreeSet<String> {
@@ -481,6 +496,8 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
     let mut built = build::build_graph(&resolver);
     effects::infer_effects(&mut built);
     let facts = source::parse_corpus(&sources);
+    let mut degraded = degraded;
+    let gone = crate::overlay::remap(&mut built, &facts, &mut degraded);
     let policy = Policy::load_file(&policy_path)?;
     let baseline = Baseline::load(&repo)?;
     let relevance = RelevanceModel::load(&repo)?;
@@ -509,6 +526,7 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
         relevance,
         neighborhood: OnceLock::new(),
         lexical: OnceLock::new(),
+        gone,
     });
     if let Ok(mut cache) = CACHE.lock() {
         *cache = Some((key, snapshot.clone()));
@@ -567,7 +585,7 @@ mod tests {
             .unwrap();
         let second = RepositorySnapshot::capture(warn(&repo)).expect("second capture");
         assert_ne!(first.id(), second.id());
-        assert_eq!(second.document_state(&file), DocumentState::Stale);
+        assert_eq!(second.document_state(&file), DocumentState::Reparsed, "edited since indexing, ranges from the parser");
         assert!(matches!(
             second.freshness(),
             SnapshotFreshness::Stale { .. }

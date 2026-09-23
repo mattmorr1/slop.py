@@ -6,7 +6,7 @@ use crate::compress::{self, CompressConfig, CompressStats};
 use crate::envelope::{self, EnvelopeConfig, EnvelopeItem, Selection};
 use crate::snapshot::{DocumentState, RepositorySnapshot, SnapshotFreshness, SnapshotId};
 
-pub const CONTEXT_SCHEMA_VERSION: u32 = 5;
+pub const CONTEXT_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone)]
 pub struct ContextRequest<'a> {
@@ -37,6 +37,10 @@ pub struct ContextArtifact {
     pub items: Vec<EnvelopeItem>,
     /// Selected entities left out because their document is not resolved.
     pub omitted_unresolved: usize,
+    /// Files among target and items whose ranges come from the parser since an edit;
+    /// their graph edges are the last index's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reparsed: Vec<String>,
     pub fallback: Option<ContextFallback>,
 }
 
@@ -93,8 +97,10 @@ impl RepositorySnapshot {
             .graph
             .node(request.target_entity)
             .map(|idx| self.built.graph.entity(idx).file.clone());
-        let fallback = match file.as_deref().map(|path| self.document_state(path)) {
-            None | Some(DocumentState::Resolved) => None,
+        let usable = |path: &str| matches!(self.document_state(path), DocumentState::Resolved | DocumentState::Reparsed);
+        let fallback = match file.as_deref() {
+            None => None,
+            Some(path) if usable(path) && !self.is_gone(request.target_entity) => None,
             Some(_) => {
                 let text = file
                     .as_ref()
@@ -107,7 +113,7 @@ impl RepositorySnapshot {
                 })
             }
         };
-        let (items, omitted_unresolved) = if fallback.is_none() {
+        let (mut items, mut omitted_unresolved) = if fallback.is_none() {
             envelope::build_captured_envelope(
                 &self.built,
                 &self.facts,
@@ -120,11 +126,21 @@ impl RepositorySnapshot {
                     min_probability_ppm: request.min_probability_ppm,
                 },
                 &envelope::Relevance { model: &self.relevance, lexical: self.lexical() },
-                |file| self.document_state(file) == DocumentState::Resolved,
+                usable,
             )
         } else {
             (Vec::new(), 0)
         };
+        let before = items.len();
+        items.retain(|item| !self.is_gone(&item.entity));
+        omitted_unresolved += before - items.len();
+        let mut reparsed: Vec<String> = items
+            .iter()
+            .map(|item| item.file.clone())
+            .filter(|file| self.document_state(file) == DocumentState::Reparsed)
+            .collect();
+        reparsed.sort();
+        reparsed.dedup();
         let fallback = if fallback.is_none() && items.is_empty() {
             Some(ContextFallback {
                 reason: "unknown_target",
@@ -153,6 +169,7 @@ impl RepositorySnapshot {
             estimated_tokens,
             items,
             omitted_unresolved,
+            reparsed,
             fallback,
         }
     }
@@ -281,6 +298,39 @@ mod tests {
     }
 
     #[test]
+    fn an_edited_document_is_reparsed_not_verbatim() {
+        let repo = fixture("toy_repo");
+        let path = repo.join("core/http_client.py");
+        let source = std::fs::read_to_string(&path).expect("read");
+        let init = source.find("    def __init__").expect("init");
+        let get = source.find("    def get").expect("get");
+        let edited = format!("# one\n# two\n# three\n{}{}", &source[..init], &source[get..]);
+        std::fs::write(&path, edited).expect("edit");
+        let snapshot = RepositorySnapshot::capture(CaptureRequest {
+            repo: &repo,
+            index: None,
+            policy: None,
+            freshness: Freshness::Warn,
+        })
+        .expect("snapshot");
+        assert_eq!(snapshot.document_state("core/http_client.py"), DocumentState::Reparsed);
+        assert!(snapshot.has_unindexed_edits(), "a reparsed document still wants a reindex");
+        let artifact = snapshot.context(ContextRequest {
+            target_entity: "core.http_client::HttpClient::get",
+            token_budget: 8000,
+            edit_zone_hops: 1,
+            selection: Selection::Coverage,
+            min_probability_ppm: 0,
+        });
+        assert!(artifact.fallback.is_none(), "{:?}", artifact.fallback);
+        let target = &artifact.items[0];
+        assert!(target.text.trim_start().starts_with("def get") && target.text.contains("raise last_error"), "{}", target.text);
+        assert!(snapshot.is_gone("core.http_client::HttpClient::__init__"));
+        assert!(artifact.items.iter().all(|item| !item.entity.ends_with("::__init__") || !item.file.ends_with("http_client.py")));
+        assert_eq!(artifact.reparsed, vec!["core/http_client.py".to_string()]);
+    }
+
+    #[test]
     fn unknown_target_is_an_explicit_fallback() {
         let repo = fixture("toy_repo");
         let snapshot = RepositorySnapshot::capture(CaptureRequest {
@@ -301,6 +351,56 @@ mod tests {
             artifact.fallback.expect("fallback").reason,
             "unknown_target"
         );
+    }
+
+    /// R4 gate: an edit to an indexed file, then context for a function in it, without a reindex.
+    /// SLOP_BENCH_REPO must be a scratch copy: its files are edited and restored.
+    #[test]
+    #[ignore = "manual benchmark: SLOP_BENCH_REPO"]
+    fn benchmark_edit_to_fresh_context() {
+        let repo = PathBuf::from(std::env::var("SLOP_BENCH_REPO").expect("SLOP_BENCH_REPO"));
+        let capture = || {
+            RepositorySnapshot::capture(CaptureRequest { repo: &repo, index: None, policy: None, freshness: Freshness::Warn })
+                .expect("snapshot")
+        };
+        let base = capture();
+        assert!(!base.has_unindexed_edits(), "start from a freshly indexed copy");
+        let mut files: Vec<(&String, usize)> = base
+            .facts
+            .iter()
+            .filter(|facts| facts.file.ends_with(".py") && facts.functions.len() >= 3)
+            .map(|facts| (&facts.file, facts.functions.len()))
+            .collect();
+        files.sort_by_key(|(file, n)| (std::cmp::Reverse(*n), (*file).clone()));
+        let mut samples = Vec::new();
+        for (round, (file, _)) in files.iter().cycle().take(20).enumerate() {
+            let path = repo.join(file);
+            let original = std::fs::read_to_string(&path).expect("read");
+            let target = base
+                .built
+                .graph
+                .entities()
+                .find(|(_, e)| &e.file == *file && e.entity_type == slop_graph::NodeType::Function)
+                .map(|(_, e)| e.id.clone())
+                .expect("a function");
+            std::fs::write(&path, format!("# edit {round}\n{original}")).expect("edit");
+            let start = std::time::Instant::now();
+            let artifact = capture().context(ContextRequest {
+                target_entity: &target,
+                token_budget: 8000,
+                edit_zone_hops: 1,
+                selection: Selection::Coverage,
+                min_probability_ppm: envelope::DEFAULT_MIN_PROBABILITY_PPM,
+            });
+            samples.push(start.elapsed());
+            std::fs::write(&path, original).expect("restore");
+            assert!(artifact.fallback.is_none(), "{target}: {:?}", artifact.fallback);
+            assert!(artifact.reparsed.contains(file), "{file} should be reparsed");
+            let name = target.rsplit("::").next().expect("name");
+            assert!(artifact.items[0].text.contains(&format!("def {name}")), "{target} rendered from wrong lines");
+        }
+        samples.sort();
+        eprintln!("edit-to-fresh-context p50={:?} p95={:?} max={:?}", samples[9], samples[18], samples[19]);
     }
 
     #[test]

@@ -90,7 +90,9 @@ scope selection. CLI, MCP, LSP, TUI, gate, baseline, and fix share it.
 **Context artifact**:
 A deterministic, provenance-bearing selection of full source and contract
 skeletons for one repository snapshot, locus, edit zone, and token budget.
-Stale coverage degrades explicitly to verbatim source.
+A document edited since indexing is **reparsed** (fresh line ranges from the
+parser, the last index's edges) and named as such in the artifact; one the
+parser cannot anchor degrades explicitly to verbatim source.
 
 **Prewrite assessment**:
 A snapshot-bound projection of proposed source into direct policy findings and

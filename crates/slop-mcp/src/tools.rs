@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use slop_analyze::check::{self, CheckRequest};
 use slop_analyze::context::ContextRequest;
 use slop_analyze::envelope::DEFAULT_MIN_PROBABILITY_PPM;
+use slop_analyze::refresh::Refresher;
 use slop_analyze::query;
 use slop_analyze::search;
 use slop_graph::{EdgeKind, Effect};
@@ -19,6 +20,8 @@ use slop_graph::{EdgeKind, Effect};
 pub struct ToolCtx {
     pub default_repo: PathBuf,
     pub default_index: Option<PathBuf>,
+    /// Background reindex for the default repository; None in tests and one-shot use.
+    pub refresher: Option<Refresher>,
 }
 
 impl ToolCtx {
@@ -34,6 +37,15 @@ impl ToolCtx {
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .or_else(|| self.default_index.clone())
+    }
+
+    /// The snapshot for `repo`; edits the index has not seen queue a background reindex.
+    fn analysis(&self, repo: &std::path::Path, args: &Value) -> Result<std::sync::Arc<check::Analysis>> {
+        let analysis = check::load_analysis(repo, self.index(args).as_deref())?;
+        if let Some(refresher) = self.refresher.as_ref().filter(|_| repo == self.default_repo) {
+            refresher.request_if_edited(&analysis);
+        }
+        Ok(analysis)
     }
 }
 
@@ -158,7 +170,7 @@ fn assess_write(ctx: &ToolCtx, args: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("content is required"))?;
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(3) as usize;
-    let analysis = check::load_analysis(&repo, ctx.index(args).as_deref())?;
+    let analysis = ctx.analysis(&repo, args)?;
     Ok(serde_json::to_string_pretty(
         &analysis.assess_write(file, content, limit)?,
     )?)
@@ -190,7 +202,7 @@ fn find_capability(ctx: &ToolCtx, args: &Value) -> Result<String> {
         return Err(anyhow!("give an `intent` to search for, an `effect` to filter by, or both"));
     }
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-    let analysis = check::load_analysis(&repo, ctx.index(args).as_deref())?;
+    let analysis = ctx.analysis(&repo, args)?;
     let found = search::find(&analysis.built, intent, effect, limit);
     if found.is_empty() {
         return Ok(serde_json::to_string_pretty(&json!({
@@ -239,7 +251,7 @@ fn get_context_envelope(ctx: &ToolCtx, args: &Value) -> Result<String> {
         .get("target_entity")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("target_entity is required"))?;
-    let analysis = check::load_analysis(&repo, ctx.index(args).as_deref())?;
+    let analysis = ctx.analysis(&repo, args)?;
     let artifact = analysis.context(ContextRequest {
         target_entity: target,
         token_budget: args.get("token_budget").and_then(Value::as_u64).unwrap_or(8000) as usize,
@@ -278,7 +290,7 @@ fn query_subgraph(ctx: &ToolCtx, args: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("entity is required"))?;
     let depth = args.get("depth").and_then(Value::as_u64).unwrap_or(1) as usize;
-    let analysis = check::load_analysis(&repo, ctx.index(args).as_deref())?;
+    let analysis = ctx.analysis(&repo, args)?;
     let kinds = parse_edge_kinds(args);
     match query::subgraph(&analysis.built, entity, depth, kinds.as_deref()) {
         Some(sg) => Ok(serde_json::to_string_pretty(&sg)?),
@@ -295,7 +307,7 @@ fn expand_entity(ctx: &ToolCtx, args: &Value) -> Result<String> {
         .get("entity")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("entity is required"))?;
-    let analysis = check::load_analysis(&repo, ctx.index(args).as_deref())?;
+    let analysis = ctx.analysis(&repo, args)?;
     match analysis.expand(entity) {
         Some(expansion) => Ok(serde_json::to_string_pretty(&expansion)?),
         None => Ok(serde_json::to_string_pretty(&json!({

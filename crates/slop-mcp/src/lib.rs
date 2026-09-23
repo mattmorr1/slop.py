@@ -14,9 +14,11 @@ pub use tools::ToolCtx;
 /// Serve the MCP protocol over stdin/stdout for `repo` until EOF. This is
 /// what `slop mcp <repo>` runs; Claude Code launches it per-project.
 pub fn serve_stdio(repo: PathBuf, index: Option<PathBuf>) -> anyhow::Result<()> {
+    let refresher = slop_analyze::refresh::Refresher::spawn(repo.clone(), index.clone(), || {});
     let ctx = ToolCtx {
         default_repo: repo,
         default_index: index,
+        refresher: Some(refresher),
     };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

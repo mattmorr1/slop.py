@@ -64,6 +64,7 @@ fn exchange(repo: PathBuf, requests: &[Value]) -> Vec<Value> {
     let ctx = ToolCtx {
         default_repo: fixture.0.clone(),
         default_index: None,
+        refresher: None,
     };
     let input: String = requests.iter().map(|r| r.to_string() + "\n").collect();
     let mut output = Vec::new();

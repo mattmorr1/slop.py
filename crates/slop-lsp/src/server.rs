@@ -11,6 +11,9 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use serde_json::{json, Value};
 
+use slop_analyze::check;
+use slop_analyze::refresh::Refresher;
+
 use crate::diagnostics;
 
 /// What the server analyzes: the repo root and an optional explicit index path.
@@ -30,6 +33,15 @@ where
     let output = Arc::new(Mutex::new(output));
     let (requests, pending) = mpsc::channel::<HashSet<String>>();
     let worker_output = Arc::clone(&output);
+    // A save republishes at once from the reparse overlay; a separate worker then
+    // reindexes (coalesced) and republishes with exact edges.
+    let latest_open: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let (republish, latest) = (requests.clone(), Arc::clone(&latest_open));
+    let refresher = Refresher::spawn(ctx.repo.clone(), ctx.index.clone(), move || {
+        if let Ok(open) = latest.lock() {
+            republish.send(open.clone()).ok();
+        }
+    });
     let worker = std::thread::spawn(move || {
         let mut published = HashSet::new();
         while let Ok(mut open) = pending.recv() {
@@ -41,6 +53,10 @@ where
                 return;
             };
             let _ = publish_analysis(result, &open, &mut published, &mut *output);
+            drop(output);
+            if let Ok(snapshot) = check::load_analysis(&ctx.repo, ctx.index.as_deref()) {
+                refresher.request_if_edited(&snapshot);
+            }
         }
     });
     let mut open = HashSet::new();
@@ -67,6 +83,7 @@ where
                 if let Some(uri) = doc_uri(&msg) {
                     open.insert(uri);
                 }
+                latest_open.lock().map(|mut latest| latest.clone_from(&open)).ok();
                 requests.send(open.clone()).ok();
             }
             "textDocument/didSave" => {
@@ -75,6 +92,7 @@ where
             "textDocument/didClose" => {
                 if let Some(uri) = doc_uri(&msg) {
                     open.remove(&uri);
+                    latest_open.lock().map(|mut latest| latest.clone_from(&open)).ok();
                     publish(
                         &mut *output
                             .lock()
