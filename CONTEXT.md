@@ -19,7 +19,7 @@ A callable or container the graph holds a node for — module, class, or functio
 
 ### Grades of sameness
 
-Three distinct claims, ordered by strength. Conflating them is how a duplicate
+Distinct claims, ordered by strength. Conflating them is how a duplicate
 detector either misses renames or blocks legitimate code.
 
 **Textually identical**:
@@ -30,6 +30,18 @@ Two bodies that differ only in the *names* they use — literals, structure and
 call targets all preserved. This is an identity rather than a judgement, which is
 what qualifies it to block a write (see ADR 0001).
 _Avoid_: structurally identical (that name is already taken by the weaker claim below)
+
+**E-equivalent (sound)**:
+α-equivalent modulo a fixed set of rewrite laws that hold for *every* value in
+the language: a ternary and its two-branch `if`, a negated test with swapped
+branches, unreachable code after an exit, a single-use temporary before a
+return. Still an identity, so still strong enough to block a write (ADR 0004).
+
+**E-equivalent (graded)**:
+Equivalent modulo laws that hold only for well-behaved types: commutation,
+comparison flips, De Morgan, `x += y` as `x = x + y`. Python's `str +` does not
+commute and `list.__iadd__` aliases, so this is a judgement, never an identity.
+_Avoid_: semantically equivalent (no tier here decides that)
 
 **Same shape**:
 Two bodies with the same control flow, where names *and literals* are both
