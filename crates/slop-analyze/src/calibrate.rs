@@ -341,7 +341,7 @@ fn training_rows(snapshot: &RepositorySnapshot, tasks: &[&Task]) -> Vec<Row> {
         let entity = snapshot.built.graph.entity(task.target);
         let text = snapshot.sources.get(&entity.file).and_then(|source| entity_text(source, entity)).unwrap_or_default();
         let gold: HashSet<NodeIndex> = task.gold.iter().copied().collect();
-        let (positives, mut negatives): (Vec<_>, Vec<_>) = candidate_features(&snapshot.built, task.target, snapshot.lexical(), &text)
+        let (positives, mut negatives): (Vec<_>, Vec<_>) = candidate_features(&snapshot.built, task.target, snapshot.lexical(), snapshot.entity_index(), &text)
             .into_iter()
             .partition(|(idx, _)| gold.contains(idx));
         let total = negatives.len();
@@ -412,9 +412,9 @@ fn solve(mut a: [[f64; 12]; 12], mut b: [f64; 12]) -> Option<[f64; 12]> {
 fn envelope_picks(snapshot: &RepositorySnapshot, task: &Task, model: &RelevanceModel, budget: usize) -> HashSet<String> {
     let target = &snapshot.built.graph.entity(task.target).id;
     let config = EnvelopeConfig { token_budget: budget, edit_zone_hops: 1, selection: Selection::Coverage, min_probability_ppm: 0 };
-    let relevance = Relevance { model, lexical: snapshot.lexical() };
+    let relevance = Relevance { model, lexical: snapshot.lexical(), index: snapshot.entity_index() };
     let (items, _) =
-        envelope::build_captured_envelope(&snapshot.built, &snapshot.facts, &snapshot.sources, target, &config, &relevance, |_| true);
+        envelope::build_captured_envelope(&snapshot.built, &snapshot.sources, target, &config, &relevance, |_| true);
     items.into_iter().map(|item| item.entity).filter(|entity| entity != target).collect()
 }
 

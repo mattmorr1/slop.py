@@ -317,8 +317,9 @@ pub fn build_envelope(
         .collect();
     let model = RelevanceModel::default_model();
     let lexical = Lexical::build(built, &sources);
-    let relevance = Relevance { model: &model, lexical: &lexical };
-    build_captured_envelope(built, facts, &sources, target_entity, config, &relevance, |_| true).0
+    let index = EntityIndex::build(built, facts);
+    let relevance = Relevance { model: &model, lexical: &lexical, index: &index };
+    build_captured_envelope(built, &sources, target_entity, config, &relevance, |_| true).0
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -363,7 +364,6 @@ pub fn catalog(built: &BuiltGraph, facts: &[FileFacts]) -> Vec<CatalogEntry> {
 
 pub fn build_captured_envelope(
     built: &BuiltGraph,
-    facts: &[FileFacts],
     sources: &BTreeMap<String, Arc<str>>,
     target_entity: &str,
     config: &EnvelopeConfig,
@@ -376,7 +376,7 @@ pub fn build_captured_envelope(
         .map(|idx| built.graph.entity(idx))
         .and_then(|entity| sources.get(&entity.file).and_then(|source| entity_text(source, entity)))
         .unwrap_or_default();
-    let mut items = build_envelope_with(built, facts, target_entity, config, relevance, &target_text, |entity| {
+    let mut items = build_envelope_with(built, target_entity, config, relevance, &target_text, |entity| {
         render_captured(sources, entity)
     });
     let before = items.len();
@@ -385,14 +385,44 @@ pub fn build_captured_envelope(
     (items, omitted)
 }
 
-/// The calibrated model and the snapshot's lexical index an envelope ranks with.
+/// The calibrated model and the snapshot's indexes an envelope ranks with.
 pub struct Relevance<'a> {
     pub model: &'a RelevanceModel,
     pub lexical: &'a Lexical,
+    pub index: &'a EntityIndex,
 }
 
 fn directory(file: &str) -> &str {
     file.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+/// Lookups every envelope request needs, built once per snapshot rather than per call.
+pub struct EntityIndex {
+    by_dir: HashMap<String, Vec<NodeIndex>>,
+    signatures: HashMap<String, String>,
+    classes: HashMap<String, String>,
+}
+
+impl EntityIndex {
+    pub fn build(built: &BuiltGraph, facts: &[FileFacts]) -> Self {
+        let mut by_dir: HashMap<String, Vec<NodeIndex>> = HashMap::new();
+        for (idx, entity) in built.graph.entities() {
+            by_dir.entry(directory(&entity.file).to_string()).or_default().push(idx);
+        }
+        let by_location = location_index(built);
+        let (mut signatures, mut classes) = (HashMap::new(), HashMap::new());
+        for file_facts in facts {
+            for fact in &file_facts.functions {
+                if let Some(e) = entity_for(built, &by_location, &file_facts.file, fact) {
+                    signatures.insert(e.id.clone(), fact.signature.clone());
+                    if let Some(class) = [&fact.equiv_hash, &fact.body_hash].into_iter().find(|hash| !hash.is_empty()) {
+                        classes.insert(e.id.clone(), class.clone());
+                    }
+                }
+            }
+        }
+        Self { by_dir, signatures, classes }
+    }
 }
 
 /// Every candidate for `target_idx` with the features the model scores: the graph
@@ -401,16 +431,17 @@ pub(crate) fn candidate_features(
     built: &BuiltGraph,
     target_idx: NodeIndex,
     lexical: &Lexical,
+    index: &EntityIndex,
     target_text: &str,
 ) -> Vec<(NodeIndex, Features)> {
     let distances = proximity_distances(built, &[target_idx], MAX_HOPS);
     let target = built.graph.entity(target_idx);
     let target_dir = directory(&target.file);
-    let lexical = lexical.scores(target_text);
     let mut pool: std::collections::BTreeSet<NodeIndex> =
         distances.iter().filter(|(_, distance)| (1..=MAX_HOPS).contains(*distance)).map(|(idx, _)| *idx).collect();
-    pool.extend(built.graph.entities().filter(|(_, entity)| directory(&entity.file) == target_dir).map(|(idx, _)| idx));
+    pool.extend(index.by_dir.get(target_dir).into_iter().flatten().copied());
     pool.remove(&target_idx);
+    let lexical = lexical.scores_for(target_text, pool.iter().copied());
     pool.into_iter()
         .filter(|&idx| matches!(built.graph.entity(idx).entity_type, NodeType::Function | NodeType::Class))
         .map(|idx| {
@@ -432,7 +463,6 @@ pub(crate) fn candidate_features(
 
 fn build_envelope_with<F>(
     built: &BuiltGraph,
-    facts: &[FileFacts],
     target_entity: &str,
     config: &EnvelopeConfig,
     relevance: &Relevance<'_>,
@@ -446,23 +476,9 @@ where
         return Vec::new();
     };
 
-    let by_location = location_index(built);
-    let mut signatures: HashMap<String, String> = HashMap::new();
-    let mut classes: HashMap<String, String> = HashMap::new();
-    for file_facts in facts {
-        for fact in &file_facts.functions {
-            if let Some(e) = entity_for(built, &by_location, &file_facts.file, fact) {
-                signatures.insert(e.id.clone(), fact.signature.clone());
-                let class = [&fact.equiv_hash, &fact.body_hash].into_iter().find(|hash| !hash.is_empty());
-                if let Some(class) = class {
-                    classes.insert(e.id.clone(), class.clone());
-                }
-            }
-        }
-    }
-
+    let (signatures, classes) = (&relevance.index.signatures, &relevance.index.classes);
     let target = built.graph.entity(target_idx);
-    let mut candidates: Vec<Candidate> = candidate_features(built, target_idx, relevance.lexical, target_text)
+    let mut candidates: Vec<Candidate> = candidate_features(built, target_idx, relevance.lexical, relevance.index, target_text)
         .into_iter()
         .filter_map(|(idx, features)| {
             let entity = built.graph.entity(idx);

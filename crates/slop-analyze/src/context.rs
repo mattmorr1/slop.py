@@ -116,7 +116,6 @@ impl RepositorySnapshot {
         let (mut items, mut omitted_unresolved) = if fallback.is_none() {
             envelope::build_captured_envelope(
                 &self.built,
-                &self.facts,
                 &self.sources,
                 request.target_entity,
                 &EnvelopeConfig {
@@ -125,7 +124,7 @@ impl RepositorySnapshot {
                     selection: request.selection,
                     min_probability_ppm: request.min_probability_ppm,
                 },
-                &envelope::Relevance { model: &self.relevance, lexical: self.lexical() },
+                &envelope::Relevance { model: &self.relevance, lexical: self.lexical(), index: self.entity_index() },
                 usable,
             )
         } else {

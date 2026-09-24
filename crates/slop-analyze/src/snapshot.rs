@@ -92,6 +92,7 @@ pub struct RepositorySnapshot {
     pub relevance: RelevanceModel,
     neighborhood: OnceLock<Neighborhood>,
     lexical: OnceLock<Lexical>,
+    entity_index: OnceLock<crate::envelope::EntityIndex>,
     /// Entities of reparsed documents whose function no longer exists.
     gone: std::collections::HashSet<petgraph::graph::NodeIndex>,
 }
@@ -142,6 +143,10 @@ impl RepositorySnapshot {
 
     pub fn lexical(&self) -> &Lexical {
         self.lexical.get_or_init(|| Lexical::build(&self.built, &self.sources))
+    }
+
+    pub fn entity_index(&self) -> &crate::envelope::EntityIndex {
+        self.entity_index.get_or_init(|| crate::envelope::EntityIndex::build(&self.built, &self.facts))
     }
 }
 
@@ -526,6 +531,7 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
         relevance,
         neighborhood: OnceLock::new(),
         lexical: OnceLock::new(),
+        entity_index: OnceLock::new(),
         gone,
     });
     if let Ok(mut cache) = CACHE.lock() {

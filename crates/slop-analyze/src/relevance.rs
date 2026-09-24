@@ -122,9 +122,13 @@ impl Features {
 }
 
 /// BM25 over every function's and class's own source, built once per snapshot.
+/// Per-document term lists, so a request scores only its candidates: postings
+/// made every request walk the ~100k documents that contain `self` (Sentry).
 pub struct Lexical {
     terms: HashMap<String, u32>,
-    postings: HashMap<u32, Vec<(NodeIndex, u32)>>,
+    /// Each document's (term, frequency), sorted by term.
+    docs: HashMap<NodeIndex, Vec<(u32, u32)>>,
+    df: HashMap<u32, u32>,
     lengths: HashMap<NodeIndex, u32>,
     documents: usize,
     average: f64,
@@ -172,7 +176,8 @@ pub fn entity_text<'a>(source: &'a str, entity: &CodeEntity) -> Option<String> {
 impl Lexical {
     pub fn build(built: &BuiltGraph, sources: &std::collections::BTreeMap<String, std::sync::Arc<str>>) -> Self {
         let mut terms: HashMap<String, u32> = HashMap::new();
-        let mut postings: HashMap<u32, Vec<(NodeIndex, u32)>> = HashMap::new();
+        let mut docs: HashMap<NodeIndex, Vec<(u32, u32)>> = HashMap::new();
+        let mut df: HashMap<u32, u32> = HashMap::new();
         let mut lengths = HashMap::new();
         let mut total: u64 = 0;
         for (idx, entity) in built.graph.entities() {
@@ -191,31 +196,51 @@ impl Lexical {
             }
             lengths.insert(idx, length);
             total += u64::from(length);
-            for (term, count) in counts {
-                postings.entry(term).or_default().push((idx, count));
-            }
+            let mut list: Vec<(u32, u32)> = counts.into_iter().collect();
+            list.sort_unstable();
+            list.iter().for_each(|(term, _)| *df.entry(*term).or_default() += 1);
+            docs.insert(idx, list);
         }
         let documents = lengths.len();
         // An integer total: a float sum in HashMap order would differ per process.
         let average = total as f64 / documents.max(1) as f64;
-        Self { terms, postings, lengths, documents, average }
+        Self { terms, docs, df, lengths, documents, average }
     }
 
-    /// BM25 of every document against `query` (each distinct word counted once).
-    pub fn scores(&self, query: &str) -> HashMap<NodeIndex, f64> {
+    /// BM25 of each candidate against `query` (each distinct word counted once).
+    /// Terms are summed in term-id order, so a score is the same whichever
+    /// documents are asked about.
+    pub fn scores_for(&self, query: &str, candidates: impl IntoIterator<Item = NodeIndex>) -> HashMap<NodeIndex, f64> {
         let mut distinct: Vec<u32> = words(query).filter_map(|word| self.terms.get(&word).copied()).collect();
         distinct.sort_unstable();
         distinct.dedup();
         let n = self.documents as f64;
-        let mut scores: HashMap<NodeIndex, f64> = HashMap::new();
-        for term in distinct {
-            let Some(list) = self.postings.get(&term) else { continue };
-            let df = list.len() as f64;
-            let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
-            for &(idx, tf) in list {
-                let (tf, length) = (f64::from(tf), f64::from(self.lengths[&idx]));
-                *scores.entry(idx).or_default() +=
-                    idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * length / self.average));
+        let idf: Vec<f64> = distinct
+            .iter()
+            .map(|term| {
+                let df = f64::from(self.df.get(term).copied().unwrap_or(0));
+                (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+            })
+            .collect();
+        let mut scores = HashMap::new();
+        for idx in candidates {
+            let Some(doc) = self.docs.get(&idx) else { continue };
+            let length = f64::from(self.lengths[&idx]);
+            let (mut i, mut j, mut score, mut hit) = (0, 0, 0.0, false);
+            while i < distinct.len() && j < doc.len() {
+                match distinct[i].cmp(&doc[j].0) {
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                    std::cmp::Ordering::Equal => {
+                        let tf = f64::from(doc[j].1);
+                        score += idf[i] * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * length / self.average));
+                        hit = true;
+                        (i, j) = (i + 1, j + 1);
+                    }
+                }
+            }
+            if hit {
+                scores.insert(idx, score);
             }
         }
         scores
