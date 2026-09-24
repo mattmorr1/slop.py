@@ -850,14 +850,16 @@ fn main() -> Result<()> {
             // untouched rather than risk corrupting it.
             let input: serde_json::Value =
                 serde_json::from_str(&buf).unwrap_or_else(|_| serde_json::json!({}));
-            let output = match event {
-                HookEvent::PreToolUse => harness::handle_pre_tool_use(&input),
-                HookEvent::PostToolUse => harness::handle_post_tool_use(&input),
-                HookEvent::UserPromptSubmit => harness::handle_user_prompt_submit(&input),
-                HookEvent::SessionStart => harness::handle_session_start(&input, "SessionStart"),
-                HookEvent::SubagentStart => harness::handle_session_start(&input, "SubagentStart"),
+            let started = std::time::Instant::now();
+            let (name, output) = match event {
+                HookEvent::PreToolUse => ("PreToolUse", harness::handle_pre_tool_use(&input)),
+                HookEvent::PostToolUse => ("PostToolUse", harness::handle_post_tool_use(&input)),
+                HookEvent::UserPromptSubmit => ("UserPromptSubmit", harness::handle_user_prompt_submit(&input)),
+                HookEvent::SessionStart => ("SessionStart", harness::handle_session_start(&input, "SessionStart")),
+                HookEvent::SubagentStart => ("SubagentStart", harness::handle_session_start(&input, "SubagentStart")),
             };
             println!("{output}");
+            harness::log_hook(&input, name, &output, started.elapsed());
         }
         Command::Lsp { repo, index } => {
             slop_lsp::serve_stdio(repo, index)?;

@@ -230,6 +230,39 @@ fn apply_edit(current: &str, edit: &Value) -> Option<String> {
     }
 }
 
+/// Append one line per hook call to `<repo>/.slop/hooks.jsonl`: what fired and what
+/// it cost, so dogfooding can measure it. `SLOP_HOOK_LOG=0` turns it off.
+pub fn log_hook(input: &Value, event: &str, output: &Value, elapsed: std::time::Duration) {
+    if std::env::var("SLOP_HOOK_LOG").is_ok_and(|v| v == "0") {
+        return;
+    }
+    let (file, cwd) = read_target(input);
+    let repo = find_repo_root(&cwd);
+    let hook = output.get("hookSpecificOutput");
+    let context = hook.and_then(|h| as_str(h, "additionalContext")).unwrap_or("");
+    let count = |needle: &str| context.lines().filter(|l| l.starts_with(needle)).count();
+    let line = json!({
+        "at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        "event": event,
+        "tool": as_str(input, "tool_name"),
+        "file": file.as_deref().and_then(|f| repo_relative(&repo, f)),
+        "ms": elapsed.as_millis() as u64,
+        "injected_tokens": context.len() / 4,
+        "duplicates": count("slop: new `"),
+        "reuse": count("slop: proposed code overlaps"),
+        "compressed_read": hook.is_some_and(|h| h.get("updatedToolOutput").is_some()),
+    });
+    let path = repo.join(".slop/hooks.jsonl");
+    let written = std::fs::create_dir_all(repo.join(".slop")).and_then(|()| {
+        use std::io::Write;
+        let mut log = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(log, "{line}")
+    });
+    if let Err(error) = written {
+        eprintln!("slop: could not write {}: {error}", path.display());
+    }
+}
+
 /// PreToolUse handler (W2): pre-check a *proposed* write against the sanctioned
 /// -channel policy and steer via `additionalContext`, before the edit lands.
 ///
@@ -258,7 +291,7 @@ pub fn handle_pre_tool_use(input: &Value) -> Value {
         return json!({});
     };
     let mut context = match prewrite::assess_from_sidecar(&repo, &policy, &rel, &content, 3) {
-        Ok(Some(assessment)) => assessment.steering(),
+        Ok(Some(assessment)) => assessment.steering(&repo),
         Ok(None) => precheck(lang, &rel, &content, &policy)
             .iter()
             .map(|finding| finding.steering())

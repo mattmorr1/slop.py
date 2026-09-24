@@ -157,7 +157,8 @@ fn assess_write_returns_snapshot_bound_reuse_evidence() {
     );
     assert_eq!(out[0]["result"]["isError"], false);
     let assessment = tool_json(&out[0]);
-    assert_eq!(assessment["schema_version"], 1);
+    assert_eq!(assessment["schema_version"], 2);
+    assert!(assessment["duplicates"].as_array().is_some_and(Vec::is_empty));
     assert_eq!(assessment["snapshot"].as_str().unwrap().len(), 64);
     assert!(assessment["reuse_suggestions"]
         .as_array()

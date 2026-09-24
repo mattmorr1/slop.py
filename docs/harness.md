@@ -118,6 +118,18 @@ later writes combine it with the current `slop.toml` policy.
     while reuse evidence can still surface. Unsupported languages stay silent.
   - Sees *direct* acquisition only (no graph ⇒ no transitive propagation). The
     deeper checks stay in `validate_change` / `slop gate`.
+  - **Provable duplicates.** A new or changed function (keyed by name and
+    E-sound hash, so untouched code never matches itself) that is provably
+    equivalent to an existing one is named first, with its location. A pure
+    rename is not reported. Python only; warn-only like everything else here.
+  - **Reuse with usage.** The top two reuse suggestions carry the existing
+    function's body (at most 30 lines, read from disk and checked to still be
+    that function) and one real call site from a caller. R8 found models reuse
+    what they see *used*, not what they see *named*.
+
+Every hook call appends one line to `<repo>/.slop/hooks.jsonl` (event, file,
+latency, injected tokens, duplicates and reuse suggestions fired) for measuring
+the harness in daily use. `SLOP_HOOK_LOG=0` turns it off.
 
 - `slop hook post-tool-use` — maintains a **session edit zone** and does
   **zoned graph-distance compression** on reads:

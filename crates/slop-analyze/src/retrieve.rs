@@ -22,12 +22,24 @@ use slop_graph::{EdgeKind, NodeType};
 use crate::build::BuiltGraph;
 use crate::detect::{DISTINCTIVE_DF_DIVISOR, MIN_DISTINCTIVE_CALLEES};
 
+/// Where a function lives: 0-based inclusive line range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Site {
+    pub label: String,
+    pub file: String,
+    pub start: usize,
+    pub end: usize,
+}
+
 /// A function the repo already has, with the simple names it calls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Candidate {
     pub label: String,
     pub file: String,
     pub line: usize,
+    pub end: usize,
+    /// Up to three functions that reference it, for showing how it is called.
+    pub callers: Vec<Site>,
     pub callees: BTreeSet<String>,
 }
 
@@ -37,6 +49,8 @@ pub struct Match {
     pub label: String,
     pub file: String,
     pub line: usize,
+    pub end: usize,
+    pub callers: Vec<Site>,
     /// Shared callees that few other functions make — the load-bearing overlap.
     pub distinctive: Vec<String>,
     /// Every shared callee, distinctive or not.
@@ -92,10 +106,25 @@ impl Neighborhood {
             for callee in &callees {
                 *df.entry(callee.clone()).or_default() += 1;
             }
+            let mut callers: Vec<Site> = built
+                .graph
+                .graph
+                .edges_directed(idx, Direction::Incoming)
+                .filter(|e| *e.weight() == EdgeKind::Calls)
+                .map(|e| built.graph.entity(e.source()))
+                .filter(|c| c.entity_type == NodeType::Function && !crate::source::is_test_file(&c.file))
+                .map(|c| Site { label: c.id.clone(), file: c.file.clone(), start: c.source_range.0, end: c.source_range.1 })
+                .collect();
+            // A `Calls` edge is any reference; keep a few so one real call site is likely.
+            callers.sort_by(|a, b| a.label.cmp(&b.label));
+            callers.dedup();
+            callers.truncate(3);
             functions.push(Candidate {
                 label: entity.id.clone(),
                 file: entity.file.clone(),
                 line: entity.source_range.0,
+                end: entity.source_range.1,
+                callers,
                 callees,
             });
         }
@@ -157,6 +186,8 @@ impl Neighborhood {
                     label: c.label.clone(),
                     file: c.file.clone(),
                     line: c.line,
+                    end: c.end,
+                    callers: c.callers.clone(),
                     distinctive,
                     shared: shared.len(),
                     score_ppm,

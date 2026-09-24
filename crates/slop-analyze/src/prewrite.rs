@@ -1,5 +1,6 @@
 //! Snapshot-bound assessment of proposed source before it reaches the worktree.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -10,10 +11,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::policy::Policy;
 use crate::precheck::{precheck, PrecheckFinding};
-use crate::retrieve::{self, Match, Neighborhood};
+use crate::retrieve::{self, Match, Neighborhood, Site};
 use crate::snapshot::{RepositorySnapshot, SnapshotFreshness, SnapshotId};
 
-pub const PREWRITE_SCHEMA_VERSION: u32 = 1;
+pub const PREWRITE_SCHEMA_VERSION: u32 = 2;
+/// Suggestions shown with their body and a call site; the rest stay one line.
+const EXPANDED_SUGGESTIONS: usize = 2;
+const MAX_BODY_LINES: usize = 30;
 pub const MIN_REUSE_SCORE_PPM: u32 = 125_000;
 const MAX_SIDECAR_BYTES: u64 = 64 * 1024 * 1024;
 static SIDECAR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -25,27 +29,86 @@ pub struct WriteAssessment {
     pub freshness: SnapshotFreshness,
     pub file: String,
     pub policy_findings: Vec<PrecheckFinding>,
+    /// New functions provably equivalent (E-sound) to one the repo already has.
+    pub duplicates: Vec<Duplicate>,
     pub reuse_suggestions: Vec<Match>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct Duplicate {
+    pub name: String,
+    pub existing: Site,
+}
+
+/// E-sound hash to every function that has it, outside tests.
+pub type EquivalenceIndex = BTreeMap<String, Vec<Site>>;
+
 impl WriteAssessment {
-    pub fn steering(&self) -> Vec<String> {
+    /// Steering lines; the top suggestions carry their body and one call site read
+    /// from `repo`, because models reuse what they see used, not what they see named.
+    pub fn steering(&self, repo: &Path) -> Vec<String> {
         let mut lines: Vec<String> = self
-            .policy_findings
+            .duplicates
             .iter()
-            .map(PrecheckFinding::steering)
+            .map(|dup| {
+                format!(
+                    "slop: new `{}` is provably equivalent (same behaviour for every input) to existing `{}` at {}:{}. Call it instead of adding a copy.",
+                    dup.name, dup.existing.label, dup.existing.file, dup.existing.start + 1
+                )
+            })
             .collect();
-        lines.extend(self.reuse_suggestions.iter().map(|suggestion| {
-            format!(
+        lines.extend(self.policy_findings.iter().map(PrecheckFinding::steering));
+        for (rank, suggestion) in self.reuse_suggestions.iter().enumerate() {
+            let mut line = format!(
                 "slop: proposed code overlaps existing `{}` at {}:{} through calls [{}]. Review that implementation before adding another; shared calls do not prove equivalent behavior.",
                 suggestion.label,
                 suggestion.file,
                 suggestion.line + 1,
                 suggestion.distinctive.join(", ")
-            )
-        }));
+            );
+            if rank < EXPANDED_SUGGESTIONS {
+                if let Some(body) = body_of(repo, &suggestion.file, suggestion.line, suggestion.end, &suggestion.label) {
+                    line.push_str(&format!("\n```\n{body}\n```"));
+                }
+                if let Some((caller, at, call)) = suggestion.callers.iter().find_map(|c| call_site(repo, c, &suggestion.label).map(|(n, l)| (c, n, l))) {
+                    line.push_str(&format!("\nUsed like this in `{}` ({}:{}): `{call}`", caller.label, caller.file, at + 1));
+                }
+            }
+            lines.push(line);
+        }
         lines
     }
+}
+
+fn simple(label: &str) -> &str {
+    let last = label.rsplit("::").next().unwrap_or(label);
+    last.rsplit(['.', ')']).find(|part| !part.is_empty()).unwrap_or(last)
+}
+
+/// The function's lines as they are on disk now, if its first lines still name it.
+fn body_of(repo: &Path, file: &str, start: usize, end: usize, label: &str) -> Option<String> {
+    let text = std::fs::read_to_string(repo.join(file)).ok()?;
+    let lines: Vec<&str> = text.lines().skip(start).take(end.checked_sub(start)? + 1).collect();
+    let name = simple(label);
+    lines.iter().take(4).any(|l| l.contains(name)).then_some(())?;
+    let shown = lines.len().min(MAX_BODY_LINES);
+    let mut body = lines[..shown].join("\n");
+    if shown < lines.len() {
+        body.push_str(&format!("\n    # ... {} more lines", lines.len() - shown));
+    }
+    Some(body)
+}
+
+/// The first line (0-based) inside `caller` that calls `label`'s simple name.
+fn call_site(repo: &Path, caller: &Site, label: &str) -> Option<(usize, String)> {
+    let text = std::fs::read_to_string(repo.join(&caller.file)).ok()?;
+    let needle = format!("{}(", simple(label));
+    text.lines()
+        .enumerate()
+        .skip(caller.start)
+        .take(caller.end.checked_sub(caller.start)? + 1)
+        .find(|(_, l)| l.contains(&needle))
+        .map(|(n, l)| (n, l.trim().to_string()))
 }
 
 #[derive(Deserialize)]
@@ -54,6 +117,7 @@ struct PrewriteSidecar {
     snapshot: SnapshotId,
     freshness: SnapshotFreshness,
     neighborhood: Neighborhood,
+    equivalents: EquivalenceIndex,
 }
 
 #[derive(Serialize)]
@@ -62,15 +126,56 @@ struct PrewriteSidecarRef<'a> {
     snapshot: &'a SnapshotId,
     freshness: &'a SnapshotFreshness,
     neighborhood: &'a Neighborhood,
+    equivalents: &'a EquivalenceIndex,
 }
 
+/// Every non-test function's E-sound hash; tiny bodies have none (the significance floor).
+pub fn equivalence_index(snapshot: &RepositorySnapshot) -> EquivalenceIndex {
+    let by_location = crate::source::location_index(&snapshot.built);
+    let mut index: EquivalenceIndex = BTreeMap::new();
+    for file_facts in snapshot.facts.iter().filter(|f| !crate::source::is_test_file(&f.file)) {
+        for fact in file_facts.functions.iter().filter(|f| !f.equiv_hash.is_empty()) {
+            let label = crate::source::entity_for(&snapshot.built, &by_location, &file_facts.file, fact)
+                .map_or_else(|| fact.name.clone(), |entity| entity.id.clone());
+            index.entry(fact.equiv_hash.clone()).or_default().push(Site {
+                label,
+                file: file_facts.file.clone(),
+                start: fact.start_line as usize,
+                end: fact.end_line as usize,
+            });
+        }
+    }
+    index
+}
+
+/// Functions in `source` that are new or changed relative to `current` (the file on
+/// disk), keyed by (name, hash) so unchanged code never matches itself, and provably
+/// equivalent to an existing one. A same-file match whose name is gone is a rename.
+fn duplicates(language: slop_parse::Language, file: &str, source: &str, current: Option<&str>, index: &EquivalenceIndex) -> Vec<Duplicate> {
+    let pairs = |text: &str| language.parse(text).map(|fns| fns.into_iter().map(|f| (f.name, f.equiv_hash)).collect::<Vec<_>>()).unwrap_or_default();
+    let existing: BTreeSet<(String, String)> = current.map(pairs).unwrap_or_default().into_iter().collect();
+    let proposed = pairs(source);
+    let names: BTreeSet<&str> = proposed.iter().map(|(name, _)| name.as_str()).collect();
+    proposed
+        .iter()
+        .filter(|pair| !pair.1.is_empty() && !existing.contains(*pair))
+        .filter_map(|(name, hash)| {
+            let site = index.get(hash)?.iter().find(|site| site.file != file || names.contains(simple(&site.label)))?;
+            Some(Duplicate { name: name.clone(), existing: site.clone() })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn assess(
     snapshot: SnapshotId,
     freshness: SnapshotFreshness,
     policy: &Policy,
     neighborhood: &Neighborhood,
+    equivalents: &EquivalenceIndex,
     file: &str,
     source: &str,
+    current: Option<&str>,
     limit: usize,
 ) -> Result<WriteAssessment> {
     let language = slop_parse::Language::from_path(file)
@@ -87,19 +192,23 @@ fn assess(
         freshness,
         file: file.to_string(),
         policy_findings: precheck(language, file, source, policy),
+        duplicates: duplicates(language, file, source, current, equivalents),
         reuse_suggestions,
     })
 }
 
 impl RepositorySnapshot {
     pub fn assess_write(&self, file: &str, source: &str, limit: usize) -> Result<WriteAssessment> {
+        let current = std::fs::read_to_string(self.repo().join(file)).ok();
         assess(
             self.id().clone(),
             self.freshness().clone(),
             &self.policy,
             self.neighborhood(),
+            &equivalence_index(self),
             file,
             source,
+            current.as_deref(),
             limit,
         )
     }
@@ -131,6 +240,7 @@ impl RepositorySnapshot {
                     snapshot: self.id(),
                     freshness: self.freshness(),
                     neighborhood: self.neighborhood(),
+                    equivalents: &equivalence_index(self),
                 },
             )?;
             writer.write_all(b"\n")?;
@@ -182,13 +292,16 @@ pub fn assess_from_sidecar(
             PREWRITE_SCHEMA_VERSION
         );
     }
+    let current = std::fs::read_to_string(repo.join(file)).ok();
     assess(
         sidecar.snapshot,
         sidecar.freshness,
         policy,
         &sidecar.neighborhood,
+        &sidecar.equivalents,
         file,
         source,
+        current.as_deref(),
         limit,
     )
     .map(Some)
@@ -203,6 +316,26 @@ mod tests {
 
     fn fixture(name: &str) -> TempFixture {
         TempFixture::new(name)
+    }
+
+    #[test]
+    fn a_renamed_copy_is_a_duplicate_and_unchanged_code_is_not() {
+        let repo = fixture("toy_repo");
+        let snapshot = RepositorySnapshot::capture(CaptureRequest { repo: &repo, index: None, policy: None, freshness: Freshness::Warn })
+            .expect("snapshot");
+        let file = "core/http_client.py";
+        let current = std::fs::read_to_string(repo.join(file)).expect("read");
+        assert!(snapshot.assess_write(file, &current, 3).expect("assess").duplicates.is_empty(), "unchanged functions must not match themselves");
+        let start = current.find("    def get").expect("get");
+        let copy = current[start..].replace("def get(", "def fetch_again(").replace("last_error", "previous");
+        let proposed = format!("{current}\n{copy}");
+        let found = snapshot.assess_write(file, &proposed, 3).expect("assess").duplicates;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!((found[0].name.as_str(), found[0].existing.label.as_str()), ("fetch_again", "core.http_client::HttpClient::get"));
+        let lines = snapshot.assess_write(file, &proposed, 3).expect("assess").steering(&repo);
+        assert!(lines[0].contains("provably equivalent") && lines[0].contains("core/http_client.py:"), "{lines:?}");
+        let renamed = current.replace("def get(", "def fetch(");
+        assert!(snapshot.assess_write(file, &renamed, 3).expect("assess").duplicates.is_empty(), "a pure rename is not a duplicate of itself");
     }
 
     #[test]
