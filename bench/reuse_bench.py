@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import urllib.request
 from collections import Counter, defaultdict
@@ -301,7 +302,8 @@ def generate(args) -> None:
 
 def generated_function(response: str, name: str):
     match = FENCE.search(response)
-    code = match.group(1) if match else response
+    # Methods come back at their class indentation, as the stub showed them.
+    code = textwrap.dedent(match.group(1) if match else response)
     try:
         tree = ast.parse(code)
     except SyntaxError:

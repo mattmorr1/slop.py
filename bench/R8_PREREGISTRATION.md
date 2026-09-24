@@ -73,4 +73,9 @@ reuse in a single generation, not a full agent loop with tools.
 
 ## Changes after the first generation
 
-None yet.
+1. **Extractor dedents before parsing (scoring only; no generation changed).**
+   The first scoring counted 368 of 800 responses unparseable; 331 were
+   methods returned at their class indentation, exactly as the stub showed
+   them, which `ast.parse` rejects as "unexpected indent". That is a harness
+   bug, identical across arms, so responses are now dedented before parsing.
+   The first scoring stays in `bench/results/reuse.jsonl` as the first entry.
