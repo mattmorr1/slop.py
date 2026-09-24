@@ -82,6 +82,14 @@ while httpx, with more history, moves freely (strength 1, +3.5 points, not
 significant). The default was fit partly on these repositories, so "model in
 use" is in-sample for them.
 
+**Hub pruning (ef6e218).** The candidate walk stops at nodes referenced by
+more than 50 others. Unpruned, four hops covered 94% of vigil and 59% of
+Sentry, so the distance features were near zero in every fold; pruned, they
+carry signal (d1 +1.77, d2 +1.14 pooled) and the defaults were refit. Out of
+sample, adaptive recall at 8k rose from 73.1% to 76.0% and is now significantly
+ahead of BM25 (+6.3) and of Aider as used (+11.5); Sentry's p95 fell from 263
+to 9 ms.
+
 Co-change is a proxy for what an agent needs, not the need itself. The first
 end-to-end test (R8, pre-registered, bench/README.md) says the proxy does not
 transfer to implementing a stub with 7–8B models: the envelope ties BM25 on

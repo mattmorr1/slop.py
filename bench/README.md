@@ -286,10 +286,35 @@ TypeScript files, 109,564 entities, 7.4x vigil. M1 Pro, 16 GB.
   directory (`--target-only`, merged with repo-relative paths, each file kept
   by exactly one shard) indexes it at half the memory.
 - Latency grows about linearly, but the candidate pool is the real limit: hub
-  functions put most of the repo within four hops, so distances 3 and 4 stop
-  discriminating and every request scores ~60k candidates. Next: stop the
-  proximity walk at hubs (high-degree nodes are shared vocabulary, as common
-  words are for BM25), validated by a B4 rerun.
+  functions put most of the repo within four hops (59% of Sentry, 94% of
+  vigil), so distances 3 and 4 stopped discriminating.
+
+### After: per-snapshot indexes and hub pruning (0c64b04, ef6e218)
+
+The proximity walk now reaches but never passes through a node referenced by
+more than 50 others, and three per-request scans became per-snapshot indexes.
+
+| Sentry | before | after |
+| --- | ---: | ---: |
+| median 4-hop pool | 63,045 | 337 |
+| context p50 / p95 | 206 / 263 ms | **3 / 9 ms** |
+| first request (builds the indexes once) | 2.0 s | 2.0 s |
+
+It also raised recall. Canonical B4 (ef6e218, same 1,326 tasks, out of sample):
+
+| pooled recall | @1k | @4k | @8k | @16k |
+| --- | ---: | ---: | ---: | ---: |
+| adaptive default, before | 44.9% | 63.6% | 73.1% | 81.0% |
+| **adaptive default, hub-pruned** | **46.1%** | **65.1%** | **76.0%** | **82.6%** |
+| fill the budget, hub-pruned | 46.9% | 68.1% | 80.4% | 91.3% |
+| adaptive − BM25 (paired) | +4.2 [+0.6, +7.6] | +5.8 [+2.2, +9.6] | **+6.3 [+2.4, +10.0]** | +1.3 [−1.6, +4.3] |
+| adaptive − Aider, file + map | −10.9 | +5.9 [+0.8, +10.6] | **+11.5 [+6.7, +16.1]** | +4.6 [+1.1, +7.9] |
+
+Distances started carrying signal (pooled d2 weight −0.05 → +1.14), which is
+why recall rose: "two hops through the logger" had been noise. The default is
+now significantly ahead of BM25 at 8k, where it was not before. httpx still
+only ties BM25; the pool reaches 98.3% of gold instead of 99.4%. Calibration
+ECE 0.00099.
 
 ## `compression_bench.py` — token-efficiency A/B
 

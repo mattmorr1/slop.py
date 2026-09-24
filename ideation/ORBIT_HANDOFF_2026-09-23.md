@@ -290,6 +290,16 @@ zone below p = 0.01 are not shown. Like for like at 8k: 95% of recall, 20% fewer
 tokens, 2.5x precision. The edit zone is exempt (callees rarely co-change but
 are needed).
 
+**R12 — Scaling to Sentry. Done (260f410, 0c64b04, ef6e218).** Sharded
+scip-python (one pass aborted over 8 GB; 312 shards, 10 min, 4.2 GB),
+per-snapshot envelope indexes, hub pruning at fan-in 50 with refit weights.
+Sentry context p95 263 -> 9 ms; adaptive recall at 8k 73.1% -> 76.0%. Open:
+prebuild the per-snapshot indexes (first request 2 s), per-shard incremental
+reindex, capture itself (14.5 s cold on Sentry).
+
+**R13 — Hook output v2. Done (8a78e23).** Write-time provable duplicates,
+reuse suggestions with body and call site, `.slop/hooks.jsonl` logging.
+
 ### Benchmark readiness (claims an outside reviewer accepts)
 
 - **B-conf. Confirmatory repos.** 4–6 repos never used in any choice (incl.
