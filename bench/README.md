@@ -245,6 +245,31 @@ a model how to call things. The untested next hypotheses: file plus envelope
 cross-file items; larger models may use distant signatures that 7–8B models
 ignore.
 
+### Run 2 (pre-registered in 6c08089): does the envelope add anything on top of the file?
+
+Same 100 targets, 6,000-token budget, qwen3:8b and llama3.1:8b. Hybrids show
+the target's file, then other files' items from each ranker.
+
+| arm | reuse | cross-file reuse | invented | mean prompt tokens |
+| --- | ---: | ---: | ---: | ---: |
+| file | 39.0% | 32.2% | 1.6% | 3,825 |
+| file+bm25 | **40.0%** | **33.8%** | 1.1% | 6,227 |
+| file+slop | 37.5% | 30.6% | 1.6% | 5,259 |
+
+| hypothesis | pooled | vigil | verdict |
+| --- | --- | --- | --- |
+| H5 file+slop > file+bm25 | −2.5 [−5.6, +0.3] | −5.3 [−11.1, −0.6] | not supported; worse on vigil |
+| H6 same, cross-file only | −3.2 [−7.2, +1.1] | −8.6 [−15.9, −2.2] | not supported; worse on vigil |
+| H4 file+slop > file | −1.5 [−4.9, +1.8] | −2.0 [−8.3, +3.4] | not supported |
+| H7 invented within 5 of file | +0.0 [−2.2, +2.2] | −2.1 | supported |
+
+Nothing beats the file by a significant margin (file+bm25 − file: +1.0
+[−2.3, +4.3]). Declared confound: the hybrids matched in median tokens but not
+in mean; slop's adaptive threshold showed about 1,000 fewer tokens than BM25's
+fill, so H5 compares less context against more. Across both runs: at 7–8B, on
+implementing a stub, the target's own file carries almost all the usable
+signal, and neither ranker's other-file items add significant reuse.
+
 ## `compression_bench.py` — token-efficiency A/B
 
 Quantifies the deterministic half of the harness thesis (D11): zoned

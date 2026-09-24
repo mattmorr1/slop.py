@@ -271,8 +271,9 @@ equivalences in B3 plus two weeks of advisory logs with no false match.
 **R8 — First end-to-end signal. Done, negative (bench/README.md).**
 Pre-registered (7e52daa). Helper reuse: file 36.4%, slop 30.2%, bm25 28.6%,
 none 15.5%. H1 null, H2 reversed (file beats slop; vigil −17.5), H3 not
-supported. Next: a file-plus-envelope arm and full bodies for high-probability
-cross-file items, pre-registered the same way; larger models.
+supported. Run 2 (6c08089): file+slop vs file+bm25 −2.5 pooled (ns), −5.3 on vigil;
+nothing beats the file significantly. Open: token-matched hybrids (slop
+fill mode), full bodies for cross-file items, models larger than 8B.
 Original item: **First end-to-end signal.** When `matt-pc` is reachable: a small paired
 run (local models) on a RepoReuse-style task set: does the agent reuse the
 helper history says it should? Pre-register hypotheses first.
