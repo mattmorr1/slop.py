@@ -205,6 +205,46 @@ the 0.001–0.01 band (about 2x, so the p = 0.01 threshold is roughly an
 observed 0.5–1%) and the top bin (0.69 predicted, 0.40 observed; 614 pairs).
 The ECE is small mostly because the lowest bin holds two thirds of the pairs.
 
+## `reuse_bench.py` — R8, end to end: does context change helper reuse?
+
+Pre-registered in `bench/R8_PREREGISTRATION.md` (7e52daa) before any
+generation. 100 Python functions (50 vigil, private; 25 flask; 25 httpx)
+gutted to signature, docstring and `raise NotImplementedError` in a reindexed
+copy; four token-matched arms; qwen2.5-coder:7b and llama3.1:8b, greedy, on an
+RTX 2080. Primary metric: the share of the original's repository-internal
+callees the generated function calls. One post-generation change, listed in
+the pre-registration: the extractor dedents before parsing (the first scoring
+miscounted 331 correctly indented methods as unparseable).
+
+### Result (second ledger entry, 200 task x model pairs)
+
+| arm | reuse | invented calls | prompt tokens |
+| --- | ---: | ---: | ---: |
+| none | 15.5% [11.7, 19.4] | 6.3% | 239 |
+| file (the target's file) | **36.4%** [31.3, 41.8] | 1.6% | 3,175 |
+| bm25 skeletons | 28.6% [23.5, 34.0] | 3.7% | 4,210 |
+| slop envelope | 30.2% [25.1, 35.6] | 5.3% | 3,491 |
+
+| hypothesis | paired difference | verdict |
+| --- | --- | --- |
+| H1 slop > bm25 | +1.6 [−3.6, +6.8] | not supported |
+| H2 slop > file | −6.3 [−12.0, −0.8]; vigil −17.5 [−24.4, −10.9] | **reversed** |
+| H3 slop invented <= file + 5 | +3.3 [+0.5, +6.5] | not supported |
+| (slop > none) | +14.7 [+8.9, +20.3] | context helps |
+
+Exploratory, not pre-registered: 53% of the callees live in the target's own
+file. On those, file reaches 43% and slop 31% (slop showed 95 of 121 of them,
+mostly as signatures; file shows every one with its body, i.e. how it is
+called). On cross-file callees no arm exceeds 26% and slop is lowest (19%):
+at 7–8B, models barely use distant signatures.
+
+What it says: B4's recall win does not carry over to this task. The envelope
+is tuned to predict co-change, and co-change recall is not the same as showing
+a model how to call things. The untested next hypotheses: file plus envelope
+(bodies of the file, skeletons beyond), and full bodies for high-probability
+cross-file items; larger models may use distant signatures that 7–8B models
+ignore.
+
 ## `compression_bench.py` — token-efficiency A/B
 
 Quantifies the deterministic half of the harness thesis (D11): zoned

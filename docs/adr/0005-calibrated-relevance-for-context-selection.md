@@ -82,6 +82,10 @@ while httpx, with more history, moves freely (strength 1, +3.5 points, not
 significant). The default was fit partly on these repositories, so "model in
 use" is in-sample for them.
 
-Co-change is a proxy for what an agent needs, not the need itself; an
-end-to-end run (R8) is still required before claiming agents edit better with
-this context.
+Co-change is a proxy for what an agent needs, not the need itself. The first
+end-to-end test (R8, pre-registered, bench/README.md) says the proxy does not
+transfer to implementing a stub with 7–8B models: the envelope ties BM25 on
+helper reuse and loses to simply showing the target's file (−6.3 points
+pooled, −17.5 on vigil), because half the helpers live in that file and the
+file shows how they are called. Until a hybrid (file bodies plus envelope
+beyond) is measured, this ADR's claim is limited to co-change recall.
