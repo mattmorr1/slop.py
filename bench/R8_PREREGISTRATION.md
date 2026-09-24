@@ -79,3 +79,44 @@ reuse in a single generation, not a full agent loop with tools.
    them, which `ast.parse` rejects as "unexpected indent". That is a harness
    bug, identical across arms, so responses are now dedented before parsing.
    The first scoring stays in `bench/results/reuse.jsonl` as the first entry.
+
+---
+
+# Run 2 (pre-registered before its generations)
+
+Run 1 reversed H2: the target's whole file beat the envelope, because half
+the callees live in that file and the file shows how they are called. Run 2
+asks whether the envelope adds anything on top of the file.
+
+## What changes
+
+- Same 100 targets and gutted copies (seeded sampling reproduces them);
+  budget 6,000 tokens, context window 12,288.
+- Arms: `file` (as run 1, now up to 6,000 tokens), `file+bm25` and
+  `file+slop`: the target's file first, then items from *other files only*,
+  in each ranker's order, packed into whatever budget the file leaves.
+  Hybrids are token-matched to each other (medians 6,183 and 6,135); `file`
+  alone uses less (median 3,480), so H5 below is the clean test of slop's
+  selection and H4 is not.
+- Models: qwen3:8b (new; 6.3 GB on the GPU, 25 tok/s) and llama3.1:8b (a
+  second family; qwen2.5-coder and qwen3 are both Qwen). Muse Glimmer 30B was
+  tried and excluded before any generation: its only build that fits this
+  host (bartowski IQ2_XXS via `hf.co`) lacks Ollama's `glimmer` chat renderer
+  and returned three tokens (`to=self`) to a neutral probe, and with 2.7 of
+  9.6 GB on the GPU it generated 3.9 tok/s, about ten hours for this run.
+- Reasoning traces disabled (`think: false`); otherwise as run 1.
+
+## Hypotheses (paired over tasks x models, bootstrap as run 1)
+
+- **H5 (primary): `file+slop` reuse > `file+bm25` reuse.**
+- **H6: `file+slop` cross-file reuse > `file+bm25` cross-file reuse**, where
+  cross-file reuse counts only callees defined outside the target's file
+  (62 of 100 tasks have one).
+- **H4: `file+slop` reuse > `file` reuse** (confounded by extra tokens; a
+  win here without H5 says "more context helps", not "slop helps").
+- **H7: `file+slop` invented-call rate no more than 5 points above `file`.**
+- Decision rule, vigil-alone reporting and treatment of nulls as run 1.
+
+## Changes after run 2's first generation
+
+None yet.

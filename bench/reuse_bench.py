@@ -37,9 +37,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SLOP = Path(os.environ.get("SLOP_BIN", ROOT / "target/release/slop"))
 SEED = 20260923
-BUDGET_TOKENS = 4000
 ADAPTIVE_PPM = 10_000
-ARMS = ("none", "file", "bm25", "slop")
+# Hybrids show the target's file first, then other files' items in the remaining budget.
+ARMS = ("none", "file", "bm25", "slop", "file+bm25", "file+slop")
 WORD = re.compile(r"[A-Za-z][a-z0-9]*|[A-Z]+(?![a-z])|\d+")
 FENCE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.S)
 IGNORE = shutil.ignore_patterns(".git", ".slop", "index.scip", "index.scip.*", "node_modules", ".venv", "venv",
@@ -105,8 +105,18 @@ def skeleton(lines: list[str], node) -> str:
     return "\n".join(parts)
 
 
+def pack(blocks, budget: int) -> list[str]:
+    """Blocks in order, each kept if it still fits; headers count toward the budget."""
+    kept, spent = [], 0
+    for block in blocks:
+        if spent + tokens(block) <= budget:
+            kept.append(block)
+            spent += tokens(block)
+    return kept
+
+
 def prepare(args) -> None:
-    out = args.out
+    out, budget = args.out, args.budget
     out.mkdir(parents=True, exist_ok=True)
     tasks = []
     for spec in args.repo:
@@ -172,7 +182,7 @@ def prepare(args) -> None:
             (copy / file).write_text("\n".join(lines) + "\n")
         subprocess.run([str(SLOP), "index", str(copy)], check=True, stdout=subprocess.DEVNULL)
 
-        gutted_rows = slop_bench(copy, picked, BUDGET_TOKENS, ["--min-probability-ppm", str(ADAPTIVE_PPM), "--with-text"])
+        gutted_rows = slop_bench(copy, picked, budget, ["--min-probability-ppm", str(ADAPTIVE_PPM), "--with-text"])
         envelopes = {row["target"]: row for row in gutted_rows if "items" in row}
         gutted_catalog = {e["entity"]: e for e in gutted_rows[0]["catalog"]}
         gutted_trees, gutted_text = {}, {}
@@ -215,7 +225,7 @@ def prepare(args) -> None:
                 elif isinstance(stmt, (ast.Assign, ast.AnnAssign)):
                     for target in (stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]):
                         top_level |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
-            window = BUDGET_TOKENS * 4
+            window = budget * 4
             if len(text) <= window:
                 file_context = text
             else:
@@ -224,30 +234,29 @@ def prepare(args) -> None:
                 file_context = text[lo: lo + window]
             ranked = sorted(((score, e) for e, score in index.scores(WORD.findall(stub.lower())).items() if e != entity),
                             key=lambda pair: (-pair[0], pair[1]))
-            bm25_items, spent = [], 0
-            for _, other in ranked:
-                block = f"# {gutted_catalog[other]['file']} ({other})\n{skeletons[other]}\n"
-                if spent + tokens(block) <= BUDGET_TOKENS:
-                    bm25_items.append(block)
-                    spent += tokens(block)
+            bm25_blocks = [(gutted_catalog[o]["file"], f"# {gutted_catalog[o]['file']} ({o})\n{skeletons[o]}\n") for _, o in ranked]
             # Same packing rule as bm25: headers count, items kept in the envelope's own order.
-            slop_items, spent = [], 0
-            for item in (i for i in envelopes[entity]["items"] if i["entity"] != entity):
-                block = f"# {gutted_catalog.get(item['entity'], {}).get('file', '?')} ({item['entity']})\n{item['text']}\n"
-                if spent + tokens(block) <= BUDGET_TOKENS:
-                    slop_items.append(block)
-                    spent += tokens(block)
+            slop_blocks = [(gutted_catalog.get(i["entity"], {}).get("file", "?"),
+                            f"# {gutted_catalog.get(i['entity'], {}).get('file', '?')} ({i['entity']})\n{i['text']}\n")
+                           for i in envelopes[entity]["items"] if i["entity"] != entity]
+            file_block = f"\nCurrent contents of {file} (the function is a stub):\n{file_context}\n"
+            rest = max(0, budget - tokens(file_block))
+            elsewhere = lambda blocks: "".join(pack((b for f, b in blocks if f != file), rest))
             header = f"Repository: {name}. File: {file}\nImports at the top of the file:\n{imports}\n"
             blocks = {
                 "none": "",
-                "file": f"\nCurrent contents of {file} (the function is a stub):\n{file_context}\n",
-                "bm25": "\nRelated code from the repository:\n" + "".join(bm25_items),
-                "slop": "\nRelated code from the repository:\n" + "".join(slop_items),
+                "file": file_block,
+                "bm25": "\nRelated code from the repository:\n" + "".join(pack((b for _, b in bm25_blocks), budget)),
+                "slop": "\nRelated code from the repository:\n" + "".join(pack((b for _, b in slop_blocks), budget)),
+                "file+bm25": file_block + "\nRelated code from other files:\n" + elsewhere(bm25_blocks),
+                "file+slop": file_block + "\nRelated code from other files:\n" + elsewhere(slop_blocks),
             }
             prompts = {arm: f"{header}{block}\n{INSTRUCTION}\n\n```python\n{stub}\n```\n" for arm, block in blocks.items()}
             tasks.append({
                 "id": f"{name}:{entity}", "repo": name, "target": entity, "name": node.name, "file": file,
                 "callees": callees[entity], "callee_names": sorted({simple(c) for c in callees[entity]}),
+                "cross_file_names": sorted({simple(c) for c in callees[entity] if catalog[c]["file"] != file}),
+                "budget": budget,
                 "allowed": sorted(repo_names | top_level),
                 "prompts": prompts, "prompt_tokens": {arm: tokens(p) for arm, p in prompts.items()},
             })
@@ -283,11 +292,13 @@ def generate(args) -> None:
     if args.out.exists():
         done = {(r["id"], r["arm"], r["model"]) for r in map(json.loads, args.out.read_text().splitlines())}
     tasks = [json.loads(line) for line in args.tasks.read_text().splitlines()]
-    todo = [(t, arm) for t in tasks for arm in ARMS if (t["id"], arm, args.model) not in done]
+    arms = args.arms.split(",")
+    todo = [(t, arm) for t in tasks for arm in arms if (t["id"], arm, args.model) not in done]
     with args.out.open("a") as out:
         for n, (task, arm) in enumerate(todo):
-            body = json.dumps({"model": args.model, "prompt": task["prompts"][arm], "stream": False,
-                               "options": {"temperature": 0, "seed": 0, "num_ctx": 8192, "num_predict": 768}})
+            # Reasoning traces off: they spend the output budget and are not the answer.
+            body = json.dumps({"model": args.model, "prompt": task["prompts"][arm], "stream": False, "think": False,
+                               "options": {"temperature": 0, "seed": 0, "num_ctx": args.num_ctx, "num_predict": 768}})
             request = urllib.request.Request(f"{args.host}/api/generate", data=body.encode(),
                                              headers={"Content-Type": "application/json"})
             started = time.time()
@@ -358,59 +369,71 @@ def score(args) -> None:
     for out in outputs:
         task = tasks[out["id"]]
         node = generated_function(out["response"], task["name"])
+        cross = task.get("cross_file_names", [])
         if node is None:
-            rows[(out["model"], out["id"], out["arm"])] = {"reuse": 0.0, "invented": None, "parse_error": True}
+            rows[(out["model"], out["id"], out["arm"])] = {"reuse": 0.0, "cross": 0.0 if cross else None, "invented": None, "parse_error": True}
             continue
         bare, any_name = calls(node)
-        reuse = sum(name in any_name for name in task["callee_names"]) / len(task["callee_names"])
         allowed = set(task["allowed"]) | builtin_names | bound(node)
-        rows[(out["model"], out["id"], out["arm"])] = {"reuse": reuse, "invented": bool(bare - allowed), "parse_error": False}
+        rows[(out["model"], out["id"], out["arm"])] = {
+            "reuse": sum(name in any_name for name in task["callee_names"]) / len(task["callee_names"]),
+            "cross": sum(name in any_name for name in cross) / len(cross) if cross else None,
+            "invented": bool(bare - allowed), "parse_error": False}
+    arms = [arm for arm in ARMS if any(key[2] == arm for key in rows)]
     models = sorted({key[0] for key in rows})
     repos = sorted({t["repo"] for t in tasks.values()})
-    complete = [(m, i) for m in models for i in tasks if all((m, i, arm) in rows for arm in ARMS)]
+    complete = [(m, i) for m in models for i in tasks if all((m, i, arm) in rows for arm in arms)]
     missing = len(models) * len(tasks) - len(complete)
+    compare = [pair.split(":") for pair in args.compare]
+    invented_compare = [pair.split(":") for pair in args.invented]
 
     def select(model=None, repo=None):
         return [(m, i) for m, i in complete if (model is None or m == model) and (repo is None or tasks[i]["repo"] == repo)]
+
+    def paired(keys, a, b, metric):
+        values = [(rows[(m, i, a)][metric], rows[(m, i, b)][metric]) for m, i in keys]
+        return bootstrap([float(x) - float(y) for x, y in values if x is not None and y is not None])
 
     results = {}
     scopes = [("pooled", None, None)] + [(f"repo={r}", None, r) for r in repos] + [(f"model={m}", m, None) for m in models]
     for label, model, repo in scopes:
         keys = select(model, repo)
         entry = {"tasks": len(keys)}
-        for arm in ARMS:
+        for arm in arms:
             entry[arm] = {
                 "reuse": bootstrap([rows[(m, i, arm)]["reuse"] for m, i in keys]),
+                "cross_file_reuse": bootstrap([rows[(m, i, arm)]["cross"] for m, i in keys if rows[(m, i, arm)]["cross"] is not None]),
                 "invented": bootstrap([float(rows[(m, i, arm)]["invented"]) for m, i in keys if rows[(m, i, arm)]["invented"] is not None]),
                 "parse_errors": sum(rows[(m, i, arm)]["parse_error"] for m, i in keys),
                 "prompt_tokens": sum(tasks[i]["prompt_tokens"][arm] for _, i in keys) / max(1, len(keys)),
             }
-        for other in ("bm25", "file", "none"):
-            entry[f"slop_minus_{other}_reuse"] = bootstrap([rows[(m, i, "slop")]["reuse"] - rows[(m, i, other)]["reuse"] for m, i in keys])
-        both = [(m, i) for m, i in keys if rows[(m, i, "slop")]["invented"] is not None and rows[(m, i, "file")]["invented"] is not None]
-        entry["slop_minus_file_invented"] = bootstrap([float(rows[(m, i, "slop")]["invented"]) - float(rows[(m, i, "file")]["invented"]) for m, i in both])
+        for a, b in compare:
+            entry[f"{a}_minus_{b}_reuse"] = paired(keys, a, b, "reuse")
+            entry[f"{a}_minus_{b}_cross_file_reuse"] = paired(keys, a, b, "cross")
+        for a, b in invented_compare:
+            entry[f"{a}_minus_{b}_invented"] = paired(keys, a, b, "invented")
         results[label] = entry
 
     pct = lambda e: f"{e[0] * 100:5.1f}% [{e[1] * 100:.1f}, {e[2] * 100:.1f}]"
     diff = lambda e: f"{e[0] * 100:+5.1f} [{e[1] * 100:+.1f}, {e[2] * 100:+.1f}]"
     for label, entry in results.items():
         print(f"\n{label} ({entry['tasks']} task x model pairs)")
-        print("| arm | reuse | invented calls | parse errors | prompt tokens |")
-        print("| --- | ---: | ---: | ---: | ---: |")
-        for arm in ARMS:
-            a = entry[arm]
-            print(f"| {arm} | {pct(a['reuse'])} | {pct(a['invented'])} | {a['parse_errors']} | {a['prompt_tokens']:.0f} |")
-        print(f"H1 slop - bm25 reuse   {diff(entry['slop_minus_bm25_reuse'])}")
-        print(f"H2 slop - file reuse   {diff(entry['slop_minus_file_reuse'])}")
-        print(f"H3 slop - file invented {diff(entry['slop_minus_file_invented'])} (margin +5)")
-        print(f"   slop - none reuse   {diff(entry['slop_minus_none_reuse'])}")
+        print("| arm | reuse | cross-file reuse | invented calls | parse errors | prompt tokens |")
+        print("| --- | ---: | ---: | ---: | ---: | ---: |")
+        for arm in arms:
+            x = entry[arm]
+            print(f"| {arm} | {pct(x['reuse'])} | {pct(x['cross_file_reuse'])} | {pct(x['invented'])} | {x['parse_errors']} | {x['prompt_tokens']:.0f} |")
+        for a, b in compare:
+            print(f"{a} - {b}: reuse {diff(entry[f'{a}_minus_{b}_reuse'])}, cross-file {diff(entry[f'{a}_minus_{b}_cross_file_reuse'])}")
+        for a, b in invented_compare:
+            print(f"{a} - {b}: invented {diff(entry[f'{a}_minus_{b}_invented'])} (margin +5)")
     if missing:
         print(f"\n{missing} (task, model) pairs lack an arm and were left out", file=sys.stderr)
-    manifest = {"bench": "reuse", "label": "pre-registered (bench/R8_PREREGISTRATION.md)",
+    manifest = {"bench": "reuse", "label": f"pre-registered (bench/R8_PREREGISTRATION.md), {args.run}",
                 "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "commit": subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip(),
                 "tasks_digest": hashlib.sha256(args.tasks.read_bytes()).hexdigest(),
-                "models": models, "python": platform.python_version(), "missing_pairs": missing}
+                "arms": arms, "models": models, "python": platform.python_version(), "missing_pairs": missing}
     ledger = ROOT / "bench/results/reuse.jsonl"
     with ledger.open("a") as handle:
         handle.write(json.dumps({"manifest": manifest, "results": results}) + "\n")
@@ -423,14 +446,20 @@ def main() -> None:
     p = sub.add_parser("prepare")
     p.add_argument("--repo", action="append", required=True, help="NAME=PATH:COUNT")
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--budget", type=int, default=4000)
     g = sub.add_parser("generate")
     g.add_argument("--tasks", type=Path, required=True)
     g.add_argument("--model", required=True)
     g.add_argument("--out", type=Path, required=True)
     g.add_argument("--host", default="http://127.0.0.1:11434")
+    g.add_argument("--arms", default="none,file,bm25,slop")
+    g.add_argument("--num-ctx", type=int, default=8192)
     s = sub.add_parser("score")
     s.add_argument("--tasks", type=Path, required=True)
     s.add_argument("--outputs", type=Path, nargs="+", required=True)
+    s.add_argument("--run", default="run 1")
+    s.add_argument("--compare", nargs="*", default=["slop:bm25", "slop:file", "slop:none"], help="A:B reuse differences")
+    s.add_argument("--invented", nargs="*", default=["slop:file"], help="A:B invented-call differences")
     args = parser.parse_args()
     {"prepare": prepare, "generate": generate, "score": score}[args.stage](args)
 
