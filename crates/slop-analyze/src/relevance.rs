@@ -36,9 +36,10 @@ pub const FEATURES: [&str; 12] = [
     "lexical",
 ];
 
-/// Pooled fit over all four B4 repositories (`context_bench.py --fit-all`, seed 20260923).
-const DEFAULT_WEIGHTS: [f64; 12] = [-10.089905, 1.058608, -0.052743, -0.289739, -0.102246, 7.386445, 3.384232, -0.445707, -0.036352, 0.523504, -6.174921, 0.882961];
-const DEFAULT_SOURCE: &str = "B4 pooled: vigil@01511904, requests@611c6162, flask@d73fa1cd, httpx@b5addb6";
+/// Pooled fit over all four B4 repositories (`context_bench.py --fit-all`, seed 20260923),
+/// with distances that stop at hubs (`HUB_FAN_IN`).
+const DEFAULT_WEIGHTS: [f64; 12] = [-8.453006, 1.771275, 1.137742, 0.177585, -0.493799, 5.887282, 2.158233, -0.433357, -0.324541, 0.648897, -5.979678, 0.622439];
+const DEFAULT_SOURCE: &str = "B4 pooled: vigil@01511904, requests@611c6162, flask@d73fa1cd, httpx@b5addb6; hub fan-in 50";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RelevanceModel {
@@ -269,7 +270,7 @@ mod tests {
             lexical: 20.0,
             ..Features::default()
         };
-        assert_eq!(RelevanceModel::default_model().probability_ppm(&features).0, 613_426);
+        assert_eq!(RelevanceModel::default_model().probability_ppm(&features).0, 595269);
     }
 
     #[test]

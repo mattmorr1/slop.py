@@ -24,6 +24,10 @@ use crate::source::{entity_for, location_index, FileFacts};
 /// Graph hops a candidate may be from the target (the model's distance features).
 const MAX_HOPS: usize = 4;
 
+/// A node referenced by more than this many others is reached but not walked through:
+/// hubs (logging, auth, base models) put 59% of Sentry within four hops. B4 recall rose.
+const HUB_FAN_IN: usize = 50;
+
 /// Candidates outside the edit zone below this probability are never shown, so the
 /// budget is a cap. B4 at 8k: 95% of fill-the-budget recall, 20% fewer tokens.
 pub const DEFAULT_MIN_PROBABILITY_PPM: u32 = 10_000;
@@ -236,7 +240,8 @@ fn estimate_tokens(text: &str) -> usize {
 }
 
 /// Multi-source BFS over proximity edges (Contains/Calls/Imports, undirected):
-/// distance from each node to its *nearest* start, for nodes within `max_hops`. Shared by the envelope
+/// distance from each node to its *nearest* start, for nodes within `max_hops`,
+/// never continuing through a hub (incoming Calls/Imports above [`HUB_FAN_IN`]). Shared by the envelope
 /// (one start = the edit target) and `compress` (many starts = the edit zone).
 pub(crate) fn proximity_distances(
     built: &BuiltGraph,
@@ -253,7 +258,8 @@ pub(crate) fn proximity_distances(
     }
     while let Some(n) = queue.pop_front() {
         let d = dist[&n];
-        if d >= max_hops {
+        let fan_in = || graph.edges_directed(n, Direction::Incoming).filter(|e| matches!(e.weight(), EdgeKind::Calls | EdgeKind::Imports)).count();
+        if d >= max_hops || (d > 0 && fan_in() > HUB_FAN_IN) {
             continue;
         }
         let mut neighbors = Vec::new();
@@ -575,6 +581,32 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_walk_reaches_a_hub_but_does_not_pass_through_it() {
+        let mut built = crate::build::BuiltGraph { graph: slop_graph::CodeGraph::new(), by_symbol: HashMap::new(), referenced: HashSet::new() };
+        let entity = |id: &str| slop_graph::CodeEntity {
+            id: id.to_string(),
+            entity_type: NodeType::Function,
+            name: id.to_string(),
+            signature: String::new(),
+            docstring: None,
+            file: format!("{id}.py"),
+            source_range: (0, 1),
+            body_hash: String::new(),
+            effect_signature: Default::default(),
+        };
+        let (target, hub, beyond) = (built.graph.add_entity(entity("target")), built.graph.add_entity(entity("hub")), built.graph.add_entity(entity("beyond")));
+        built.graph.add_edge(target, hub, EdgeKind::Calls);
+        for i in 0..=HUB_FAN_IN {
+            let caller = built.graph.add_entity(entity(&format!("caller{i}")));
+            built.graph.add_edge(caller, hub, EdgeKind::Calls);
+        }
+        built.graph.add_edge(beyond, hub, EdgeKind::Calls);
+        let dist = proximity_distances(&built, &[target], MAX_HOPS);
+        assert_eq!(dist.get(&hub), Some(&1), "the hub itself is a candidate");
+        assert_eq!(dist.get(&beyond), None, "nothing is reached through it");
+    }
+
     use super::*;
     use crate::{build, effects, source};
     use slop_resolve::{Resolver, ScipResolver};
