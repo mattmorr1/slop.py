@@ -7,7 +7,7 @@
 
 mod scip_backend;
 
-pub use scip_backend::ScipResolver;
+pub use scip_backend::{merge_shards, ScipResolver};
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

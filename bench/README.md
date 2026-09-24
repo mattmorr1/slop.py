@@ -270,6 +270,27 @@ fill, so H5 compares less context against more. Across both runs: at 7–8B, on
 implementing a stub, the target's own file carries almost all the usable
 signal, and neither ranker's other-file items add significant reuse.
 
+## Scaling: Sentry (2026-09-24)
+
+getsentry/sentry at 67610b2a (shallow clone): 8,206 Python and 9,463
+TypeScript files, 109,564 entities, 7.4x vigil. M1 Pro, 16 GB.
+
+| | vigil | Sentry |
+| --- | ---: | ---: |
+| index (Python) | 40 s, one pass | single pass: **aborts** (V8 heap, >8 GB); sharded: 10 min, 312 shards x 4, peak 4.2 GB |
+| cold capture | 0.55 s | 14.5 s, 3.3 GB |
+| context p95, adaptive / fill | 21 / 38 ms | 154 / 292 ms (first call 1.9 s: lazy BM25 build) |
+| graph within 4 hops of a target (median) | — | **64,558 entities, 59% of the repo** |
+
+- One Pyright pass cannot index a repo this size in 8 GB; sharding by
+  directory (`--target-only`, merged with repo-relative paths, each file kept
+  by exactly one shard) indexes it at half the memory.
+- Latency grows about linearly, but the candidate pool is the real limit: hub
+  functions put most of the repo within four hops, so distances 3 and 4 stop
+  discriminating and every request scores ~60k candidates. Next: stop the
+  proximity walk at hubs (high-degree nodes are shared vocabulary, as common
+  words are for BM25), validated by a B4 rerun.
+
 ## `compression_bench.py` — token-efficiency A/B
 
 Quantifies the deterministic half of the harness thesis (D11): zoned

@@ -22,6 +22,13 @@ use slop_parse::Language;
 
 pub const SCIP_PYTHON_PACKAGE: &str = "@sourcegraph/scip-python@0.6.6";
 pub const SCIP_TYPESCRIPT_PACKAGE: &str = "@sourcegraph/scip-typescript@0.4.0";
+/// V8 heap ceiling for the Node indexers, in MB.
+const NODE_HEAP_MB: u32 = 8192;
+/// Above this many Python sources scip-python runs per directory shard: a single
+/// Pyright pass over Sentry (8k files) exhausted an 8 GB heap; one shard took 1.6 GB.
+const SHARD_ABOVE: usize = 3000;
+const SHARD_MAX: usize = 1500;
+const MAX_LOOSE_TARGETS: usize = 64;
 
 /// The SCIP indexer for a language. slop's graph/effect detectors consume any
 /// SCIP index; picking the right indexer per repo is all the multi-language
@@ -484,7 +491,13 @@ fn run_indexer_over(
     }
     let mut stamp = stamp_for(repo, files, indexer)?;
     let staged = sibling(out, ".partial");
-    let outcome = invoke(indexer, repo, &staged, project)
+    let python: Vec<&str> = files.iter().map(String::as_str).filter(|f| indexer == Indexer::Python && indexer.covers(f)).collect();
+    let run = if python.len() > SHARD_ABOVE {
+        invoke_python_shards(repo, &staged, project, &python)
+    } else {
+        invoke(indexer, repo, &staged, project)
+    };
+    let outcome = run
         .and_then(|()| validate(&staged, stamp.files.len()))
         .and_then(|()| {
             std::fs::rename(&staged, out).with_context(|| format!("installing {}", out.display()))
@@ -503,11 +516,96 @@ fn run_indexer_over(
     }
 }
 
+/// Directory targets of at most [`SHARD_MAX`] files where splitting helps; the few
+/// files directly inside a split directory become single-file targets. A directory
+/// with many loose files stays one shard: a run per file would cost more than it saves.
+fn python_shards(files: &[&str]) -> Vec<String> {
+    fn plan(prefix: &str, files: Vec<&str>, out: &mut Vec<String>) {
+        let whole = || if prefix.is_empty() { ".".to_string() } else { prefix.to_string() };
+        let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let mut loose = Vec::new();
+        for &file in &files {
+            let rest = if prefix.is_empty() { file } else { &file[prefix.len() + 1..] };
+            match rest.split_once('/') {
+                Some((child, _)) => children.entry(child).or_default().push(file),
+                None => loose.push(file),
+            }
+        }
+        if files.len() <= SHARD_MAX || loose.len() > MAX_LOOSE_TARGETS || children.is_empty() {
+            out.push(whole());
+            return;
+        }
+        out.extend(loose.into_iter().map(str::to_string));
+        for (child, files) in children {
+            plan(&if prefix.is_empty() { child.to_string() } else { format!("{prefix}/{child}") }, files, out);
+        }
+    }
+    let mut out = Vec::new();
+    plan("", files.to_vec(), &mut out);
+    out
+}
+
+/// scip-python once per shard, a few at a time, merged into one repo-relative index.
+fn invoke_python_shards(repo: &Path, out: &Path, project: &str, files: &[&str]) -> Result<()> {
+    let targets = python_shards(files);
+    let dir = sibling(out, ".shards");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    // A shard peaks near 1.6 GB (Sentry); four fit a 16 GB machine.
+    let workers = std::thread::available_parallelism().map_or(1, usize::from).div_ceil(2).clamp(1, 4);
+    eprintln!("scip-python: {} files in {} shards, {workers} at a time", files.len(), targets.len());
+    let failures: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut failed = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(target) = targets.get(i) else { return failed };
+                        let heap = format!("--max-old-space-size={NODE_HEAP_MB}");
+                        let status = Process::new("npx")
+                            .arg("--yes")
+                            .args([SCIP_PYTHON_PACKAGE, "index"])
+                            .arg(repo)
+                            .args(["--project-name", project, "--project-version", "0", "--quiet", "--target-only", target, "--output"])
+                            .arg(dir.join(format!("{i}.scip")))
+                            .current_dir(repo)
+                            .env("NODE_OPTIONS", std::env::var("NODE_OPTIONS").ok().filter(|o| o.contains("--max-old-space-size")).unwrap_or(heap))
+                            .stdout(std::io::stderr())
+                            .status();
+                        match status {
+                            Ok(status) if status.success() => {}
+                            Ok(status) => failed.push(format!("{target}: exited with {status}")),
+                            Err(error) => failed.push(format!("{target}: {error}")),
+                        }
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|handle| handle.join().expect("shard worker panicked")).collect()
+    });
+    if !failures.is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
+        bail!("{} of {} scip-python shards failed: {}", failures.len(), targets.len(), failures.join("; "));
+    }
+    let parts: Vec<(PathBuf, String)> = targets.iter().enumerate().map(|(i, t)| (dir.join(format!("{i}.scip")), t.clone())).collect();
+    let root = format!("file://{}", repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf()).display());
+    let merged = slop_resolve::merge_shards(&parts, &root, out);
+    std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+    merged.map(|documents| eprintln!("scip-python: merged {documents} documents"))
+}
+
 fn invoke(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> Result<()> {
     let mut inferred_config = None;
     let npx = || {
         let mut cmd = Process::new("npx");
         cmd.arg("--yes");
+        // Pyright on a large repo (8k+ files) exhausts V8's default heap and aborts;
+        // the limit is a ceiling, not a reservation. A size the user set wins.
+        let options = std::env::var("NODE_OPTIONS").unwrap_or_default();
+        if !options.contains("--max-old-space-size") {
+            cmd.env("NODE_OPTIONS", format!("{options} --max-old-space-size={NODE_HEAP_MB}").trim());
+        }
         cmd
     };
     let (tool, install_hint, mut cmd) = match indexer {
@@ -564,13 +662,30 @@ fn invoke(indexer: Indexer, repo: &Path, out: &Path, project: &str) -> Result<()
     }
     let status = status?;
     if !status.success() {
-        bail!("{tool} exited with {status}");
+        let hint = if indexer == Indexer::Rust { "" } else { " (a Node indexer aborting is usually heap exhaustion: raise NODE_OPTIONS=--max-old-space-size)" };
+        bail!("{tool} exited with {status}{hint}");
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn python_shards_split_only_what_is_too_big() {
+        let mut files: Vec<String> = (0..1600).map(|i| format!("src/big/m{i}.py")).collect();
+        files.extend((0..10).map(|i| format!("src/small/s{i}.py")));
+        files.push("src/loose.py".into());
+        files.push("setup.py".into());
+        let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        let mut shards = super::python_shards(&refs);
+        shards.sort();
+        // The root and `src` split; `src/big` is over the limit but flat, so it stays one
+        // shard rather than 1,600 single-file runs.
+        assert_eq!(shards, ["setup.py", "src/big", "src/loose.py", "src/small"]);
+        let small: Vec<&str> = vec!["a/x.py", "b/y.py"];
+        assert_eq!(super::python_shards(&small), vec!["."], "a repo under the limit is one shard");
+    }
+
     use super::*;
 
     fn temp_repo(tag: &str) -> PathBuf {

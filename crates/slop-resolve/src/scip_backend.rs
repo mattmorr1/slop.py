@@ -24,6 +24,59 @@ fn is_local(symbol: &str) -> bool {
     symbol.starts_with("local ")
 }
 
+/// Merge SCIP shards whose document paths are relative to a subdirectory (a
+/// `--target-only` run) into one index with repo-relative paths. Each part is
+/// (shard file, its target relative to the repo). A shard also emits files it
+/// merely touched (`../x.py`); only documents inside its own target are kept, so
+/// every file comes from exactly one shard. Returns the document count.
+pub fn merge_shards(parts: &[(std::path::PathBuf, String)], project_root: &str, out: &Path) -> Result<usize> {
+    let mut merged = scip::types::Index::new();
+    let mut external = std::collections::HashSet::new();
+    for (path, target) in parts {
+        let bytes = std::fs::read(path).with_context(|| format!("reading SCIP shard {}", path.display()))?;
+        let mut shard = scip::types::Index::parse_from_bytes(&bytes)
+            .with_context(|| format!("parsing SCIP shard {}", path.display()))?;
+        if merged.metadata.is_none() {
+            merged.metadata = std::mem::take(&mut shard.metadata);
+        }
+        let target = target.trim_matches('/').trim_start_matches("./");
+        let target = if target == "." { "" } else { target };
+        for mut document in shard.documents.drain(..) {
+            let joined = if target.is_empty() { document.relative_path.clone() } else { format!("{target}/{}", document.relative_path) };
+            let Some(relative) = normalize(&joined) else { continue };
+            let owned = target.is_empty() || relative == target || relative.starts_with(&format!("{target}/"));
+            if owned {
+                document.relative_path = relative;
+                merged.documents.push(document);
+            }
+        }
+        merged.external_symbols.extend(shard.external_symbols.drain(..).filter(|symbol| external.insert(symbol.symbol.clone())));
+    }
+    if let Some(metadata) = merged.metadata.as_mut() {
+        metadata.project_root = project_root.to_string();
+    }
+    let count = merged.documents.len();
+    std::fs::write(out, merged.write_to_bytes().context("encoding merged SCIP index")?)
+        .with_context(|| format!("writing {}", out.display()))?;
+    Ok(count)
+}
+
+/// Resolve `.` and `..` segments; None if the path climbs above its root.
+fn normalize(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+
 impl ScipResolver {
     pub fn load(index_path: &Path) -> Result<Self> {
         let bytes = std::fs::read(index_path)
@@ -218,4 +271,14 @@ fn display_name(symbol: &str, provided: &str) -> String {
         .unwrap_or(symbol)
         .trim_end_matches('.')
         .to_string()
+}
+
+#[cfg(test)]
+mod merge_tests {
+    #[test]
+    fn normalize_resolves_segments_and_rejects_escapes() {
+        assert_eq!(super::normalize("src/a.py/../runner/main.py").as_deref(), Some("src/runner/main.py"));
+        assert_eq!(super::normalize("./x/./y.py").as_deref(), Some("x/y.py"));
+        assert_eq!(super::normalize("../outside.py"), None);
+    }
 }
