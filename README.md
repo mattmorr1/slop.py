@@ -1,65 +1,37 @@
 # slop
 
-A **codebase-relative AI-slop analyzer** for Python, JavaScript/TypeScript and
-Rust, plus an agent harness that steers a coding agent away from slop as it
-writes.
+A static analyzer for Python, TypeScript/JavaScript and Rust that judges code
+against the repository it lives in, plus a harness that feeds those judgments to
+a coding agent while it writes.
 
-Most linters judge a file against absolute rules. `slop` judges code against
-*the codebase it lives in*: it builds an effect-typed graph of the whole repo
-and flags the things that make AI-generated code rot — reimplementing something
-that already exists, bypassing the infrastructure everyone else routes through,
-hallucinated dead code, functions whose names lie about what they do, and
-tangled control flow — then either fixes them mechanically or hands an agent
-precise, located guidance.
+It builds a graph of the repo from a [SCIP](https://github.com/sourcegraph/scip)
+index, tags each function with the effects it performs (net, fs, db, env), and
+flags reimplementations, bypassed infrastructure, dead code, misleading names
+and tangled control flow.
 
-> Status: **v0**, built on a SCIP index. The
-> detectors and harness are dogfooded on real repos (see below); the
-> token/quality *value* of the read-path harness is measured but not yet
-> rigorously proven. See [Limitations](#limitations).
+Status: v0. The detectors are dogfooded on real repositories.
 
 ## Install
 
-Release archives contain one binary for Linux/macOS on x86-64/ARM64, plus a
-checksum, README, and license. Building from source requires a recent Rust
-toolchain. Python/TypeScript indexing also requires `npx`; Rust uses
+Needs a recent Rust toolchain. Indexing Python/TypeScript needs `npx`; Rust needs
 `rust-analyzer`.
 
 ```sh
-cargo install --path crates/slop
-# or, without installing:
-cargo build --release                # -> target/release/slop
+cargo install --path crates/slop     # or: cargo build --release
 ```
 
-The crates.io package is `slop-cli` (the binary remains `slop`); once the
-0.1.0 publish workflow completes, install it with `cargo install slop-cli`.
+## Usage
 
-## Quickstart
-
-`slop` reads a [SCIP](https://github.com/sourcegraph/scip) index of your repo.
-Generate one, then check:
+Every command takes an optional repo path and defaults to the current directory.
 
 ```sh
-slop setup              # choose Claude/Codex and an editor; install the harness
-slop doctor             # verify host, editor, harness, project, and index state
-slop index              # indexes every detected language family
-slop check              # judges the working-tree diff vs HEAD (cwd)
-slop analyze --all      # visible alias for whole-repository analysis
-slop check --all        # audits the whole repo
-slop check --reindex    # regenerate the index first (else a stale one warns)
-slop check --json       # machine-readable output for editors / CI
+slop index              # SCIP index for each detected language
+slop check              # findings in the working-tree diff vs HEAD
+slop check --all        # whole repo
+slop check --json       # for editors and CI
+slop gate               # exit non-zero on blocking findings, JSON verdict
+slop dash               # TUI: browse, fix, dispatch to an agent, re-verify
 ```
-
-Every command defaults its repo argument to the current directory. (`slop index`
-wraps pinned `scip-python` 0.6.6, pinned `scip-typescript` 0.4.0, or
-`rust-analyzer scip`, detected from the source tree; polyglot repositories get
-one artifact per language and one combined graph. `--indexer` or `--index`
-retains the single-artifact seam. A broken/empty index fails loudly
-rather than silently passing.)
-
-Every machine-readable judgment names the immutable repository snapshot and its
-freshness. CLI, gate, MCP, LSP, TUI, baseline, and fix all project from that
-same evaluated finding population; refreshing the dashboard swaps its graph and
-findings together.
 
 ```
 WARNING (1)
@@ -72,171 +44,110 @@ WARNING (1)
 health: 84/100
 ```
 
-Findings are grouped by severity and colorized on a terminal (piping stays
-plain; `NO_COLOR` is honored). Every run ends with a **health score** (0–100),
-and `slop check` exits non-zero when anything is *Blocking*.
+A stale index is regenerated rather than trusted (`--reindex` forces it). Every
+JSON result names the repository snapshot it was computed from.
 
-### Interactive dashboard
+## Rules
 
-Run `slop dash [repo]` to open the optional full-screen TUI. Bare `slop` prints
-the command surface, so setup and scanning remain discoverable without learning
-dashboard keybindings first.
-
-- browse the whole-repo audit with the arrow keys; each finding's fix guidance
-  shows in a detail pane
-- **`Enter`** opens the selected finding in your editor at its line
-  (`$SLOP_EDITOR`, else `cursor`/`code`)
-- **`x`** applies the mechanical repair when the finding is auto-fixable
-  (over-commenting / naming) — deterministic, no LLM
-- **`a`** dispatches the finding to **Claude Code** (headless, `acceptEdits`)
-  seeded with its fix guidance — for the semantic findings the mechanical fixer
-  can't touch. Both `x` and `a` then reindex + gate to verify the finding
-  actually cleared, so *every* finding has a fix path from the dashboard
-- **`e`** opens the **graph explorer** on the selected finding: its effect
-  signature and 1-hop edges (what it calls / imports, and who calls it) from the
-  SCIP graph. `Enter` jumps focus to a neighbor, `Backspace` goes back — walk the
-  call graph to understand code, not just lint it
-- **`y`** copies the selected finding's full detail (rule, entity, `file:line`,
-  message, fix) to the clipboard — no fighting the terminal's row-wise mouse
-  selection to grab multiline text out of the detail box
-- **`v`** verifies: runs `slop gate` and shows a PASS/FAIL verdict panel with
-  the health + failing/blocking counts — the CI check, in place
-- **`c`** opens a command palette to run any slop command — re-index, check,
-  fix, baseline, init policy, install harness, gate, run the project's tests —
-  after which the dashboard reloads and the status shows the `blocking N→M ·
-  health A→B` delta, so you watch the finding actually clear (the verification
-  loop)
-- **`f`** filters by severity, **`g`** toggles grandfathered findings, **`r`**
-  reloads
-
-Health is scored two ways — everything vs. only un-grandfathered — so a
-baselined repo doesn't look falsely pristine.
-
-## What it flags
-
-| Rule | Severity | What it catches |
+| Rule | Severity | Flags |
 | --- | --- | --- |
-| `infra-bypass` | Blocking | Acquiring a raw effect (net/fs/db/env) directly when the codebase routes that effect through a sanctioned channel |
-| `circular-import` | Blocking | Import cycles (Tarjan SCC over the import graph) |
-| `effect-layer-violation` | Warning | An entity in a declared layer directly does an effect that layer forbids (e.g. DB/net in a `pure-utils` or presentation layer) |
-| `effect-creep` | Blocking | A function that was **pure** at `slop baseline` time now performs I/O — a purity regression (delta vs baseline) |
-| `duplicate-exact` | Warning | Functions with identical bodies (modulo comments/whitespace) |
-| `duplicate-equivalent` | Warning | Python functions provably equal up to renaming and sound rewrite laws (a ternary vs. its `if`, a negated test with swapped branches, a single-use temporary): an identity, not a similarity score (ADR 0004) |
-| `duplicate-structural` | Advisory → Warning | Same control-flow shape, renamed vars/literals — a *candidate*; `--tier3` promotes ones an LLM judge confirms |
-| `parallel-implementation` | Advisory | Functions calling the same *distinctive* set of things while sharing no code — one job implemented twice, in different words. Duplication found on graph shape, where the `duplicate-*` rules find it on token shape |
-| `complexity-spike` | Warning | Genuinely tangled functions — deep nesting or many independent branches, not just a fat boolean guard |
-| `purity-lie` | Warning | A `compute_`/`parse_`/`is_`-named function that actually does I/O |
-| `untested-effect` | Advisory | A branching function that performs I/O and no test reaches, in a codebase that tests most of its effectful functions |
-| `dead-island` | Warning / Advisory | Functions nothing references and that aren't declared entry points (methods → Advisory: SCIP can miss dynamic dispatch) |
-| `naming-convention` | Advisory | Deviation from the codebase's dominant case style |
-| `slop-name` | Advisory | Throwaway markers that outlive their intent — `_v2`, `helper_`, `temp_` |
-| `config-sprawl` | Advisory | One environment variable read straight from the environment across four or more modules — a config surface with no single definition |
-| `over-commenting` | Advisory | Comments that merely restate the adjacent code |
+| `infra-bypass` | Blocking | Raw net/fs/db/env access where the repo has a sanctioned channel for it |
+| `circular-import` | Blocking | Import cycles |
+| `effect-creep` | Blocking | A function that was pure at baseline now does I/O |
+| `effect-layer-violation` | Warning | An effect a declared layer forbids |
+| `duplicate-exact` | Warning | Identical bodies, ignoring comments and whitespace |
+| `duplicate-equivalent` | Warning | Python functions provably equal up to renaming and sound rewrites ([ADR 0004](docs/adr/0004-e-equivalence-normalizer-with-egglog-as-oracle.md)) |
+| `duplicate-structural` | Advisory | Same shape, different names; `--tier3` asks an LLM to confirm |
+| `parallel-implementation` | Advisory | Same distinctive callees, no shared code |
+| `complexity-spike` | Warning | Deep nesting or many independent branches |
+| `purity-lie` | Warning | `compute_`/`parse_`/`is_` functions that do I/O |
+| `dead-island` | Warning | Unreferenced, non-entry-point code (Advisory for methods) |
+| `untested-effect` | Advisory | Branching I/O no test reaches, in a repo that usually tests it |
+| `config-sprawl` | Advisory | One env var read directly in four or more modules |
+| `naming-convention` | Advisory | Deviates from the repo's dominant case style |
+| `slop-name` | Advisory | `_v2`, `helper_`, `temp_` |
+| `over-commenting` | Advisory | Comments that restate the code |
 
-Sanctioned channels come from a `slop.toml` policy. `slop init .` proposes one
-from your repo's dominant patterns; without it, `infra-bypass` stays silent.
-Grandfather existing findings with `slop baseline .` — this also records each
-function's effect signature, so a later run can flag `effect-creep` (a function
-that was pure then, doing I/O now).
+`infra-bypass` needs a `slop.toml` policy; `slop init` proposes one from the
+repo's dominant patterns. `slop baseline` grandfathers current findings and
+records effect signatures for `effect-creep`.
 
-## Auto-fix
+## Fixing
 
-`slop fix` applies the *mechanical* repairs itself — dry-run by default,
-`--write` to apply:
+`slop fix` is a dry run; `--write` applies. It renames camelCase free functions
+across every SCIP-resolved reference. Opt-in flags also remove restating
+comments, dead functions and trivial wrappers. Each repair checks
+preconditions, reparses, reindexes and confirms the finding is gone, or rolls
+back. Everything else ships as `fix_guidance` text for an agent.
 
-- **naming-convention** — renames a camelCase **free function** to snake_case,
-  rewriting every SCIP-resolved reference and re-parsing each file. Aborts if
-  any reference can't be located as a whole token or a file stops parsing.
-  Methods, throwaway-marker names, and collisions are reported and left to a
-  human — a rename there can silently break framework dispatch.
-- **over-commenting** — available only with `--allow-advisory`; directives and
-  tooling comments are protected, but natural-language classification is still
-  graded and must be reviewed.
-- **dead-island** and judge-confirmed wrappers — destructive repairs require
-  their explicit opt-in flags.
-
-Every repair plan is bound to a repository snapshot, checks source preconditions,
-and re-parses staged results. Original files remain in a rollback journal while
-slop reindexes and verifies the selected finding ID disappeared; verification
-failure restores both source and index before returning an error. Use
-`--finding <id>` to repair one exact finding from `slop check --json`.
-
-Everything else stays *guidance*: the finding carries a `fix_guidance` string
-precise enough for an agent to act on.
-
-## The agent harness
-
-Configure Claude or Codex plus the editor `slop launch` should open:
+## Agent harness
 
 ```sh
-slop setup /path/to/repo --ai codex --editor cursor
-slop launch /path/to/repo
-slop uninstall /path/to/repo # structurally removes only slop-owned entries
+slop setup --ai claude --editor cursor   # or --ai codex
+slop launch
+slop uninstall                           # removes only what setup wrote
 ```
 
-Claude gets MCP, hooks, and the embedded skill. Codex gets a project-scoped,
-delimited MCP block in `.codex/config.toml`; the rest of that TOML is preserved
-byte-for-byte. AI/editor preferences remain user-local. `slop install` and
-`slop claude` remain compatibility commands:
+- **MCP** (`slop mcp`): `find_capability`, `assess_write`, `validate_change`,
+  `get_context_envelope`, `expand_entity`, `query_subgraph`.
+- **Hooks**: write-time duplicate checks, and read-path compression that keeps
+  code near the edit in full and skeletonizes the rest.
+- **Proxy** (`slop proxy`): an `ANTHROPIC_BASE_URL` reverse proxy with request,
+  concurrency and timeout limits.
 
-```sh
-slop claude                  # install harness + launch claude in the cwd
-slop claude --proxy          # also route the session through slop's steering proxy
-slop claude -- --resume      # args after `--` pass through to claude
-```
+Details: [docs/harness.md](docs/harness.md).
 
-- **Claude skill** — `slop install` drops a `/slop` skill so the agent knows
-  when and how to check, triage, fix, and gate on its own.
-- **MCP tools** — `find_capability` (what does this repo already have?),
-  `assess_write` (where proposed code belongs), `validate_change`,
-  `get_context_envelope`, and `query_subgraph`. Context envelopes
-  carry snapshot provenance, deterministic integer score reasons, and explicit
-  verbatim fallback when index coverage is stale.
-- **Hooks** — read-path steering + zoned graph-distance compression (skeletonize
-  code far from what you're editing; keep near context full-fidelity).
-- **Gate** — `slop gate`, a CI/fix-loop entry point that exits non-zero on
-  blocking findings and prints a machine-readable verdict.
-- **Proxy** — `slop proxy`, a bounded `ANTHROPIC_BASE_URL` reverse proxy with
-  explicit concurrency, request-size, capture-size, and timeout ceilings.
+## Context engine
 
-Full details, config, and the fix-loop shape: **[docs/harness.md](docs/harness.md)**.
+`get_context_envelope` returns, for an entity about to be edited, the source an
+agent most likely needs under a token budget.
 
-## Editor integration
+- **Candidates**: undirected BFS over calls, imports and contains, up to 4 hops.
+  Nodes with fan-in above 50 are reached but not expanded. Plus every entity in
+  the target's directory.
+- **Scoring**: logistic regression over 12 features (hop distance, same file,
+  same directory, line gap, same container, shared effect, is-class, BM25
+  against the target) giving P(co-change). Fit on commit history; each item
+  returns its per-feature logit contributions.
+- **Packing**: hop 1 in full, skeletons (effects, signature, docstring) beyond;
+  p < 0.01 dropped outside hop 1. Lazy greedy on gain per token, with provably
+  equivalent functions counted once.
+- **Determinism**: probabilities in parts per million, integer ratio
+  comparison, entity-id tie-break. Output is bound to a content-hashed
+  snapshot; `expand_entity` reads from the same one.
+- **Freshness**: an edited file is reparsed at once (p95 408 ms) and reindexed
+  in the background.
+- **Calibration**: `slop calibrate` refits on the repo's own history and writes
+  `.slop/relevance.json` only if it does at least as well on the newest commits.
 
-`slop lsp` is a language server that publishes findings as inline diagnostics on
-open/save — Blocking → Error, Warning → Warning, Advisory → Information, each
-with its fix guidance. It's editor-agnostic (VS Code, Cursor, Neovim, Zed,
-JetBrains all speak LSP); point your editor's LSP client at `slop lsp`. A ready
-VS Code / Cursor shim lives in **[editors/vscode](editors/vscode)**.
+B4 benchmark, out of sample: 76.0% co-change recall at 8k tokens, +6.3 points
+over BM25 and +11.5 over Aider's file-plus-map; p95 9 ms on Sentry. Design in
+[ADR 0005](docs/adr/0005-calibrated-relevance-for-context-selection.md) and
+[ADR 0006](docs/adr/0006-reparse-overlay-and-background-refresh.md); numbers in
+[bench/README.md](bench/README.md).
 
-```sh
-slop lsp                # serve over stdio for the cwd (what an editor launches)
-```
+## Editors
+
+`slop lsp` publishes findings as diagnostics on open and save (Blocking = Error,
+Warning = Warning, Advisory = Information). Any LSP client works;
+[editors/vscode](editors/vscode) has a VS Code/Cursor launcher.
 
 ## Limitations
 
-- **Python, JavaScript/TypeScript and Rust are supported**, through one seam
-  (`Language` in `slop-parse`): Python via ruff, the rest via tree-sitter.
-  `slop index` runs `scip-python`, `scip-typescript`, and/or
-  `rust-analyzer scip` for every detected language, and the effect seed table
-  carries a validated set for each. Every rule runs on all three. Resolution is only as good as the SCIP
-  index — dynamic dispatch, `getattr` and duck typing can be missed, and a
-  *stale* index is worse than a missing one, so `check`/`gate` regenerate it
-  rather than judging a diff against yesterday's graph.
-- The read-path harness's **token wins are measured** (~−61% on dogfood repos);
-  whether it preserves *output quality* is not yet rigorously proven.
-- `slop fix` renames are SCIP-*verified*, not behaviour-inert — dry-run and
-  review before `--write`.
-- The **LSP server** (`slop lsp`) is covered by headless tests; the **VS Code
-  shim** in `editors/vscode` is not — exercising it needs a running extension
-  host. It's kept to a thin launcher so the untested surface stays minimal.
+- Resolution is as good as the SCIP index: dynamic dispatch, `getattr` and duck
+  typing can be missed.
+- Read-path compression cuts tokens about 61% on dogfood repos. Whether output
+  quality holds is not established; the first end-to-end test (R8) found the
+  envelope no better than showing the target's file.
+- `fix` renames are index-verified, not proven behaviour-preserving. Review the
+  dry run.
+- The VS Code launcher has no tests; the LSP server does.
 
 ## Development
 
 ```sh
-cargo test           # unit + fixture-driven integration tests
-cargo clippy
+cargo test && cargo clippy
 ```
 
-Architecture and design decisions (the `D`-numbered invariants referenced in
-the code) live in `ideation/EXECUTION_PLAN.md`.
+Decisions are in [docs/adr](docs/adr); the invariants the code cites as `D<n>`
+are in `ideation/EXECUTION_PLAN.md`.
