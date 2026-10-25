@@ -276,7 +276,7 @@ fn main() -> Result<()> {
             // `check::run` reindexes a stale index itself; --reindex forces
             // one even when the mtimes say it is current.
             if reindex {
-                run_scip_index(&repo, index.as_deref())?;
+                run_scip_index(&repo, index.as_deref())?.iter().for_each(|failure| eprintln!("warning: {failure}"));
             }
             let result = check::run(CheckRequest {
                 repo: repo.clone(),
@@ -325,7 +325,7 @@ fn main() -> Result<()> {
             // The gate runs through `check::run`, which builds a missing index
             // and refreshes a stale one; --reindex forces one regardless.
             if reindex {
-                run_scip_index(&work_repo, index.as_deref())?;
+                run_scip_index(&work_repo, index.as_deref())?.iter().for_each(|failure| eprintln!("warning: {failure}"));
             }
 
             let outcome = gate::evaluate(
@@ -381,8 +381,10 @@ fn main() -> Result<()> {
             indexer,
         } => {
             if indexer == IndexerArg::Auto && output.is_none() {
-                run_scip_index(&repo, None)?;
-                let paths = slop_core::analyze::index::index_paths(&repo, None);
+                let failures = run_scip_index(&repo, None)?;
+                failures.iter().for_each(|failure| eprintln!("warning: {failure}; the other languages were indexed"));
+                let mut paths = slop_core::analyze::index::index_paths(&repo, None);
+                paths.retain(|path| path.exists());
                 let resolver = IndexSet::load(&paths)?;
                 if resolver.definition_count() == 0 {
                     bail!(

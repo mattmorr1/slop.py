@@ -378,8 +378,8 @@ pub fn stale_indexers(
 
 /// Regenerate the SCIP index for `repo`, writing to `index` (default
 /// `<repo>/index.scip`, or one shard per language in a polyglot repo).
-/// Every shard is attempted; failures are reported together afterwards.
-pub fn run_scip_index(repo: &Path, index: Option<&Path>) -> Result<()> {
+/// Every shard is attempted. Errs only when every one failed; otherwise returns the failures.
+pub fn run_scip_index(repo: &Path, index: Option<&Path>) -> Result<Vec<String>> {
     let files = discover_sources(repo);
     let targets = match index {
         Some(out) => vec![(Indexer::Auto, out.to_path_buf())],
@@ -396,6 +396,7 @@ pub fn run_scip_index(repo: &Path, index: Option<&Path>) -> Result<()> {
         }
     };
     let project = default_project_name(repo);
+    let attempted = targets.len();
     let failures: Vec<String> = targets
         .into_iter()
         .filter_map(|(indexer, out)| {
@@ -404,11 +405,10 @@ pub fn run_scip_index(repo: &Path, index: Option<&Path>) -> Result<()> {
                 .map(|error| format!("{}: {error:#}", indexer.label()))
         })
         .collect();
-    if failures.is_empty() {
-        Ok(())
-    } else {
+    if failures.len() == attempted {
         bail!("indexing failed — {}", failures.join("; "))
     }
+    Ok(failures)
 }
 
 /// Run only the given indexers, returning each failure instead of stopping:

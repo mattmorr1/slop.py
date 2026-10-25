@@ -61,7 +61,11 @@ fails open (the write or the stop proceeds) and is logged to stderr and
   pre-existing work.
 - Builds the graph once and writes the sidecar: the callee neighborhood, the
   E-sound and structural hash indexes, and the defined-name table used for
-  suggestions. A stale index is not persisted; the error is logged.
+  suggestions. A stale index is not persisted; the error is logged. A language
+  whose indexer failed at the current content does not count as stale: the
+  sidecar is written from the languages that indexed, and the context names the
+  failed one. `slop index` then exits 0 with a warning; it fails only when every
+  language fails.
 - Injects the **world model**: sanctioned channels, layer rules and a capability
   index of the most-referenced functions by effect, budgeted to 7000 chars, then a
   pointer to `reconcile` carrying the session id.

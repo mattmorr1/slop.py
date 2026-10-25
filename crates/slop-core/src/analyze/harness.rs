@@ -287,6 +287,9 @@ pub fn handle_session_start(input: &Value, event: &str) -> Value {
     if let Some(error) = sidecar_error {
         context.push_str(&format!("slop: prewrite sidecar unavailable: {error:#}\n"));
     }
+    for label in analysis.iter().flat_map(|a| a.failed_indexers()) {
+        context.push_str(&format!("slop: the {label} index failed, so {label} files have no call graph; other languages are unaffected. Run `slop index` to see why.\n"));
+    }
     let scope = as_str(input, "session_id").map_or_else(String::new, |id| format!(" with session_id \"{id}\""));
     context.push_str(&format!("slop: before finishing, call slop's `reconcile` tool{scope} to check what you changed; use `query_subgraph` to find the channel for an effect."));
     json!({
@@ -359,6 +362,23 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(context.contains("notify_with_report"), "{context}");
+        let _ = std::fs::remove_file(sidecar);
+    }
+
+    #[test]
+    fn session_start_keeps_the_sidecar_when_one_language_fails_to_index() {
+        let repo = TempFixture::new("toy_repo_slopped");
+        std::fs::create_dir_all(repo.join("native")).unwrap();
+        std::fs::write(repo.join("native/lib.rs"), "pub fn x() {}\n").unwrap();
+        std::fs::create_dir_all(repo.join(".slop/index")).unwrap();
+        let digest = blake3::hash(b"pub fn x() {}\n").to_hex();
+        std::fs::write(repo.join(".slop/index/rust.scip.failed"), format!("slop-stamp 2\nerror rust-analyzer exited 1\n{digest} native/lib.rs\n")).unwrap();
+        let sidecar = prewrite::sidecar_path(&repo);
+        let _ = std::fs::remove_file(&sidecar);
+        let out = handle_session_start(&json!({ "cwd": repo.to_string_lossy() }), "SessionStart");
+        let context = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default();
+        assert!(sidecar.is_file(), "the Python evidence is sound without Rust: {context}");
+        assert!(context.lines().any(|l| l.starts_with("slop: the rust index failed")), "{context}");
         let _ = std::fs::remove_file(sidecar);
     }
 

@@ -240,7 +240,8 @@ impl RepositorySnapshot {
     }
 
     pub fn write_prewrite_sidecar(&self) -> Result<PathBuf> {
-        if !matches!(self.freshness(), SnapshotFreshness::Current) {
+        // A failed indexer leaves its files parser-only; the indexed ones stay exact.
+        if !self.vouched() {
             bail!(
                 "refusing to persist prewrite evidence from stale snapshot {}",
                 self.id()

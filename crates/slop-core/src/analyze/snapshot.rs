@@ -73,10 +73,16 @@ pub struct CaptureRequest<'a> {
     pub freshness: Freshness,
 }
 
+/// Indexers whose last run failed at the current content: (label, error).
+type Failed = Vec<(&'static str, String)>;
+
 pub struct RepositorySnapshot {
     id: SnapshotId,
     repo: PathBuf,
     freshness: SnapshotFreshness,
+    /// Every indexed document is current and none is missing; only failed indexers may degrade it.
+    vouched: bool,
+    failed: Failed,
     /// Only documents that are not [`DocumentState::Resolved`].
     degraded: BTreeMap<String, DocumentState>,
     digests: BTreeMap<String, Digest>,
@@ -106,6 +112,16 @@ impl RepositorySnapshot {
 
     pub fn freshness(&self) -> &SnapshotFreshness {
         &self.freshness
+    }
+
+    /// Indexers whose last run failed at this content: their languages have no index evidence.
+    pub fn failed_indexers(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.failed.iter().map(|(label, _)| *label)
+    }
+
+    /// Every indexed document is current, so evidence about them may be persisted.
+    pub fn vouched(&self) -> bool {
+        self.vouched
     }
 
     pub fn document_state(&self, file: &str) -> DocumentState {
@@ -313,13 +329,14 @@ fn snapshot_id(
     Ok(SnapshotId(hasher.finalize().to_hex().to_string()))
 }
 
-/// Per-document states plus the reasons, if any, the snapshot is not current.
+/// Per-document states, the reasons indexed evidence is not current, and the failures
+/// (indexer label, error) still active at this content, which leave their files unresolved.
 fn coverage(
     digests: &BTreeMap<String, Digest>,
     indexed: &BTreeSet<String>,
     stamps: &[Stamp],
     failures: &[Stamp],
-) -> (BTreeMap<String, DocumentState>, Vec<String>) {
+) -> (BTreeMap<String, DocumentState>, Vec<String>, Failed) {
     let vouched = |stamps: &[Stamp], file: &String, digest: &Digest| {
         stamps
             .iter()
@@ -373,14 +390,15 @@ fn coverage(
     if removed > 0 {
         reasons.push(format!("{removed} indexed document(s) no longer exist"));
     }
-    reasons.extend(failures.iter().filter_map(|failure| {
-        let active = failure
-            .files
-            .iter()
-            .all(|(file, digest)| digests.get(file) == Some(digest));
-        failure.error.as_ref().filter(|_| active).cloned()
-    }));
-    (degraded, reasons)
+    let failed = failures
+        .iter()
+        .filter(|failure| failure.files.iter().all(|(file, digest)| digests.get(file) == Some(digest)))
+        .filter_map(|failure| {
+            let label = failure.files.keys().find_map(|f| crate::parse::Language::from_path(f).and_then(index::Indexer::for_language)).map_or("unknown", |i| i.label());
+            Some((label, failure.error.clone()?))
+        })
+        .collect();
+    (degraded, reasons, failed)
 }
 
 fn stamps_of(index_paths: &[PathBuf], side: fn(&Path) -> PathBuf) -> Vec<Stamp> {
@@ -423,6 +441,8 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
             index_paths = index::index_paths_for(&repo, request.index, &files);
         }
     }
+    // A failed artifact is absent, but its failure memo still explains its files.
+    let attempted = index_paths.clone();
     index_paths.retain(|path| path.exists());
     if index_paths.is_empty() {
         let cause = if reindex_errors.is_empty() {
@@ -436,7 +456,7 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
         );
     }
 
-    let key = cache_key(&repo, &index_paths, &policy_path, &digests);
+    let key = cache_key(&repo, &attempted, &policy_path, &digests);
     if let Some(snapshot) = CACHE.lock().ok().and_then(|cache| {
         cache
             .as_ref()
@@ -447,10 +467,10 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
     }
 
     let sources = collect_sources(&repo, &mut digests, read)?;
-    let key = cache_key(&repo, &index_paths, &policy_path, &digests);
+    let key = cache_key(&repo, &attempted, &policy_path, &digests);
     let artifacts: Vec<_> = index_paths.iter().map(|path| artifact_stat(path)).collect();
     let stamps = stamps_of(&index_paths, index::stamp_path);
-    let failures = stamps_of(&index_paths, index::failure_path);
+    let failures = stamps_of(&attempted, index::failure_path);
     let resolver = IndexSet::load(&index_paths)?;
     if resolver.definition_count() == 0 {
         bail!(
@@ -460,11 +480,12 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
     }
     let indexed_files: BTreeSet<String> =
         resolver.files().into_iter().map(str::to_string).collect();
-    let (degraded, reasons) = coverage(&digests, &indexed_files, &stamps, &failures);
-    let freshness = if reasons.is_empty() {
+    let (degraded, reasons, failed) = coverage(&digests, &indexed_files, &stamps, &failures);
+    let vouched = reasons.is_empty();
+    let freshness = if vouched && failed.is_empty() {
         SnapshotFreshness::Current
     } else {
-        let reason = reasons.join("; ");
+        let reason = reasons.iter().cloned().chain(failed.iter().map(|(_, error)| error.clone())).collect::<Vec<_>>().join("; ");
         if request.freshness == Freshness::Warn {
             eprintln!("warning: SCIP evidence is partial — {reason}");
         }
@@ -489,6 +510,8 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
         id,
         repo,
         freshness,
+        vouched,
+        failed,
         degraded,
         digests,
         built,
@@ -587,7 +610,7 @@ mod tests {
             ]),
             error: None,
         };
-        let (degraded, reasons) = coverage(&digests, &indexed, &[stamp], &[]);
+        let (degraded, reasons, _) = coverage(&digests, &indexed, &[stamp], &[]);
         assert_eq!(degraded.get("a.py"), None);
         assert_eq!(degraded.get("b.py"), Some(&DocumentState::Stale));
         assert_eq!(degraded.get("c.py"), Some(&DocumentState::Unresolved));
