@@ -1,7 +1,7 @@
 //! Finding what a codebase already has, by intent.
 //!
-//! The other graph tools (`query_subgraph`, `get_context_envelope`) both take
-//! an entity id, and nothing produced one: the graph's only lookup is
+//! The other graph tool (`query_subgraph`) takes an entity id, and nothing
+//! produced one: the graph's only lookup is
 //! `node(id)`, an exact match on an id the agent has no way to guess. So an
 //! agent about to write `fetch_url` could not ask whether this repo already
 //! has one — which is the redundancy slop class, the most common of them all.

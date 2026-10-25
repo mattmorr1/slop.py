@@ -1,15 +1,13 @@
 //! The additive MCP tools (M4c, D9): `find_capability`, `validate_change`,
-//! `get_context_envelope`, `query_subgraph`. Each is a thin adapter that
+//! `assess_write`, `query_subgraph`. Each is a thin adapter that
 //! runs the *same* analysis the CLI runs (via `slop_analyze::check`) and
 //! serializes the result — never a reimplementation.
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use slop_analyze::check::{self, CheckRequest};
-use slop_analyze::context::ContextRequest;
-use slop_analyze::envelope::DEFAULT_MIN_PROBABILITY_PPM;
 use slop_analyze::refresh::Refresher;
 use slop_analyze::query;
 use slop_analyze::search;
@@ -55,7 +53,7 @@ pub fn definitions() -> Value {
     json!([
         {
             "name": "find_capability",
-            "description": "Find what this codebase ALREADY provides for a described intent, before writing a new implementation. Ranked by name/module/docstring match and how many places call it. This is the entry point to the other graph tools: every id it returns can be fed straight to `query_subgraph` or `get_context_envelope`. Reimplementing something that exists is the most common slop class — ask here first.",
+            "description": "Find what this codebase ALREADY provides for a described intent, before writing a new implementation. Ranked by name/module/docstring match and how many places call it. This is the entry point to the other graph tools: every id it returns can be fed straight to `query_subgraph`. Reimplementing something that exists is the most common slop class — ask here first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -97,33 +95,6 @@ pub fn definitions() -> Value {
             }
         },
         {
-            "name": "get_context_envelope",
-            "description": "Build the context envelope around a target entity: the code most likely needed when editing it, scored by calibrated relevance, full-fidelity inside the edit zone and skeletonized beyond, capped by a token budget. Returns items with source text and per-feature reasons.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string", "description": "Repo root (defaults to the server's launch repo)"},
-                    "target_entity": {"type": "string", "description": "Entity id, e.g. `billing.gateways::StripeGateway::charge`"},
-                    "token_budget": {"type": "integer", "description": "Rough token budget for context beyond the target (default 8000)"},
-                    "edit_zone_hops": {"type": "integer", "description": "BFS hops from the target that stay full-fidelity (default 1)"},
-                    "min_probability": {"type": "number", "description": "Calibrated relevance an item needs to be shown, 0-1 (default 0.01; 0 fills the budget, higher is terser)"}
-                },
-                "required": ["target_entity"]
-            }
-        },
-        {
-            "name": "expand_entity",
-            "description": "Full verbatim source of one entity from the same repository snapshot a context envelope came from: the inverse of a skeleton. Use it when a skeletonized item turns out to matter. `state` other than `resolved` means its line range came from an index built from different content.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string", "description": "Repo root (defaults to the server's launch repo)"},
-                    "entity": {"type": "string", "description": "Entity id from an envelope item"}
-                },
-                "required": ["entity"]
-            }
-        },
-        {
             "name": "query_subgraph",
             "description": "Explore the effect graph around an entity: its callers/callees/imports out to a depth, each neighbor's relation and distance, plus the target's inferred effect signature. Use this to learn how a codebase routes an effect (e.g. what owns Net) before writing code.",
             "inputSchema": {
@@ -151,9 +122,7 @@ pub fn call(ctx: &ToolCtx, name: &str, args: &Value) -> Result<String> {
         "find_capability" => find_capability(ctx, args),
         "validate_change" => validate_change(ctx, args),
         "assess_write" => assess_write(ctx, args),
-        "get_context_envelope" => get_context_envelope(ctx, args),
         "query_subgraph" => query_subgraph(ctx, args),
-        "expand_entity" => expand_entity(ctx, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -243,27 +212,6 @@ fn validate_change(ctx: &ToolCtx, args: &Value) -> Result<String> {
     }))?)
 }
 
-fn get_context_envelope(ctx: &ToolCtx, args: &Value) -> Result<String> {
-    let repo = ctx.repo(args);
-    let target = args
-        .get("target_entity")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("target_entity is required"))?;
-    let analysis = ctx.analysis(&repo, args)?;
-    let artifact = analysis.context(ContextRequest {
-        target_entity: target,
-        token_budget: args.get("token_budget").and_then(Value::as_u64).unwrap_or(8000) as usize,
-        edit_zone_hops: args.get("edit_zone_hops").and_then(Value::as_u64).unwrap_or(1) as usize,
-        selection: Default::default(),
-        min_probability_ppm: match args.get("min_probability").and_then(Value::as_f64) {
-            Some(p) if (0.0..=1.0).contains(&p) => (p * 1_000_000.0).round() as u32,
-            Some(p) => bail!("min_probability must be between 0 and 1, got {p}"),
-            None => DEFAULT_MIN_PROBABILITY_PPM,
-        },
-    });
-    Ok(serde_json::to_string_pretty(&artifact)?)
-}
-
 fn parse_edge_kinds(args: &Value) -> Option<Vec<EdgeKind>> {
     let arr = args.get("edge_kinds")?.as_array()?;
     let kinds = arr
@@ -295,23 +243,6 @@ fn query_subgraph(ctx: &ToolCtx, args: &Value) -> Result<String> {
         None => Ok(serde_json::to_string_pretty(&json!({
             "entity": entity,
             "note": "entity not found in the graph",
-        }))?),
-    }
-}
-
-fn expand_entity(ctx: &ToolCtx, args: &Value) -> Result<String> {
-    let repo = ctx.repo(args);
-    let entity = args
-        .get("entity")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("entity is required"))?;
-    let analysis = ctx.analysis(&repo, args)?;
-    match analysis.expand(entity) {
-        Some(expansion) => Ok(serde_json::to_string_pretty(&expansion)?),
-        None => Ok(serde_json::to_string_pretty(&json!({
-            "entity": entity,
-            "snapshot": analysis.id(),
-            "note": "entity not found in this snapshot",
         }))?),
     }
 }

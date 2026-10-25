@@ -2,7 +2,7 @@
 //! ranges from the parser, without waiting for a reindex.
 //!
 //! Functions map to their old entities by (name, ordinal among same-named
-//! functions), the mapping `calibrate` uses on history. Every other entity in
+//! functions). Every other entity in
 //! the document (classes, constants) shifts by the delta of the nearest mapped
 //! function before it. Edges stay those of the last index, which is why such a
 //! document is `Reparsed`, not `Resolved`: context may use it, a deny may not.

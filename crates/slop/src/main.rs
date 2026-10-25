@@ -8,7 +8,6 @@ use slop_analyze::baseline::Baseline;
 use slop_analyze::check::{self, CheckRequest, CheckResult};
 use slop_analyze::findings::Severity;
 
-use slop_analyze::compress::{self, CompressConfig};
 use slop_analyze::index::{
     default_project_name, ensure_index, run_indexer, run_scip_index, Indexer,
 };
@@ -114,31 +113,6 @@ enum Command {
         #[arg(long)]
         reindex: bool,
     },
-    /// Zoned graph-distance compression of a file (D11): full fidelity within
-    /// --hops of the --edit loci, skeletons beyond. Prints the compressed
-    /// source; --stats reports the token win. Empty --edit = strip-noise only.
-    Compress {
-        /// Repo root
-        repo: PathBuf,
-        /// Repo-relative source file to compress (Python, JS/TS, or Rust)
-        file: String,
-        /// Path to index.scip (default: <repo>/index.scip)
-        #[arg(long)]
-        index: Option<PathBuf>,
-        /// Edit-zone entity id (repeatable), e.g. `utils.dates::parse`
-        #[arg(long = "edit")]
-        edit: Vec<String>,
-        /// Edit-zone by file (repeatable): use every entity defined in this
-        /// repo-relative file as a locus — mirrors what the read hook does.
-        #[arg(long = "edit-file")]
-        edit_file: Vec<String>,
-        /// Graph hops from the edit zone kept full-fidelity
-        #[arg(long, default_value_t = 1)]
-        hops: usize,
-        /// Print compression stats to stderr
-        #[arg(long)]
-        stats: bool,
-    },
     /// Validation gate (M5): run the check and exit non-zero if anything
     /// blocks, printing a JSON verdict a CI step or agent fix-loop consumes.
     Gate {
@@ -182,8 +156,8 @@ enum Command {
         #[arg(long)]
         index: Option<PathBuf>,
     },
-    /// Serve slop's MCP tools (assess_write, validate_change,
-    /// get_context_envelope, query_subgraph) over stdio. Launched by an agent host
+    /// Serve slop's MCP tools (find_capability, assess_write, validate_change,
+    /// query_subgraph) over stdio. Launched by an agent host
     /// (e.g. Claude Code); speaks newline-delimited JSON-RPC 2.0.
     Mcp {
         /// Repo root the tools default to (default: current directory)
@@ -263,25 +237,6 @@ enum Command {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Research adapter for the context benchmark: one capture, then a context
-    /// artifact per (target, budget), after one line with the shared cost catalog.
-    #[command(hide = true)]
-    ContextBench {
-        repo: PathBuf,
-        /// One target entity id per line.
-        targets: PathBuf,
-        #[arg(long, value_delimiter = ',', default_value = "1000,2000,4000,8000,16000")]
-        budgets: Vec<usize>,
-        /// `coverage` (default) or `ranked` (the ablation baseline).
-        #[arg(long, default_value = "coverage")]
-        selection: String,
-        /// Minimum calibrated probability in ppm; 0 (default) fills the budget, as in B4 runs to date.
-        #[arg(long, default_value_t = 0)]
-        min_probability_ppm: u32,
-        /// Include each item's rendered text (for building prompts from the envelope).
-        #[arg(long)]
-        with_text: bool,
-    },
     /// Research adapter for the equivalence benchmark: each JSONL line
     /// `{"a": src, "b": src}` (one Python function each) yields every tier's verdict.
     #[command(hide = true)]
@@ -319,27 +274,6 @@ enum Command {
         /// Args passed through to claude (everything after `--`)
         #[arg(last = true)]
         claude_args: Vec<String>,
-    },
-    /// Fit the context relevance model on this repository's own co-change history,
-    /// validated on the newest commits; writes .slop/relevance.json only if it holds up.
-    Calibrate {
-        /// Repo root (default: current directory)
-        #[arg(default_value = ".")]
-        repo: PathBuf,
-        #[arg(long, default_value_t = 1500)]
-        max_commits: usize,
-        /// Share of the newest commits held out for validation.
-        #[arg(long, default_value_t = 0.2)]
-        holdout: f64,
-        /// Token budget the validation compares recall at.
-        #[arg(long, default_value_t = 4000)]
-        budget: usize,
-        /// Write the fit even if it does worse on the holdout than the model in use.
-        #[arg(long)]
-        force: bool,
-        /// Report only; never write.
-        #[arg(long)]
-        dry_run: bool,
     },
     /// Record current findings as the grandfathered baseline.
     Baseline {
@@ -452,57 +386,6 @@ fn main() -> Result<()> {
             }
             if result.blocking > 0 {
                 std::process::exit(1);
-            }
-        }
-        Command::Compress {
-            repo,
-            file,
-            index,
-            mut edit,
-            edit_file,
-            hops,
-            stats,
-        } => {
-            let analysis = check::load_analysis(&repo, index.as_deref())?;
-            // Expand --edit-file into the entity ids defined in those files.
-            if !edit_file.is_empty() {
-                for (_, e) in analysis.built.graph.entities() {
-                    if edit_file.contains(&e.file) {
-                        edit.push(e.id.clone());
-                    }
-                }
-            }
-            let source = std::fs::read_to_string(repo.join(&file))
-                .with_context(|| format!("reading {file}"))?;
-
-            let (out, st) = compress::compress_file(
-                &analysis.built,
-                &analysis.facts,
-                &source,
-                &file,
-                &edit,
-                &CompressConfig {
-                    edit_zone_hops: hops,
-                    min_lines: 0,
-                },
-                None,
-            );
-            print!("{out}");
-            if stats {
-                let pct = 100usize.saturating_sub(
-                    st.compressed_chars
-                        .saturating_mul(100)
-                        .checked_div(st.original_chars)
-                        .unwrap_or(100),
-                );
-                eprintln!(
-                    "compress: {}/{} functions skeletonized, {} -> {} chars (-{}%)",
-                    st.skeletonized,
-                    st.total_functions,
-                    st.original_chars,
-                    st.compressed_chars,
-                    pct
-                );
             }
         }
         Command::Gate {
@@ -669,9 +552,6 @@ fn main() -> Result<()> {
         } => {
             setup::launch(&repo, ai, editor, no_setup, no_editor, &args)?;
         }
-        Command::ContextBench { repo, targets, budgets, selection, min_probability_ppm, with_text } => {
-            run_context_bench(&repo, &targets, &budgets, &selection, min_probability_ppm, with_text)?
-        }
         Command::Equiv { pairs, iterations } => run_equiv(&pairs, iterations)?,
         Command::Install { repo, force } => {
             install_harness(&repo, force)?;
@@ -682,9 +562,6 @@ fn main() -> Result<()> {
             claude_args,
         } => {
             launch_claude(&repo, no_install, &claude_args)?;
-        }
-        Command::Calibrate { repo, max_commits, holdout, budget, force, dry_run } => {
-            run_calibrate(&repo, max_commits, holdout, budget, force, dry_run)?
         }
         Command::Baseline { repo, index } => {
             let analysis = check::load_analysis(&repo, index.as_deref())?;
@@ -1171,84 +1048,6 @@ fn run_equiv(pairs: &Path, iterations: usize) -> Result<()> {
         #[cfg(not(feature = "egraph"))]
         let _ = iterations;
         println!("{verdict}");
-    }
-    Ok(())
-}
-
-fn run_calibrate(repo: &Path, max_commits: usize, holdout: f64, budget: usize, force: bool, dry_run: bool) -> Result<()> {
-    use slop_analyze::calibrate::{self, CalibrateRequest};
-    if !(0.05..=0.5).contains(&holdout) {
-        bail!("--holdout must be between 0.05 and 0.5, got {holdout}");
-    }
-    let snapshot = check::load_analysis(repo, None)?;
-    let report = calibrate::calibrate(&snapshot, repo, &CalibrateRequest { max_commits, holdout, budget })?;
-    let pct = |e: calibrate::Estimate| format!("{:5.1}%  [{:.1}, {:.1}]", e.mean * 100.0, e.low * 100.0, e.high * 100.0);
-    println!("{} co-change tasks from {} commits; fit on {} older, validated on {} newest", report.tasks, report.commits, report.train_tasks, report.holdout_tasks);
-    println!("holdout recall at {} tokens (95% CI over commits):", report.budget);
-    println!("  this repository's fit   {}", pct(report.own));
-    println!("  model in use            {}   ({})", pct(report.current), report.current_source);
-    println!("  file proximity          {}", pct(report.proximity));
-    let d = report.own_minus_current;
-    println!("  fit minus in use        {:+5.1} points [{:+.1}, {:+.1}], paired", d.mean * 100.0, d.low * 100.0, d.high * 100.0);
-    println!("  prior strength {} (shrinks the fit toward the model in use; chosen on older commits only)", report.lambda);
-    if dry_run {
-        println!("dry run: nothing written");
-    } else if report.supports_writing() || force {
-        let path = calibrate::write(repo, &report.model)?;
-        println!("wrote {} (fit on all {} tasks)", path.display(), report.tasks);
-    } else {
-        println!("kept the model in use: this fit did worse on the holdout (--force writes it anyway)");
-    }
-    Ok(())
-}
-
-fn run_context_bench(repo: &Path, targets: &Path, budgets: &[usize], selection: &str, min_probability_ppm: u32, with_text: bool) -> Result<()> {
-    use slop_analyze::context::ContextRequest;
-    use slop_analyze::envelope::{self, Selection};
-    let selection = match selection {
-        "coverage" => Selection::Coverage,
-        "ranked" => Selection::Ranked,
-        other => bail!("unknown selection {other:?}: use coverage or ranked"),
-    };
-    let snapshot = check::load_analysis(repo, None)?;
-    let catalog = envelope::catalog(&snapshot.built, &snapshot.facts);
-    println!("{}", serde_json::json!({ "snapshot": snapshot.id(), "catalog": catalog }));
-    let text = std::fs::read_to_string(targets).with_context(|| format!("reading {}", targets.display()))?;
-    for target in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        println!(
-            "{}",
-            serde_json::json!({
-                "target": target,
-                "neighbors": envelope::neighbors(&snapshot.built, target),
-                "callees": envelope::callees(&snapshot.built, target),
-                "distances": envelope::distances(&snapshot.built, target, 4),
-            })
-        );
-        for &budget in budgets {
-            let start = std::time::Instant::now();
-            let artifact = snapshot.context(ContextRequest { target_entity: target, token_budget: budget, edit_zone_hops: 1, selection, min_probability_ppm });
-            let items: Vec<serde_json::Value> = artifact
-                .items
-                .iter()
-                .map(|item| {
-                    let mut row = serde_json::json!({ "entity": item.entity, "fidelity": item.fidelity, "score": item.score, "tokens": item.text.len() / 4 + 1 });
-                    if with_text {
-                        row["text"] = serde_json::Value::from(item.text.as_str());
-                    }
-                    row
-                })
-                .collect();
-            println!(
-                "{}",
-                serde_json::json!({
-                    "target": target,
-                    "budget": budget,
-                    "items": items,
-                    "fallback": artifact.fallback.map(|fallback| fallback.reason),
-                    "micros": start.elapsed().as_micros() as u64,
-                })
-            );
-        }
     }
     Ok(())
 }

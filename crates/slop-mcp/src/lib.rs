@@ -1,7 +1,7 @@
 //! MCP tool surface for slop (M4c, D9): additive, read-only tools an
 //! existing agent (Claude Code) drives — slop is never its own agent.
-//! `validate_change` gates edits, `get_context_envelope` / `query_subgraph`
-//! feed the agent the effect-typed context and graph it needs.
+//! `validate_change` gates edits, `find_capability` / `query_subgraph` feed
+//! the agent the effect-typed graph it needs.
 
 use std::path::PathBuf;
 

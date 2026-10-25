@@ -2,17 +2,13 @@
 
 pub mod baseline;
 pub mod build;
-pub mod calibrate;
 pub mod check;
-pub mod compress;
 pub mod config;
-pub mod context;
 pub mod coverage;
 pub mod detect;
 pub mod diff;
 pub mod effects;
 pub mod entity_id;
-pub mod envelope;
 pub mod findings;
 pub mod gate;
 pub mod harness;
@@ -26,7 +22,6 @@ pub mod precheck;
 pub mod prewrite;
 pub mod query;
 pub mod refresh;
-pub mod relevance;
 pub mod retrieve;
 pub mod scan;
 pub mod search;

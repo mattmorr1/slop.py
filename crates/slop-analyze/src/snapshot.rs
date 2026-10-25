@@ -13,7 +13,6 @@ use crate::build::{self, BuiltGraph};
 use crate::effects;
 use crate::index::{self, Digest, Stamp};
 use crate::policy::Policy;
-use crate::relevance::{self, Lexical, RelevanceModel};
 use crate::retrieve::Neighborhood;
 use crate::source::{self, FileFacts};
 
@@ -89,10 +88,7 @@ pub struct RepositorySnapshot {
     pub resolver: IndexSet,
     pub policy: Policy,
     pub baseline: Baseline,
-    pub relevance: RelevanceModel,
     neighborhood: OnceLock<Neighborhood>,
-    lexical: OnceLock<Lexical>,
-    entity_index: OnceLock<crate::envelope::EntityIndex>,
     /// Entities of reparsed documents whose function no longer exists.
     gone: std::collections::HashSet<petgraph::graph::NodeIndex>,
 }
@@ -141,13 +137,6 @@ impl RepositorySnapshot {
             .get_or_init(|| Neighborhood::build(&self.built))
     }
 
-    pub fn lexical(&self) -> &Lexical {
-        self.lexical.get_or_init(|| Lexical::build(&self.built, &self.sources))
-    }
-
-    pub fn entity_index(&self) -> &crate::envelope::EntityIndex {
-        self.entity_index.get_or_init(|| crate::envelope::EntityIndex::build(&self.built, &self.facts))
-    }
 }
 
 static CACHE: Mutex<Option<(Digest, Arc<RepositorySnapshot>)>> = Mutex::new(None);
@@ -295,7 +284,6 @@ fn cache_key(
     for path in [
         policy_path.to_path_buf(),
         repo.join(crate::baseline::BASELINE_FILE),
-        repo.join(relevance::MODEL_FILE),
     ] {
         hasher.update(&std::fs::read(path).unwrap_or_default());
         hasher.update(&[0]);
@@ -325,8 +313,7 @@ fn snapshot_id(
         hasher.update(source.as_bytes());
     }
     let baseline_path = repo.join(crate::baseline::BASELINE_FILE);
-    let model_path = repo.join(relevance::MODEL_FILE);
-    for path in [policy_path, baseline_path.as_path(), model_path.as_path()] {
+    for path in [policy_path, baseline_path.as_path()] {
         hasher.update(
             path.file_name()
                 .and_then(|s| s.to_str())
@@ -505,7 +492,6 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
     let gone = crate::overlay::remap(&mut built, &facts, &mut degraded);
     let policy = Policy::load_file(&policy_path)?;
     let baseline = Baseline::load(&repo)?;
-    let relevance = RelevanceModel::load(&repo)?;
     let id = snapshot_id(&repo, &index_paths, &policy_path, &sources)?;
     if index_paths
         .iter()
@@ -528,10 +514,7 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
         resolver,
         policy,
         baseline,
-        relevance,
         neighborhood: OnceLock::new(),
-        lexical: OnceLock::new(),
-        entity_index: OnceLock::new(),
         gone,
     });
     if let Ok(mut cache) = CACHE.lock() {

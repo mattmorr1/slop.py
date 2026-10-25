@@ -1,6 +1,6 @@
 //! Read-only subgraph queries around a single entity, for the MCP
-//! `query_subgraph` tool (M4c). BFS over the same proximity edges the
-//! context envelope uses, but returned as plain serializable data — the
+//! `query_subgraph` tool (M4c). BFS over the proximity edges, returned as
+//! plain serializable data — the
 //! agent asks "what does `X` call / import / carry?" without slop needing
 //! to be the one holding petgraph handles.
 
