@@ -25,6 +25,7 @@ pub mod refresh;
 pub mod retrieve;
 pub mod scan;
 pub mod search;
+pub mod session;
 pub mod snapshot;
 pub mod source;
 pub mod suppress;

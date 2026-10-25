@@ -133,7 +133,7 @@ pub fn log_hook(input: &Value, event: &str, output: &Value, elapsed: std::time::
     let context = hook.and_then(|h| as_str(h, "additionalContext")).unwrap_or("");
     let count = |needle: &str| context.lines().filter(|l| l.starts_with(needle)).count();
     let line = json!({
-        "at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        "at": now(),
         "event": event,
         "tool": as_str(input, "tool_name"),
         "file": file.as_deref().and_then(|f| repo_relative(&repo, f)),
@@ -142,6 +142,14 @@ pub fn log_hook(input: &Value, event: &str, output: &Value, elapsed: std::time::
         "duplicates": count("slop: new `"),
         "reuse": count("slop: proposed code overlaps"),
     });
+    append_log(&repo, &line);
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn append_log(repo: &Path, line: &Value) {
     let path = repo.join(".slop/hooks.jsonl");
     let written = std::fs::create_dir_all(repo.join(".slop")).and_then(|()| {
         use std::io::Write;
@@ -150,6 +158,14 @@ pub fn log_hook(input: &Value, event: &str, output: &Value, elapsed: std::time::
     });
     if let Err(error) = written {
         eprintln!("slop: could not write {}: {error}", path.display());
+    }
+}
+
+/// A hook's internal error, to stderr and `.slop/hooks.jsonl`: failing open is logged, never silent.
+pub fn log_error(repo: &Path, event: &str, error: &anyhow::Error) {
+    eprintln!("slop {event}: {error:#}");
+    if !std::env::var("SLOP_HOOK_LOG").is_ok_and(|v| v == "0") {
+        append_log(repo, &json!({ "at": now(), "event": event, "error": format!("{error:#}") }));
     }
 }
 
@@ -237,10 +253,18 @@ pub fn handle_session_start(input: &Value, event: &str) -> Value {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let repo = find_repo_root(&cwd);
-    let analysis = crate::analyze::check::load_analysis(&repo, None).ok();
+    if let Some(Err(error)) = as_str(input, "session_id").map(|id| crate::analyze::session::start(&repo, id)) {
+        log_error(&repo, event, &error);
+    }
+    let analysis = crate::analyze::check::load_analysis(&repo, None)
+        .inspect_err(|error| log_error(&repo, event, error))
+        .ok();
     let sidecar_error = analysis
         .as_ref()
         .and_then(|snapshot| snapshot.write_prewrite_sidecar().err());
+    if let Some(error) = &sidecar_error {
+        log_error(&repo, event, error);
+    }
     let fallback_policy = Policy::load(&repo).unwrap_or_default();
     let policy = analysis
         .as_ref()
