@@ -1,7 +1,7 @@
 # B5 pre-registration: does binding a sketch surface the helpers better than the envelope?
 
 Written and committed before any generation or scoring (roadmap phase P1,
-gate G1; spec `docs/prd/P1-b5-bind-recall.md`). Changes after the first
+gate G1; spec `docs/prd/done/P1-b5-bind-recall.md`). Changes after the first
 generation are listed at the end with their reason, never made silently. The
 G1 thresholds below are fixed by this commit.
 
