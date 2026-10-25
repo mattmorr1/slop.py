@@ -103,7 +103,7 @@ pub struct FunctionFacts {
     /// the target it defines for def-use to mean anything.
     pub stmt_spans: Vec<(u32, u32)>,
     /// Raw source from the `def` (or leading decorator) through the `:` —
-    /// the type-annotated header used verbatim in skeletons.
+    /// the type-annotated header.
     pub signature: String,
     /// Token-based cyclomatic complexity: 1 + branch keywords (includes the
     /// `and`/`or` boolean operators McCabe counts).
