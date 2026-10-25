@@ -176,21 +176,17 @@ enum Command {
         #[arg(long, value_enum, default_value_t = IndexerArg::Auto)]
         indexer: IndexerArg,
     },
-    /// Configure slop for an agent host. Codex gets a repo-local MCP entry; Claude
-    /// Code gets the plugin, and older repo-local Claude entries are removed. Preferences are user-local.
+    /// Print the Claude Code plugin install commands, after removing the repo-local
+    /// entries an older setup wrote.
     Setup {
         /// Repo root to configure (default: current directory)
         #[arg(default_value = ".")]
         repo: PathBuf,
-        /// Preferred AI host. Required when stdin is not interactive unless a
-        /// preference was saved by an earlier setup.
-        #[arg(long, value_enum)]
-        ai: Option<setup::AgentHost>,
-        /// Replace invalid or conflicting slop-owned generated files.
+        /// Remove older generated files even if their content changed after setup.
         #[arg(long)]
         force: bool,
     },
-    /// Verify the saved AI, harness receipt, project markers, and index.
+    /// Verify the binary the plugin would run, project markers, index, and policy.
     Doctor {
         /// Repo root to diagnose (default: current directory)
         #[arg(default_value = ".")]
@@ -204,21 +200,6 @@ enum Command {
         /// Remove generated files even if their content changed after setup.
         #[arg(long)]
         force: bool,
-    },
-    /// Run the preferred AI in this repository.
-    Launch {
-        /// Repo root (default: current directory)
-        #[arg(default_value = ".")]
-        repo: PathBuf,
-        /// Override the saved AI for this launch.
-        #[arg(long, value_enum)]
-        ai: Option<setup::AgentHost>,
-        /// Do not refresh the repo-local harness before launching.
-        #[arg(long)]
-        no_setup: bool,
-        /// Args passed through to the AI host (everything after `--`).
-        #[arg(last = true)]
-        args: Vec<String>,
     },
     /// Research adapter for the equivalence benchmark: each JSONL line
     /// `{"a": src, "b": src}` (one Python function each) yields every tier's verdict.
@@ -471,17 +452,14 @@ fn main() -> Result<()> {
                 resolver.files().len()
             );
         }
-        Command::Setup { repo, ai, force } => {
-            let preferences = setup::configure(&repo, ai, force)?;
-            println!(
-                "configured {:?}; run `slop doctor {}` to verify",
-                preferences.ai,
-                repo.display()
-            );
-            if preferences.ai == setup::AgentHost::Claude {
-                println!("Claude Code gets slop's hooks, MCP tools and skill from the plugin. In Claude Code, run:");
-                setup::CLAUDE_PLUGIN_STEPS.iter().for_each(|step| println!("  {step}"));
+        Command::Setup { repo, force } => {
+            let removed = setup::configure(&repo, force)?;
+            if !removed.is_empty() {
+                println!("removed an older setup's entries from {} file(s)", removed.len());
             }
+            println!("Claude Code gets slop's hooks, MCP tools and skill from the plugin. In Claude Code, run:");
+            setup::CLAUDE_PLUGIN_STEPS.iter().for_each(|step| println!("  {step}"));
+            println!("then run `slop doctor {}` to verify", repo.display());
         }
         Command::Doctor { repo } => {
             if !setup::doctor(&repo)? {
@@ -491,14 +469,6 @@ fn main() -> Result<()> {
         Command::Uninstall { repo, force } => {
             let changed = setup::uninstall(&repo, force)?;
             println!("removed slop integration from {} file(s)", changed.len());
-        }
-        Command::Launch {
-            repo,
-            ai,
-            no_setup,
-            args,
-        } => {
-            setup::launch(&repo, ai, no_setup, &args)?;
         }
         Command::Equiv { pairs, iterations } => run_equiv(&pairs, iterations)?,
         Command::Baseline { repo, index } => {

@@ -30,13 +30,10 @@ version and caches its absolute path in `${TMPDIR:-/tmp}/slop-plugin-<version>.p
 3. `uvx --from slop-cli==<version> slop`, resolved to a real path once.
 
 With none of them it exits 1 with a message naming `SLOP_BIN`, which Claude Code
-shows as a non-blocking hook error. `slop setup --ai claude` now only removes the
-`.mcp.json` entry, hooks and project skill an older setup wrote, and prints the
-two commands above.
-
-**Codex**: `slop setup <repo> --ai codex` adds a delimited MCP block to
-`.codex/config.toml`. Codex has no hooks. `slop uninstall` removes only what
-setup wrote; `slop doctor` checks the host, receipt and index.
+shows as a non-blocking hook error. `slop setup` removes the `.mcp.json` entry,
+hooks, project skill and Codex MCP block an older setup wrote (as does
+`slop uninstall`), and prints the two commands above. `slop doctor` checks the
+binary the launcher would find, the index and `slop.toml`.
 
 `[agent] gate` in `slop.toml` sets how hard the hooks push:
 

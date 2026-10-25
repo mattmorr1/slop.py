@@ -1,16 +1,14 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
-const SKILL: &str = include_str!("../../../plugin/skills/slop/SKILL.md");
 const CODEX_BLOCK_START: &str = "# >>> slop managed: mcp";
 const CODEX_BLOCK_END: &str = "# <<< slop managed: mcp";
 const STATE_PATH: &str = ".slop/install-state.json";
@@ -24,35 +22,13 @@ const SUBAGENT_CMD: &str = "hook subagent-start";
 /// What Claude Code users run instead: hooks, MCP and the skill ship as the plugin in `plugin/`.
 pub const CLAUDE_PLUGIN_STEPS: [&str; 2] = ["/plugin marketplace add mattmorr1/slop.py", "/plugin install slop@slop"];
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum AgentHost {
-    Claude,
-    Codex,
-}
-
-impl AgentHost {
-    pub fn executable(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct Preferences {
-    pub ai: AgentHost,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// The receipt an older `slop setup` wrote; read only to undo what it lists.
+#[derive(Deserialize)]
 struct InstallState {
-    schema: u8,
-    ai: AgentHost,
     files: BTreeMap<String, OwnedFile>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct OwnedFile {
     installed_hash: String,
     created: bool,
@@ -64,16 +40,60 @@ struct FileChange {
     content: Option<Vec<u8>>,
 }
 
-pub fn configure(repo: &Path, ai: Option<AgentHost>, force: bool) -> Result<Preferences> {
+/// Undo what an older setup wrote into `repo` if it left a receipt; the plugin replaces it.
+pub fn configure(repo: &Path, force: bool) -> Result<Vec<PathBuf>> {
+    if !repo.join(STATE_PATH).is_file() {
+        return Ok(Vec::new());
+    }
+    uninstall(repo, force)
+}
+
+pub fn doctor(repo: &Path) -> Result<bool> {
     let repo = canonical_repo(repo)?;
-    let prior = load_preferences().ok();
-    let ai = choose_ai(ai.or_else(|| prior.as_ref().map(|p| p.ai)))?;
-    let preferences = Preferences { ai };
-    let exe = std::env::current_exe().context("resolving the slop binary path")?;
-    let changes = install_changes(&repo, &exe, ai, force)?;
-    apply_transaction(&repo, changes)?;
-    save_preferences(&preferences)?;
-    Ok(preferences)
+    let binary = plugin_binary();
+    match &binary {
+        Some(found) => println!("ok   plugin binary: {found}"),
+        None => println!("fail plugin binary: set SLOP_BIN, put slop {} on PATH, or install uv", env!("CARGO_PKG_VERSION")),
+    }
+    let markers = ["pyproject.toml", "package.json", "Cargo.toml"];
+    let project_markers = markers
+        .iter()
+        .filter(|name| repo.join(name).is_file())
+        .count();
+    println!(
+        "{} project markers: {project_markers}",
+        if project_markers > 0 { "ok  " } else { "warn" }
+    );
+    let indexes = slop_core::analyze::index::index_paths(&repo, None);
+    if indexes.iter().all(|path| path.is_file()) {
+        println!("ok   index: {} artifact(s)", indexes.len());
+    } else {
+        println!("warn index: missing; `slop check` will build it when an indexer is available");
+    }
+    if repo.join("slop.toml").is_file() {
+        println!("ok   policy: slop.toml");
+    } else {
+        println!("warn policy: no slop.toml, so channel bypasses are not checked (run `slop init`)");
+    }
+    if repo.join(STATE_PATH).is_file() {
+        println!("warn older setup: {STATE_PATH} found; `slop setup` removes what it lists");
+    }
+    Ok(binary.is_some())
+}
+
+/// The binary the plugin launcher (`plugin/bin/slop-run`) would run, checked in its order.
+fn plugin_binary() -> Option<String> {
+    if let Some(bin) = std::env::var_os("SLOP_BIN") {
+        return Some(format!("SLOP_BIN={}", PathBuf::from(bin).display()));
+    }
+    let version = env!("CARGO_PKG_VERSION");
+    let matches = |slop: &PathBuf| Command::new(slop).arg("--version").output().is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == format!("slop {version}"));
+    on_path("slop").filter(matches).map(|slop| slop.display().to_string())
+        .or_else(|| on_path("uvx").map(|uvx| format!("{} --from slop-cli=={version} slop", uvx.display())))
+}
+
+fn on_path(command: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|dir| dir.join(command)).find(|path| path.is_file())
 }
 
 pub fn uninstall(repo: &Path, force: bool) -> Result<Vec<PathBuf>> {
@@ -118,312 +138,12 @@ pub fn uninstall(repo: &Path, force: bool) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-pub fn launch(
-    repo: &Path,
-    ai: Option<AgentHost>,
-    no_setup: bool,
-    args: &[String],
-) -> Result<()> {
-    let repo = canonical_repo(repo)?;
-    let saved = load_preferences().ok();
-    let ai = ai
-        .or_else(|| saved.as_ref().map(|p| p.ai))
-        .unwrap_or(AgentHost::Claude);
-    if !no_setup {
-        let _ = configure(&repo, Some(ai), false)?;
-    }
-    let status = Command::new(ai.executable())
-        .current_dir(&repo)
-        .args(args)
-        .status()
-        .with_context(|| format!("launching {} (is it on PATH?)", ai.executable()))?;
-    if !status.success() {
-        bail!("{} exited with {}", ai.executable(), status);
-    }
-    Ok(())
-}
-
-pub fn doctor(repo: &Path) -> Result<bool> {
-    let repo = canonical_repo(repo)?;
-    let preferences = load_preferences().ok();
-    let mut healthy = true;
-    match preferences {
-        Some(ref p) => healthy &= report_command("AI", p.ai.executable()),
-        None => {
-            println!("fail preferences: run `slop setup --ai <claude|codex>`");
-            healthy = false;
-        }
-    }
-    let state = repo.join(STATE_PATH);
-    if state.is_file() {
-        println!("ok   installation receipt: {}", state.display());
-        match read_install_state(&state) {
-            Ok(receipt) => {
-                for (relative, owned) in receipt.files {
-                    let path = repo.join(&relative);
-                    match read_optional(&path) {
-                        Ok(Some(content)) if hash(&content) == owned.installed_hash => {
-                            println!("ok   harness: {relative}");
-                        }
-                        Ok(Some(content)) if owned_content_present(&relative, &content) => {
-                            println!("ok   harness: {relative} (shared config changed)");
-                        }
-                        Ok(_) => {
-                            println!("fail harness: {relative} is missing slop's owned entry");
-                            healthy = false;
-                        }
-                        Err(error) => {
-                            println!("fail harness: {relative}: {error}");
-                            healthy = false;
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                println!("fail installation receipt: {error}");
-                healthy = false;
-            }
-        }
-    } else {
-        println!(
-            "fail installation receipt: run `slop setup {}`",
-            repo.display()
-        );
-        healthy = false;
-    }
-    let markers = ["pyproject.toml", "package.json", "Cargo.toml"];
-    let project_markers = markers
-        .iter()
-        .filter(|name| repo.join(name).is_file())
-        .count();
-    println!(
-        "{} project markers: {project_markers}",
-        if project_markers > 0 { "ok  " } else { "warn" }
-    );
-    let indexes = slop_core::analyze::index::index_paths(&repo, None);
-    if indexes.iter().all(|path| path.is_file()) {
-        println!("ok   index: {} artifact(s)", indexes.len());
-    } else {
-        println!("warn index: missing; `slop check` will build it when an indexer is available");
-    }
-    Ok(healthy)
-}
-
-fn read_install_state(path: &Path) -> Result<InstallState> {
-    serde_json::from_slice(&fs::read(path).with_context(|| format!("reading {}", path.display()))?)
-        .with_context(|| format!("parsing {}", path.display()))
-}
-
-fn owned_content_present(relative: &str, content: &[u8]) -> bool {
-    match relative {
-        ".codex/config.toml" => std::str::from_utf8(content)
-            .is_ok_and(|text| text.contains(CODEX_BLOCK_START) && text.contains(CODEX_BLOCK_END)),
-        ".mcp.json" => serde_json::from_slice::<Value>(content)
-            .ok()
-            .is_some_and(|value| !value["mcpServers"]["slop"].is_null()),
-        ".claude/settings.json" => serde_json::from_slice::<Value>(content)
-            .ok()
-            .and_then(|value| value.get("hooks").cloned())
-            .and_then(|value| value.as_object().cloned())
-            .is_some_and(|hooks| {
-                hooks
-                    .values()
-                    .filter_map(Value::as_array)
-                    .flatten()
-                    .filter_map(|group| group.get("hooks").and_then(Value::as_array))
-                    .flatten()
-                    .any(is_slop_command)
-            }),
-        ".claude/skills/slop/SKILL.md" => content == SKILL.as_bytes(),
-        _ => false,
-    }
-}
-
-pub fn load_preferences() -> Result<Preferences> {
-    let path = preferences_path()?;
-    serde_json::from_slice(&fs::read(&path).with_context(|| format!("reading {}", path.display()))?)
-        .with_context(|| format!("parsing {}", path.display()))
-}
-
-fn choose_ai(value: Option<AgentHost>) -> Result<AgentHost> {
-    if let Some(value) = value {
-        return Ok(value);
-    }
-    if !std::io::stdin().is_terminal() {
-        bail!("--ai is required outside an interactive terminal");
-    }
-    prompt(
-        "Preferred AI",
-        &[("Claude", AgentHost::Claude), ("Codex", AgentHost::Codex)],
-    )
-}
-
-fn prompt<T: Copy>(label: &str, options: &[(&str, T)]) -> Result<T> {
-    eprintln!("{label}:");
-    for (index, (name, _)) in options.iter().enumerate() {
-        eprintln!("  {}) {name}", index + 1);
-    }
-    eprint!("> ");
-    std::io::stderr().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let index = input
-        .trim()
-        .parse::<usize>()
-        .context("expected a numbered choice")?;
-    options
-        .get(index.saturating_sub(1))
-        .map(|(_, value)| *value)
-        .context("choice is out of range")
-}
-
-fn preferences_path() -> Result<PathBuf> {
-    if let Some(root) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(root).join("slop/config.json"));
-    }
-    let home =
-        std::env::var_os("HOME").context("HOME is not set; cannot locate slop preferences")?;
-    Ok(PathBuf::from(home).join(".config/slop/config.json"))
-}
-
-fn save_preferences(preferences: &Preferences) -> Result<()> {
-    let path = preferences_path()?;
-    let parent = path.parent().context("preference path has no parent")?;
-    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let bytes = format!("{}\n", serde_json::to_string_pretty(preferences)?).into_bytes();
-    atomic_replace(&path, &bytes)
-}
 
 fn canonical_repo(repo: &Path) -> Result<PathBuf> {
     repo.canonicalize()
         .with_context(|| format!("resolving repo path {}", repo.display()))
 }
 
-fn install_changes(repo: &Path, exe: &Path, ai: AgentHost, force: bool) -> Result<Vec<FileChange>> {
-    let exe = exe.to_string_lossy();
-    let repo_text = repo.to_string_lossy();
-    let host_changes = match ai {
-        AgentHost::Claude => Vec::new(),
-        AgentHost::Codex => codex_changes(repo, &exe, &repo_text, force)?,
-    };
-    let files = host_changes
-        .iter()
-        .filter_map(|change| {
-            change.content.as_ref().map(|content| {
-                (
-                    relative(repo, &change.path),
-                    OwnedFile {
-                        installed_hash: hash(content),
-                        created: !change.path.exists(),
-                    },
-                )
-            })
-        })
-        .collect();
-    let mut changes = migration_removals(repo, ai, force)?;
-    changes.extend(host_changes);
-    let state = InstallState {
-        schema: 2,
-        ai,
-        files,
-    };
-    changes.push(FileChange {
-        path: repo.join(STATE_PATH),
-        content: Some(format!("{}\n", serde_json::to_string_pretty(&state)?).into_bytes()),
-    });
-    Ok(changes)
-}
-
-/// A previous install's owned entries, removed when the host changes, and always for Claude,
-/// whose integration is now the plugin.
-fn migration_removals(repo: &Path, next: AgentHost, force: bool) -> Result<Vec<FileChange>> {
-    let path = repo.join(STATE_PATH);
-    let Some(bytes) = read_optional(&path)? else {
-        return Ok(Vec::new());
-    };
-    let state: InstallState =
-        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
-    if state.ai == next && next != AgentHost::Claude {
-        return Ok(Vec::new());
-    }
-    let mut changes = Vec::new();
-    for (relative, owned) in state.files {
-        let target = repo.join(&relative);
-        let Some(current) = read_optional(&target)? else {
-            continue;
-        };
-        let current_hash = hash(&current);
-        let updated = if owned.created && current_hash == owned.installed_hash {
-            None
-        } else {
-            remove_owned_content(&relative, &current)?
-        };
-        if updated.is_none() && current_hash != owned.installed_hash && !force {
-            bail!(
-                "{} changed since setup; refusing to replace host integration (pass --force)",
-                target.display()
-            );
-        }
-        changes.push(FileChange {
-            path: target,
-            content: updated,
-        });
-    }
-    Ok(changes)
-}
-
-fn codex_changes(repo: &Path, exe: &str, repo_text: &str, force: bool) -> Result<Vec<FileChange>> {
-    let config_path = repo.join(".codex/config.toml");
-    let existing = read_optional(&config_path)?.unwrap_or_default();
-    let text = String::from_utf8(existing)
-        .with_context(|| format!("{} is not UTF-8", config_path.display()))?;
-    let block = format!("{CODEX_BLOCK_START}\n[mcp_servers.slop]\ncommand = {}\nargs = [{}, {}]\n{CODEX_BLOCK_END}\n", toml_string(exe), toml_string("mcp"), toml_string(repo_text));
-    let merged = merge_managed_block(&text, &block, force)?;
-    Ok(vec![FileChange {
-        path: config_path,
-        content: Some(merged.into_bytes()),
-    }])
-}
-
-fn merge_managed_block(existing: &str, block: &str, force: bool) -> Result<String> {
-    match (
-        existing.find(CODEX_BLOCK_START),
-        existing.find(CODEX_BLOCK_END),
-    ) {
-        (Some(start), Some(end)) if start <= end => {
-            let end = end + CODEX_BLOCK_END.len();
-            let suffix = existing
-                .get(end..)
-                .context("invalid managed block boundary")?
-                .trim_start_matches('\n');
-            Ok(format!("{}{}{}", &existing[..start], block, suffix))
-        }
-        (None, None) => {
-            let parsed = existing.parse::<toml::Value>();
-            if !existing.trim().is_empty() && parsed.is_err() && !force {
-                bail!("existing Codex config is invalid TOML; fix it or pass --force");
-            }
-            if parsed
-                .ok()
-                .and_then(|v| v.get("mcp_servers")?.get("slop").cloned())
-                .is_some()
-            {
-                bail!("existing [mcp_servers.slop] is not slop-managed; rename or remove it first");
-            }
-            let separator = if existing.is_empty() || existing.ends_with("\n\n") {
-                ""
-            } else if existing.ends_with('\n') {
-                "\n"
-            } else {
-                "\n\n"
-            };
-            Ok(format!("{existing}{separator}{block}"))
-        }
-        _ => {
-            bail!("Codex config contains an incomplete slop-managed block; repair it before setup")
-        }
-    }
-}
 
 fn remove_owned_content(relative: &str, current: &[u8]) -> Result<Option<Vec<u8>>> {
     if relative == ".codex/config.toml" {
@@ -569,33 +289,12 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(format!(".{name}.slop-{}-{suffix}", std::process::id()))
 }
 
-fn report_command(label: &str, command: &str) -> bool {
-    let found = command_exists(command);
-    println!("{} {label}: {command}", if found { "ok  " } else { "fail" });
-    found
-}
-
-fn command_exists(command: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|path| path.join(command).is_file())
-}
 
 fn json_bytes(value: &Value) -> Result<Vec<u8>> {
     Ok(format!("{}\n", serde_json::to_string_pretty(value)?).into_bytes())
 }
 fn hash(content: &[u8]) -> String {
     blake3::hash(content).to_hex().to_string()
-}
-fn relative(repo: &Path, path: &Path) -> String {
-    path.strip_prefix(repo)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-fn toml_string(value: &str) -> String {
-    toml::Value::String(value.to_string()).to_string()
 }
 
 fn is_slop_command(hook: &Value) -> bool {
@@ -666,29 +365,10 @@ fn remove_hooks(mut existing: Value) -> Value {
     existing
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn managed_codex_block_preserves_unowned_text() {
-        let existing = "# mine\nmodel = \"x\"\n";
-        let once = merge_managed_block(
-            existing,
-            "# >>> slop managed: mcp\nx = 1\n# <<< slop managed: mcp\n",
-            false,
-        )
-        .unwrap();
-        let twice = merge_managed_block(
-            &once,
-            "# >>> slop managed: mcp\nx = 2\n# <<< slop managed: mcp\n",
-            false,
-        )
-        .unwrap();
-        assert!(twice.starts_with(existing));
-        assert!(twice.contains("x = 2"));
-        assert!(!twice.contains("x = 1"));
-    }
 
     #[test]
     fn hook_removal_keeps_similar_user_commands() {
@@ -705,36 +385,30 @@ mod tests {
     }
 
     #[test]
-    fn claude_setup_removes_what_an_older_setup_installed() {
+    fn setup_removes_what_an_older_setup_installed() {
         let repo = std::env::temp_dir().join(format!("slop-setup-{}", std::process::id()));
         let _ = fs::remove_dir_all(&repo);
         fs::create_dir_all(repo.join(".claude/skills/slop")).unwrap();
+        fs::create_dir_all(repo.join(".codex")).unwrap();
         fs::create_dir_all(repo.join(".slop")).unwrap();
         let settings = json!({ "model": "x", "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": "/bin/slop hook session-start" }] }] } });
         let mcp = json!({ "mcpServers": { "slop": { "command": "/bin/slop" }, "other": { "command": "o" } } });
-        let files = [(".claude/settings.json", json_bytes(&settings).unwrap(), false), (".mcp.json", json_bytes(&mcp).unwrap(), false), (".claude/skills/slop/SKILL.md", b"old skill".to_vec(), true)];
-        let state = InstallState { schema: 2, ai: AgentHost::Claude, files: files.iter().map(|(rel, content, created)| (rel.to_string(), OwnedFile { installed_hash: hash(content), created: *created })).collect() };
+        let codex = format!("model = \"x\"\n\n{CODEX_BLOCK_START}\n[mcp_servers.slop]\n{CODEX_BLOCK_END}\n");
+        let files = [(".claude/settings.json", json_bytes(&settings).unwrap(), false), (".mcp.json", json_bytes(&mcp).unwrap(), false), (".claude/skills/slop/SKILL.md", b"old skill".to_vec(), true), (".codex/config.toml", codex.into_bytes(), false)];
+        let owned: serde_json::Map<_, _> = files.iter().map(|(rel, content, created)| (rel.to_string(), json!({ "installed_hash": hash(content), "created": created }))).collect();
         for (rel, content, _) in &files {
             fs::write(repo.join(rel), content).unwrap();
         }
-        fs::write(repo.join(STATE_PATH), serde_json::to_vec(&state).unwrap()).unwrap();
-        let canonical = canonical_repo(&repo).unwrap();
-        apply_transaction(&canonical, install_changes(&canonical, Path::new("/bin/slop"), AgentHost::Claude, false).unwrap()).unwrap();
+        fs::write(repo.join(STATE_PATH), json_bytes(&json!({ "schema": 2, "ai": "claude", "files": owned })).unwrap()).unwrap();
+        assert_eq!(configure(&repo, false).unwrap().len(), files.len() + 1);
         let settings: Value = serde_json::from_slice(&fs::read(repo.join(".claude/settings.json")).unwrap()).unwrap();
         assert_eq!(settings, json!({ "model": "x", "hooks": {} }));
         let mcp: Value = serde_json::from_slice(&fs::read(repo.join(".mcp.json")).unwrap()).unwrap();
         assert_eq!(mcp, json!({ "mcpServers": { "other": { "command": "o" } } }));
+        assert_eq!(fs::read_to_string(repo.join(".codex/config.toml")).unwrap(), "model = \"x\"\n\n");
         assert!(!repo.join(".claude/skills/slop/SKILL.md").exists());
-        let receipt = read_install_state(&repo.join(STATE_PATH)).unwrap();
-        assert!(receipt.files.is_empty());
-        assert!(install_changes(&canonical, Path::new("/bin/slop"), AgentHost::Claude, false).unwrap().len() == 1, "a second run only rewrites the receipt");
+        assert!(!repo.join(STATE_PATH).exists());
+        assert!(configure(&repo, false).unwrap().is_empty(), "a second run has nothing to remove");
         let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn unmanaged_codex_server_is_refused() {
-        let error =
-            merge_managed_block("[mcp_servers.slop]\ncommand = \"mine\"\n", "", false).unwrap_err();
-        assert!(error.to_string().contains("not slop-managed"));
     }
 }

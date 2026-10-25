@@ -115,17 +115,11 @@ the reasons. The `reconcile` tool shows what Stop will say before it says it.
 
 `[agent] gate = "off" | "steer" | "reconcile"` in `slop.toml` turns the hooks
 off, keeps steering without the Stop gate, or keeps both (the default).
-`slop setup --ai claude` removes what older versions wrote into the repo and
-prints the two commands above.
+`slop setup` removes what older versions wrote into the repo and prints the two
+commands above; `slop doctor` checks the binary the plugin would run, the index
+and `slop.toml`.
 
-## Other agent hosts
-
-```sh
-slop setup --ai codex                   # MCP entry in .codex/config.toml
-slop launch
-slop doctor                             # check the saved host, receipt and index
-slop uninstall                          # removes only what setup wrote
-```
+## Other entry points
 
 - **MCP** (`slop mcp`): `find_capability`, `assess_write`, `query_subgraph`,
   `reconcile`, `acknowledge`.
