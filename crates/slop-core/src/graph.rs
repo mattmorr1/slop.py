@@ -63,7 +63,7 @@ pub enum NodeType {
     EffectSource,
 }
 
-/// A node in the graph (§3.2 of the execution plan).
+/// A node in the graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeEntity {
     /// e.g. "billing.gateways::StripeGateway::charge_customer"

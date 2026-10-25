@@ -1,5 +1,5 @@
-//! Detectors. Deterministic set per §3.4: infra-bypass (flagship),
-//! circular imports, dead islands, purity-lies.
+//! Detectors. The deterministic set: infra-bypass (flagship), effect-layer
+//! violation, effect-creep, dead islands, purity-lies.
 
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
@@ -229,7 +229,7 @@ pub fn dead_island(
     findings
 }
 
-/// Effect-layer violation (D2, §3.4): an entity in a policy-declared layer
+/// Effect-layer violation (D2): an entity in a policy-declared layer
 /// *directly* acquires an effect that layer forbids — the generalization of
 /// "no DB in the presentation layer". Keyed on direct acquisition (`HasEffect`
 /// edges to raw seeds), not transitive effects, so a controller that reaches
@@ -306,7 +306,7 @@ pub(crate) const IO_EFFECTS: &[Effect] = &[
     Effect::Env,
 ];
 
-/// Effect-creep (D2, §3.4): a function that was **pure** at baseline now has
+/// Effect-creep (D2): a function that was **pure** at baseline now has
 /// an I/O effect signature — a purity *regression*, distinct from purity-lie
 /// (which is name-based and baseline-free). This is the "delta vs baseline"
 /// blocker: it fires only against a `slop baseline` that recorded effects, and

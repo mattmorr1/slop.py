@@ -150,4 +150,4 @@ cargo test && cargo clippy
 ```
 
 Decisions are in [docs/adr](docs/adr); the invariants the code cites as `D<n>`
-are in `ideation/EXECUTION_PLAN.md`.
+are in the Invariants section of [CONTEXT.md](CONTEXT.md).
