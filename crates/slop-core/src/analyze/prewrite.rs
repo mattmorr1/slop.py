@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::analyze::missing::Defined;
 use crate::analyze::policy::Policy;
 use crate::analyze::precheck::{precheck, PrecheckFinding};
 use crate::analyze::retrieve::{self, Match, Neighborhood, Site};
@@ -111,13 +112,18 @@ fn call_site(repo: &Path, caller: &Site, label: &str) -> Option<(usize, String)>
         .map(|(n, l)| (n, l.trim().to_string()))
 }
 
+/// What SessionStart leaves for the per-call hooks, which never build the graph or read SCIP.
 #[derive(Deserialize)]
-struct PrewriteSidecar {
+pub struct PrewriteSidecar {
     schema_version: u32,
-    snapshot: SnapshotId,
-    freshness: SnapshotFreshness,
-    neighborhood: Neighborhood,
-    equivalents: EquivalenceIndex,
+    pub snapshot: SnapshotId,
+    pub freshness: SnapshotFreshness,
+    pub neighborhood: Neighborhood,
+    pub equivalents: EquivalenceIndex,
+    /// Same-shape index (names and literals erased): advisory matches only.
+    pub structural: EquivalenceIndex,
+    /// Functions, classes and methods by module, for `missing` suggestions.
+    pub defined: Vec<Defined>,
 }
 
 #[derive(Serialize)]
@@ -127,17 +133,37 @@ struct PrewriteSidecarRef<'a> {
     freshness: &'a SnapshotFreshness,
     neighborhood: &'a Neighborhood,
     equivalents: &'a EquivalenceIndex,
+    structural: &'a EquivalenceIndex,
+    defined: &'a [Defined],
 }
 
 /// Every non-test function's E-sound hash; tiny bodies have none (the significance floor).
 pub fn equivalence_index(snapshot: &RepositorySnapshot) -> EquivalenceIndex {
+    hash_index(snapshot, |fact| &fact.equiv_hash)
+}
+
+pub fn structural_index(snapshot: &RepositorySnapshot) -> EquivalenceIndex {
+    hash_index(snapshot, |fact| &fact.structural_hash)
+}
+
+/// Every non-test Python function, class and method, from the snapshot's sources.
+pub fn defined_index(snapshot: &RepositorySnapshot) -> Vec<Defined> {
+    snapshot
+        .sources
+        .iter()
+        .filter(|(file, _)| file.ends_with(".py") && !crate::analyze::source::is_test_file(file))
+        .flat_map(|(file, text)| crate::analyze::missing::defined_names(file, text))
+        .collect()
+}
+
+fn hash_index(snapshot: &RepositorySnapshot, key: impl Fn(&crate::parse::FunctionFacts) -> &String) -> EquivalenceIndex {
     let by_location = crate::analyze::source::location_index(&snapshot.built);
     let mut index: EquivalenceIndex = BTreeMap::new();
     for file_facts in snapshot.facts.iter().filter(|f| !crate::analyze::source::is_test_file(&f.file)) {
-        for fact in file_facts.functions.iter().filter(|f| !f.equiv_hash.is_empty()) {
+        for fact in file_facts.functions.iter().filter(|f| !key(f).is_empty()) {
             let label = crate::analyze::source::entity_for(&snapshot.built, &by_location, &file_facts.file, fact)
                 .map_or_else(|| fact.name.clone(), |entity| entity.id.clone());
-            index.entry(fact.equiv_hash.clone()).or_default().push(Site {
+            index.entry(key(fact).clone()).or_default().push(Site {
                 label,
                 file: file_facts.file.clone(),
                 start: fact.start_line as usize,
@@ -241,6 +267,8 @@ impl RepositorySnapshot {
                     freshness: self.freshness(),
                     neighborhood: self.neighborhood(),
                     equivalents: &equivalence_index(self),
+                    structural: &structural_index(self),
+                    defined: &defined_index(self),
                 },
             )?;
             writer.write_all(b"\n")?;
@@ -263,13 +291,8 @@ pub fn sidecar_path(repo: &Path) -> PathBuf {
     std::env::temp_dir().join(format!("slop-prewrite-v1-{digest}.json"))
 }
 
-pub fn assess_from_sidecar(
-    repo: &Path,
-    policy: &Policy,
-    file: &str,
-    source: &str,
-    limit: usize,
-) -> Result<Option<WriteAssessment>> {
+/// The sidecar for `repo`, `None` when SessionStart or `slop index` has not written one.
+pub fn load_sidecar(repo: &Path) -> Result<Option<PrewriteSidecar>> {
     let path = sidecar_path(repo);
     let file_handle = match File::open(&path) {
         Ok(file) => file,
@@ -292,19 +315,12 @@ pub fn assess_from_sidecar(
             PREWRITE_SCHEMA_VERSION
         );
     }
+    Ok(Some(sidecar))
+}
+
+pub fn assess_from_sidecar(repo: &Path, sidecar: &PrewriteSidecar, policy: &Policy, file: &str, source: &str, limit: usize) -> Result<WriteAssessment> {
     let current = std::fs::read_to_string(repo.join(file)).ok();
-    assess(
-        sidecar.snapshot,
-        sidecar.freshness,
-        policy,
-        &sidecar.neighborhood,
-        &sidecar.equivalents,
-        file,
-        source,
-        current.as_deref(),
-        limit,
-    )
-    .map(Some)
+    assess(sidecar.snapshot.clone(), sidecar.freshness.clone(), policy, &sidecar.neighborhood, &sidecar.equivalents, file, source, current.as_deref(), limit)
 }
 
 #[cfg(test)]
@@ -381,15 +397,16 @@ mod tests {
         let first = std::fs::read(&path).unwrap();
         snapshot.write_prewrite_sidecar().expect("rewrite sidecar");
         assert_eq!(std::fs::read(&path).unwrap(), first);
+        let sidecar = load_sidecar(&repo).expect("read sidecar").expect("sidecar exists");
         let assessment = assess_from_sidecar(
             &repo,
+            &sidecar,
             &snapshot.policy,
             "services/new_notify.py",
             "def emit(rows):\n    report = build_report(rows)\n    send_notification(report)\n",
             3,
         )
-        .expect("read sidecar")
-        .expect("sidecar exists");
+        .expect("assess");
         assert_eq!(assessment.snapshot, snapshot.id().clone());
         assert!(!assessment.reuse_suggestions.is_empty());
         let _ = std::fs::remove_file(path);

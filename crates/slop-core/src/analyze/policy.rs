@@ -23,6 +23,27 @@ pub struct Policy {
     /// layer"). Empty = silent (D8), like `channels`.
     #[serde(default, rename = "layer")]
     pub layers: Vec<LayerRule>,
+    #[serde(default)]
+    pub agent: AgentConfig,
+}
+
+/// `[agent]` in `slop.toml`: how hard the Claude Code hooks push.
+#[derive(Debug, Default, Deserialize)]
+pub struct AgentConfig {
+    #[serde(default)]
+    pub gate: Gate,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Gate {
+    /// No steering and no Stop gate.
+    Off,
+    /// PreToolUse context only.
+    Steer,
+    /// Steering, plus a Stop block on unacknowledged provable findings.
+    #[default]
+    Reconcile,
 }
 
 /// One architectural-layer rule (a `[[layer]]` table in `slop.toml`).

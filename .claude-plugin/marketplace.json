@@ -1,0 +1,12 @@
+{
+  "name": "slop",
+  "description": "slop: codebase-relative checks that stop an agent from copying, bypassing or inventing code",
+  "owner": {"name": "mattmorr1"},
+  "plugins": [
+    {
+      "name": "slop",
+      "source": "./plugin",
+      "description": "Steers writes toward code the repository already has and blocks a turn that ends with a provable copy, a call to a name that does not exist, or a sanctioned-channel bypass"
+    }
+  ]
+}

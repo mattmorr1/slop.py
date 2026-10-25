@@ -2,15 +2,10 @@
 //!
 //! - `pre-tool-use` — pre-check a proposed write against policy and the
 //!   prewrite sidecar.
-//! - `post-tool-use` — attach sanctioned-channel steering to source reads.
-//!   `slop setup` no longer registers it; it stays so older installs keep working.
-//! - `user-prompt-submit` — inject the repo's sanctioned-channel policy as
-//!   pre-hoc steering ("route Net through core.http.Client; don't use urllib").
-//! - `session-start` / `subagent-start` — inject the codebase world model.
+//! - `session-start` / `subagent-start` — record the session baseline, inject the world model.
+//! - `stop` — the reconcile gate over what the session changed.
 //!
-//! The per-call hooks derive steering from `slop.toml` alone (cheap — no SCIP
-//! index, no graph build). The heavier graph-backed checks live behind
-//! `validate_change` / `slop gate`.
+//! PreToolUse and Stop read `slop.toml` and the prewrite sidecar only: no SCIP, no graph build.
 
 use std::path::{Path, PathBuf};
 
@@ -18,10 +13,10 @@ use serde_json::{json, Value};
 
 use crate::parse::Language;
 
-use crate::analyze::policy::Policy;
+use crate::analyze::missing::Resolver;
+use crate::analyze::policy::{Gate, Policy};
 use crate::analyze::precheck::precheck;
-use crate::analyze::prewrite;
-use crate::analyze::world;
+use crate::analyze::{prewrite, reconcile, session, world};
 
 /// Nearest ancestor of `start` (inclusive) containing `slop.toml`, else the
 /// nearest `.git` root, else `start` itself. Hooks are launched from the
@@ -39,26 +34,6 @@ fn find_repo_root(start: &Path) -> PathBuf {
         dir = d.parent();
     }
     git_root.unwrap_or(start).to_path_buf()
-}
-
-/// Sanctioned-channel policy rendered as agent-facing steering, or `None`
-/// when the repo has no policy (stay silent — no cold-start noise, D8).
-pub fn channel_steering(policy: &Policy) -> Option<String> {
-    if policy.channels.is_empty() {
-        return None;
-    }
-    let mut keys: Vec<&String> = policy.channels.keys().collect();
-    keys.sort();
-    let mut lines = vec![
-        "slop: this codebase routes effects through sanctioned channels — reuse them, don't reimplement:".to_string(),
-    ];
-    for key in keys {
-        let chans = &policy.channels[key];
-        if !chans.is_empty() {
-            lines.push(format!("  - {}: {}", key, chans.join(", ")));
-        }
-    }
-    Some(lines.join("\n"))
 }
 
 fn as_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -133,7 +108,7 @@ pub fn log_hook(input: &Value, event: &str, output: &Value, elapsed: std::time::
     let context = hook.and_then(|h| as_str(h, "additionalContext")).unwrap_or("");
     let count = |needle: &str| context.lines().filter(|l| l.starts_with(needle)).count();
     let line = json!({
-        "at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        "at": now(),
         "event": event,
         "tool": as_str(input, "tool_name"),
         "file": file.as_deref().and_then(|f| repo_relative(&repo, f)),
@@ -141,7 +116,18 @@ pub fn log_hook(input: &Value, event: &str, output: &Value, elapsed: std::time::
         "injected_tokens": context.len() / 4,
         "duplicates": count("slop: new `"),
         "reuse": count("slop: proposed code overlaps"),
+        "missing": count("slop: missing"),
+        "decision": as_str(output, "decision"),
+        "blocked": as_str(output, "reason").map_or(0, |r| r.lines().filter(|l| l.starts_with(|c: char| c.is_ascii_digit())).count()),
     });
+    append_log(&repo, &line);
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn append_log(repo: &Path, line: &Value) {
     let path = repo.join(".slop/hooks.jsonl");
     let written = std::fs::create_dir_all(repo.join(".slop")).and_then(|()| {
         use std::io::Write;
@@ -150,6 +136,14 @@ pub fn log_hook(input: &Value, event: &str, output: &Value, elapsed: std::time::
     });
     if let Err(error) = written {
         eprintln!("slop: could not write {}: {error}", path.display());
+    }
+}
+
+/// A hook's internal error, to stderr and `.slop/hooks.jsonl`: failing open is logged, never silent.
+pub fn log_error(repo: &Path, event: &str, error: &anyhow::Error) {
+    eprintln!("slop {event}: {error:#}");
+    if !std::env::var("SLOP_HOOK_LOG").is_ok_and(|v| v == "0") {
+        append_log(repo, &json!({ "at": now(), "event": event, "error": format!("{error:#}") }));
     }
 }
 
@@ -173,28 +167,36 @@ pub fn handle_pre_tool_use(input: &Value) -> Value {
         return json!({});
     };
     let repo = find_repo_root(&cwd);
-    let policy = Policy::load(&repo).unwrap_or_default();
     let Some(rel) = repo_relative(&repo, &file) else {
         return json!({});
     };
+    let policy = Policy::load(&repo).inspect_err(|error| log_error(&repo, "PreToolUse", error)).unwrap_or_default();
+    if policy.agent.gate == Gate::Off {
+        return json!({});
+    }
     let Some(content) = proposed_content(tool, input, Path::new(&file)) else {
         return json!({});
     };
-    let mut context = match prewrite::assess_from_sidecar(&repo, &policy, &rel, &content, 3) {
-        Ok(Some(assessment)) => assessment.steering(&repo),
-        Ok(None) => precheck(lang, &rel, &content, &policy)
-            .iter()
-            .map(|finding| finding.steering())
-            .collect(),
-        Err(error) => {
-            let mut context: Vec<String> = precheck(lang, &rel, &content, &policy)
-                .iter()
-                .map(|finding| finding.steering())
-                .collect();
-            context.push(format!("slop: reuse suggestions unavailable: {error:#}"));
-            context
-        }
+    let (sidecar, error) = match prewrite::load_sidecar(&repo) {
+        Ok(sidecar) => (sidecar, None),
+        Err(error) => (None, Some(error)),
     };
+    let assessment = sidecar.as_ref().map(|s| prewrite::assess_from_sidecar(&repo, s, &policy, &rel, &content, 3));
+    let mut context: Vec<String> = match &assessment {
+        Some(Ok(assessment)) => assessment.steering(&repo),
+        _ => precheck(lang, &rel, &content, &policy).iter().map(|finding| finding.steering()).collect(),
+    };
+    if let Some(error) = error.or_else(|| assessment.and_then(Result::err)) {
+        log_error(&repo, "PreToolUse", &error);
+        context.push(format!("slop: reuse suggestions unavailable: {error:#}"));
+    }
+    if lang == Language::Python {
+        let before = std::fs::read_to_string(&file).ok();
+        context.extend(reconcile::new_missing(&mut Resolver::new(&repo), &rel, before.as_deref(), &content).iter().map(|call| {
+            let finding = reconcile::missing_finding(&rel, call, sidecar.as_ref());
+            format!("slop: missing `{}` at {}:{}: {}; {}.", call.name, rel, finding.line + 1, finding.fact, finding.action)
+        }));
+    }
     context.dedup();
     if context.is_empty() {
         return json!({});
@@ -207,22 +209,41 @@ pub fn handle_pre_tool_use(input: &Value) -> Value {
     })
 }
 
-/// PostToolUse handler: sanctioned-channel steering on a source-file read as
-/// `additionalContext`, or an empty object (no-op passthrough).
-pub fn handle_post_tool_use(input: &Value) -> Value {
-    if as_str(input, "tool_name") != Some("Read") {
+/// Stop handler (L2): block the end of a turn, once per finding, while the code this session
+/// changed holds an unacknowledged provable problem. Any internal error allows the stop.
+pub fn handle_stop(input: &Value) -> Value {
+    if input.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
         return json!({});
     }
-    let (file, cwd) = read_target(input);
-    if !file.is_some_and(|f| Language::from_path(&f).is_some()) {
-        return json!({});
+    let repo = find_repo_root(&read_target(input).1);
+    stop(&repo, input).unwrap_or_else(|error| {
+        log_error(&repo, "Stop", &error.context("failing open"));
+        json!({})
+    })
+}
+
+fn stop(repo: &Path, input: &Value) -> anyhow::Result<Value> {
+    use anyhow::Context;
+    let policy = Policy::load(repo)?;
+    if policy.agent.gate != Gate::Reconcile {
+        return Ok(json!({}));
     }
-    match channel_steering(&Policy::load(&find_repo_root(&cwd)).unwrap_or_default()) {
-        Some(steering) => json!({
-            "hookSpecificOutput": { "hookEventName": "PostToolUse", "additionalContext": steering }
-        }),
-        None => json!({}),
+    let id = as_str(input, "session_id").context("Stop payload has no session_id")?;
+    let mut session = session::load(repo, id)?;
+    let changes = session::changes(repo, &session)?;
+    if changes.is_empty() {
+        return Ok(json!({}));
     }
+    let sidecar = prewrite::load_sidecar(repo)?;
+    let report = reconcile::reconcile(repo, &changes, sidecar.as_ref(), &policy);
+    let acked = reconcile::acknowledged(repo)?;
+    let fresh: Vec<_> = report.findings.into_iter().filter(|f| !acked.contains(&f.id) && !session.blocked.contains(&f.id)).collect();
+    if fresh.is_empty() {
+        return Ok(json!({}));
+    }
+    session.blocked.extend(fresh.iter().map(|f| f.id.clone()));
+    session::save(repo, id, &session)?;
+    Ok(json!({ "decision": "block", "reason": reconcile::render(&fresh, &report.advisory) }))
 }
 
 /// SessionStart / SubagentStart handler (W4): inject the codebase world model
@@ -237,11 +258,19 @@ pub fn handle_session_start(input: &Value, event: &str) -> Value {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let repo = find_repo_root(&cwd);
-    let analysis = crate::analyze::check::load_analysis(&repo, None).ok();
+    if let Some(Err(error)) = as_str(input, "session_id").map(|id| session::start(&repo, id)) {
+        log_error(&repo, event, &error);
+    }
+    let analysis = crate::analyze::check::load_analysis(&repo, None)
+        .inspect_err(|error| log_error(&repo, event, error))
+        .ok();
     let sidecar_error = analysis
         .as_ref()
         .and_then(|snapshot| snapshot.write_prewrite_sidecar().err());
-    let fallback_policy = Policy::load(&repo).unwrap_or_default();
+    if let Some(error) = &sidecar_error {
+        log_error(&repo, event, error);
+    }
+    let fallback_policy = Policy::load(&repo).inspect_err(|error| log_error(&repo, event, error)).unwrap_or_default();
     let policy = analysis
         .as_ref()
         .map_or(&fallback_policy, |snapshot| &snapshot.policy);
@@ -251,38 +280,18 @@ pub fn handle_session_start(input: &Value, event: &str) -> Value {
         .map(|a| crate::analyze::config::env_vars(&repo, &a.facts))
         .unwrap_or_default();
 
-    let Some(mut context) = world::render(policy, built, &env, world::DEFAULT_BUDGET) else {
+    if policy.agent.gate == Gate::Off {
         return json!({});
-    };
-    if let Some(error) = sidecar_error {
-        context.push_str(&format!("\nslop: prewrite sidecar unavailable: {error:#}"));
     }
+    let mut context = world::render(policy, built, &env, world::DEFAULT_BUDGET).map_or_else(String::new, |world| world + "\n");
+    if let Some(error) = sidecar_error {
+        context.push_str(&format!("slop: prewrite sidecar unavailable: {error:#}\n"));
+    }
+    let scope = as_str(input, "session_id").map_or_else(String::new, |id| format!(" with session_id \"{id}\""));
+    context.push_str(&format!("slop: before finishing, call slop's `reconcile` tool{scope} to check what you changed; use `query_subgraph` to find the channel for an effect."));
     json!({
         "hookSpecificOutput": {
             "hookEventName": event,
-            "additionalContext": context,
-        }
-    })
-}
-
-/// UserPromptSubmit handler: inject the repo's sanctioned-channel policy plus
-/// a pointer to slop's validation tool as pre-hoc steering.
-pub fn handle_user_prompt_submit(input: &Value) -> Value {
-    let cwd = as_str(input, "cwd")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let policy = Policy::load(&find_repo_root(&cwd)).unwrap_or_default();
-
-    let Some(channels) = channel_steering(&policy) else {
-        return json!({});
-    };
-    let context = format!(
-        "{channels}\nBefore finishing, validate new code with slop's `validate_change` tool; \
-         use `query_subgraph` to find the right channel for an effect."
-    );
-    json!({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
             "additionalContext": context,
         }
     })
@@ -292,47 +301,6 @@ pub fn handle_user_prompt_submit(input: &Value) -> Value {
 mod tests {
     use super::*;
     use crate::analyze::test_support::TempFixture;
-
-    fn input_in_dir_without_policy() -> Value {
-        json!({"cwd": "/does/not/matter"})
-    }
-
-    #[test]
-    fn non_read_tools_pass_through() {
-        let out = handle_post_tool_use(&json!({
-            "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_output": "x"
-        }));
-        assert_eq!(out, json!({}));
-    }
-
-    #[test]
-    fn non_python_reads_pass_through() {
-        let out = handle_post_tool_use(&json!({
-            "tool_name": "Read", "tool_input": {"file_path": "/x/README.md"},
-            "tool_output": "# title\n\n\n\nbody"
-        }));
-        assert_eq!(out, json!({}));
-    }
-
-    #[test]
-    fn channel_steering_lists_sorted_channels() {
-        let policy: Policy = toml::from_str(
-            "[channels]\nnet = [\"core.http.Client\"]\ndb = [\"core.db.Session\"]",
-        )
-        .unwrap();
-        let s = channel_steering(&policy).unwrap();
-        // Sorted keys: db before net.
-        assert!(s.find("db:").unwrap() < s.find("net:").unwrap());
-        assert!(s.contains("core.http.Client"));
-    }
-
-    #[test]
-    fn empty_policy_yields_no_steering() {
-        assert!(channel_steering(&Policy::default()).is_none());
-        // ...and UserPromptSubmit stays silent.
-        let out = handle_user_prompt_submit(&input_in_dir_without_policy());
-        assert_eq!(out, json!({}));
-    }
 
     /// A repo with a Net channel policy and a file on disk to Edit against.
     fn repo_with_policy(tag: &str) -> PathBuf {
@@ -426,7 +394,6 @@ mod tests {
             "tool_input": { "file_path": "/nope/a.py", "content": "import requests\n" }
         }));
         assert_eq!(out, json!({}));
-        // Reads are the PostToolUse hook's business, not this one's.
         assert_eq!(
             handle_pre_tool_use(&json!({
                 "tool_name": "Read", "tool_input": {"file_path": "/x/a.py"}

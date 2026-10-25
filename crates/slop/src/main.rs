@@ -24,8 +24,8 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// Hook events slop can handle. Kebab-cased on the CLI by clap:
-/// `post-tool-use`, `user-prompt-submit`.
+/// Hook events slop can handle, kebab-cased on the CLI. `post-tool-use` and
+/// `user-prompt-submit` are no-ops kept so hooks from older installs still exit cleanly.
 #[derive(Clone, Copy, ValueEnum)]
 enum HookEvent {
     PreToolUse,
@@ -33,6 +33,7 @@ enum HookEvent {
     UserPromptSubmit,
     SessionStart,
     SubagentStart,
+    Stop,
 }
 
 /// Which SCIP indexer `slop index` runs. Mirrors [`Indexer`]; separate only
@@ -156,8 +157,8 @@ enum Command {
         #[arg(long)]
         index: Option<PathBuf>,
     },
-    /// Serve slop's MCP tools (find_capability, assess_write, validate_change,
-    /// query_subgraph) over stdio. Launched by an agent host
+    /// Serve slop's MCP tools (find_capability, assess_write, query_subgraph, reconcile,
+    /// acknowledge) over stdio. Launched by an agent host
     /// (e.g. Claude Code); speaks newline-delimited JSON-RPC 2.0.
     Mcp {
         /// Repo root the tools default to (default: current directory)
@@ -167,6 +168,9 @@ enum Command {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Print this binary's absolute path; the plugin launcher caches it.
+    #[command(hide = true)]
+    SelfPath,
     /// Generate SCIP artifacts for every detected language. Explicit
     /// --indexer/--output retains the single-artifact compatibility seam.
     Index {
@@ -183,9 +187,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = IndexerArg::Auto)]
         indexer: IndexerArg,
     },
-    /// Configure slop for an agent host and editor, then install the repo-local
-    /// harness transactionally. Preferences are user-local; harness files are
-    /// project-local and can be removed with `slop uninstall`.
+    /// Configure slop for an agent host and editor. Codex gets a repo-local MCP entry; Claude
+    /// Code gets the plugin, and older repo-local Claude entries are removed. Preferences are user-local.
     Setup {
         /// Repo root to configure (default: current directory)
         #[arg(default_value = ".")]
@@ -418,20 +421,19 @@ fn main() -> Result<()> {
             use std::io::Read;
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
-            // Hooks run on every read/write, so payload we can't parse is a
-            // silent no-op rather than an error: a non-zero exit here would
-            // surface as a hook failure in the agent host on each tool call.
-            // Same discipline as the read-remap, which passes a read through
-            // untouched rather than risk corrupting it.
-            let input: serde_json::Value =
-                serde_json::from_str(&buf).unwrap_or_else(|_| serde_json::json!({}));
+            // A payload we can't parse is a logged no-op: a non-zero exit would fail every tool call.
+            let input: serde_json::Value = serde_json::from_str(&buf).unwrap_or_else(|error| {
+                harness::log_error(Path::new("."), "hook", &anyhow::Error::new(error).context("unparseable hook payload"));
+                serde_json::json!({})
+            });
             let started = std::time::Instant::now();
             let (name, output) = match event {
                 HookEvent::PreToolUse => ("PreToolUse", harness::handle_pre_tool_use(&input)),
-                HookEvent::PostToolUse => ("PostToolUse", harness::handle_post_tool_use(&input)),
-                HookEvent::UserPromptSubmit => ("UserPromptSubmit", harness::handle_user_prompt_submit(&input)),
+                HookEvent::PostToolUse => ("PostToolUse", serde_json::json!({})),
+                HookEvent::UserPromptSubmit => ("UserPromptSubmit", serde_json::json!({})),
                 HookEvent::SessionStart => ("SessionStart", harness::handle_session_start(&input, "SessionStart")),
                 HookEvent::SubagentStart => ("SubagentStart", harness::handle_session_start(&input, "SubagentStart")),
+                HookEvent::Stop => ("Stop", harness::handle_stop(&input)),
             };
             println!("{output}");
             harness::log_hook(&input, name, &output, started.elapsed());
@@ -442,6 +444,7 @@ fn main() -> Result<()> {
         Command::Mcp { repo, index } => {
             slop_cli::mcp::serve_stdio(repo, index)?;
         }
+        Command::SelfPath => println!("{}", std::env::current_exe()?.canonicalize()?.display()),
         Command::Index {
             repo,
             output,
@@ -504,6 +507,10 @@ fn main() -> Result<()> {
                 preferences.editor,
                 repo.display()
             );
+            if preferences.ai == setup::AgentHost::Claude {
+                println!("Claude Code gets slop's hooks, MCP tools and skill from the plugin. In Claude Code, run:");
+                setup::CLAUDE_PLUGIN_STEPS.iter().for_each(|step| println!("  {step}"));
+            }
         }
         Command::Doctor { repo } => {
             if !setup::doctor(&repo)? {

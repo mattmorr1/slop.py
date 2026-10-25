@@ -48,7 +48,7 @@ pub fn reference_counts(built: &BuiltGraph) -> HashMap<NodeIndex, usize> {
 
 /// Content words of `s`, lowercased, split on non-alphanumerics and camelCase
 /// boundaries so `fetchUrl`, `fetch_url` and "fetch a url" all agree.
-fn tokens(s: &str) -> Vec<String> {
+pub(crate) fn tokens(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut prev_lower = false;

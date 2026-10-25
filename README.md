@@ -80,20 +80,55 @@ records effect signatures for `effect-creep`. Rule ids removed in P0
 `slop-name`, `over-commenting`) stay reserved: old suppressions naming them are
 accepted and do nothing.
 
-## Agent harness
+## Claude Code
 
-```sh
-slop setup --ai claude --editor cursor   # or --ai codex
-slop launch
-slop doctor                              # check the saved host, receipt and index
-slop uninstall                           # removes only what setup wrote
+Install the plugin from inside Claude Code:
+
+```
+/plugin marketplace add mattmorr1/slop.py
+/plugin install slop@slop
 ```
 
-- **MCP** (`slop mcp`): `find_capability`, `assess_write`, `validate_change`,
-  `query_subgraph`.
-- **Hooks** (`slop hook <event>`): write-time duplicate and reuse checks before
-  a write lands, sanctioned-channel steering on each prompt, and the repo's
-  world model (channels, layers, capability index) at session and subagent start.
+The plugin runs the `slop` binary it finds: `$SLOP_BIN`, then a `slop` of the
+same version on `PATH`, then `uvx --from slop-cli`. Index the repo once with
+`slop index` so the hooks have something to compare against.
+
+**What blocks.** At the end of a turn, the Stop hook checks only what this
+session changed and blocks once per *provable* problem:
+
+- a new function that is provably equivalent to one the repo already has;
+- a call to a name that provably does not exist (with "did you mean"
+  suggestions);
+- new raw network, file, database or env access that bypasses the channel
+  `slop.toml` sanctions.
+
+**What never blocks.** Writes: PreToolUse only adds context before a write lands
+(the same three checks plus existing code worth reusing). Ranked matches such as
+a similar shape or overlapping calls, files that were already dirty when the
+session started, and any internal slop error. Each block names its finding once,
+and a second Stop in the same turn is always allowed.
+
+**Acknowledging.** Each finding has an id. If it is intentional, the agent calls
+the `acknowledge` tool with the id and a reason. That appends to
+`.slop/acks.jsonl`, and the id stops blocking; commit the file so reviewers see
+the reasons. The `reconcile` tool shows what Stop will say before it says it.
+
+`[agent] gate = "off" | "steer" | "reconcile"` in `slop.toml` turns the hooks
+off, keeps steering without the Stop gate, or keeps both (the default).
+`slop setup --ai claude` removes what older versions wrote into the repo and
+prints the two commands above.
+
+## Other agent hosts
+
+```sh
+slop setup --ai codex --editor cursor   # MCP entry in .codex/config.toml
+slop launch
+slop doctor                             # check the saved host, receipt and index
+slop uninstall                          # removes only what setup wrote
+```
+
+- **MCP** (`slop mcp`): `find_capability`, `assess_write`, `query_subgraph`,
+  `reconcile`, `acknowledge`.
 - **Gate** (`slop gate`): the CI and agent fix-loop entry point.
 
 slop never edits code itself; findings carry `fix_guidance` for the agent.
