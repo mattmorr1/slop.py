@@ -14,6 +14,7 @@ pub mod gate;
 pub mod harness;
 pub mod health;
 pub mod index;
+pub mod missing;
 pub mod infer;
 pub mod overlay;
 pub mod policy;
