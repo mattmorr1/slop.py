@@ -66,7 +66,8 @@ class Catalog:
 
     def tree(self, file: str):
         if file not in self.trees:
-            text = (self.repo / file).read_text(errors="replace")
+            path = self.repo / file
+            text = path.read_text(errors="replace") if path.exists() else ""  # a new destination file has no imports yet
             self.lines[file] = text.splitlines()
             try:
                 self.trees[file] = ast.parse(text)

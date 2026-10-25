@@ -252,6 +252,27 @@ def score(args) -> None:
     print(f"\nappended to {ledger}")
 
 
+def dupes(args) -> None:
+    """Secondary check: each known copy as the sketch (written to a new file), are the other copies in bind's top 5?"""
+    import b5_bind
+    binder = b5_bind.Binder(args.repo.resolve())
+    cat, rows = binder.catalog, []
+    for spec in args.group:
+        label, members = spec.split("=", 1)
+        entities = [next(e for e, v in cat.entries.items() if v["file"] == f and v["name"] == n)
+                    for f, n in (m.rsplit(":", 1) for m in members.split(","))]
+        for entity in entities:
+            file = cat.entries[entity]["file"]
+            result = binder.bind(cat.nodes[entity], file if args.in_place else f"{file.rsplit('/', 1)[0]}/b5_sketch.py", entity)
+            ranks = {o: result["ranked"].index(o) + 1 if o in result["ranked"] else None for o in entities if o != entity}
+            rows.append({"group": label, "sketch": entity, "others_in_top5": sum(r is not None and r <= TOP for r in ranks.values()),
+                         "others": len(ranks), "ranks": ranks, "esound": result["esound"]})
+            print(f"{label}: {entity} -> {rows[-1]['others_in_top5']}/{len(ranks)} in top 5, ranks {list(ranks.values())}, E-sound {result['esound']}")
+    binder.mcp.close()
+    hits = sum(r["others_in_top5"] for r in rows)
+    print(f"{hits}/{sum(r['others'] for r in rows)} other copies in the top 5")
+
+
 def generate(args) -> None:
     done = set()
     if args.out.exists():
@@ -301,8 +322,12 @@ def main() -> None:
     s.add_argument("--sketches", type=Path, nargs="+", required=True)
     s.add_argument("--trace", type=Path, help="per-sketch bindings (top 20, signals, latency) for replay")
     s.add_argument("--binary-commit", default="278c7fb")
+    d = sub.add_parser("dupes")
+    d.add_argument("--repo", type=Path, required=True)
+    d.add_argument("--in-place", action="store_true", help="destination is the copy's own file, not a new file beside it")
+    d.add_argument("--group", action="append", required=True, help="LABEL=file:name,file:name,...")
     args = parser.parse_args()
-    {"prepare": prepare, "generate": generate, "score": score}[args.stage](args)
+    {"prepare": prepare, "generate": generate, "score": score, "dupes": dupes}[args.stage](args)
 
 
 if __name__ == "__main__":
