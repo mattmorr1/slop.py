@@ -31,9 +31,6 @@ impl EffectSet {
     pub fn pure() -> Self {
         Self::default()
     }
-    pub fn is_pure(&self) -> bool {
-        self.0.is_empty()
-    }
     pub fn insert(&mut self, e: Effect) {
         if let Err(pos) = self.0.binary_search(&e) {
             self.0.insert(pos, e);

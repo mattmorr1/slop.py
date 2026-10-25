@@ -45,10 +45,6 @@ impl IndexSet {
         })
     }
 
-    pub fn artifact_count(&self) -> usize {
-        self.resolvers.len()
-    }
-
     pub fn definition_count(&self) -> usize {
         self.resolvers
             .iter()
