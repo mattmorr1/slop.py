@@ -139,4 +139,13 @@ Labels go to `bench/results/b6_labels.jsonl`, one line each:
 
 ## Changes after the first corpus run
 
-None yet.
+1. Harness only, after unit 1 of the first run: `reconcile` over MCP failed
+   with "an index was rewritten while capturing analysis; retry the command".
+   The tool's own first capture queues a background reindex (the server's
+   refresher), which rewrites the index while the same call's `check::run`
+   captures again. The run was stopped after that unit and discarded; the
+   harness now keeps one `slop mcp` process per unit and retries only that
+   error (2 s apart, within the 600 s timeout), recording the retry count.
+   The background reindex does not rewrite the prewrite sidecar, so the
+   provable and advisory lists are unaffected; only the detector list sees
+   the reindexed tree. Reported as a slop bug, not fixed.

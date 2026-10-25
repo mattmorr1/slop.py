@@ -4,7 +4,7 @@
   python3 bench/b6_replay.py run --repo NAME=PATH [...] --work /tmp/b6 [--list]
   python3 bench/b6_replay.py score [--ledger bench/results/replay.jsonl] [--labels bench/results/b6_labels.jsonl]
 """
-import argparse, json, os, platform, random, re, subprocess, sys, time, uuid
+import argparse, json, os, platform, random, re, select, subprocess, sys, time, uuid
 from pathlib import Path
 
 SEED, CAP = 20261025, 60
@@ -43,17 +43,44 @@ def hook(repo, event, payload):
     return ms, out, p.returncode, p.stderr.strip()[-400:]
 
 
-def mcp_reconcile(repo, session_id):
-    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "b6", "version": "1"}}},
-            {"jsonrpc": "2.0", "method": "notifications/initialized"},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "reconcile", "arguments": {"session_id": session_id}}}]
-    at = time.perf_counter()
-    p = sh([str(BIN), "mcp", str(repo)], stdin="".join(json.dumps(m) + "\n" for m in msgs), timeout=MCP_TIMEOUT, check=False)
-    ms = (time.perf_counter() - at) * 1000
-    reply = next((json.loads(l) for l in p.stdout.splitlines() if l.strip() and json.loads(l).get("id") == 2), None)
-    if reply is None or "error" in reply or reply["result"].get("isError"):
-        raise RuntimeError(f"reconcile failed (rc {p.returncode}): {json.dumps(reply)[:300] if reply else p.stderr.strip()[-300:]}")
-    return ms, json.loads(reply["result"]["content"][0]["text"])
+RACE = "an index was rewritten while capturing analysis"
+
+
+def mcp_reconcile(repo, session_id, work):
+    """reconcile over one live `slop mcp`; retries only the index-rewrite race, as its message asks, and counts retries."""
+    err = open(work / "mcp.stderr", "w+")
+    p = subprocess.Popen([str(BIN), "mcp", str(repo)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, text=True)
+    deadline = time.monotonic() + MCP_TIMEOUT
+    def call(i, method, params):
+        p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": method, "params": params}) + "\n")
+        p.stdin.flush()
+        while select.select([p.stdout], [], [], max(0, deadline - time.monotonic()))[0]:
+            line = p.stdout.readline()
+            if not line:
+                break
+            if json.loads(line).get("id") == i:
+                return json.loads(line)
+        err.seek(0)
+        raise RuntimeError(f"mcp gave no reply to {method} (rc {p.poll()}): {err.read().strip()[-300:]}")
+    try:
+        call(1, "initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "b6", "version": "1"}})
+        p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        at, retries = time.perf_counter(), 0
+        for i in range(2, 200):
+            reply = call(i, "tools/call", {"name": "reconcile", "arguments": {"session_id": session_id}})
+            text = reply.get("result", {}).get("content", [{}])[0].get("text", "")
+            if reply.get("result", {}).get("isError") and RACE in text and time.monotonic() < deadline:
+                retries += 1
+                time.sleep(2)
+                continue
+            if "error" in reply or reply["result"].get("isError"):
+                raise RuntimeError(f"reconcile failed: {json.dumps(reply)[:300]}")
+            return (time.perf_counter() - at) * 1000, retries, json.loads(text)
+        raise RuntimeError(f"reconcile still racing after {retries} retries")
+    finally:
+        p.kill()
+        p.wait()
+        err.close()
 
 
 def later_touch(repo, commit, file, line, end):
@@ -119,7 +146,7 @@ def replay(repo, name, commit, parent, py_files):
     u["stop_ids"] = re.findall(r"^\d+\. \[([^\]]+)\]", out.get("reason", ""), re.M) if u["blocked"] else []
     u["hook_errors"] = [json.loads(l)["error"][-300:] for l in hooks_log.read_text().splitlines() if '"error"' in l] if hooks_log.is_file() else []
     try:
-        ms, rep = mcp_reconcile(repo, sid)
+        ms, u["reconcile_retries"], rep = mcp_reconcile(repo, sid, tmp)
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         u["errors"].append(f"reconcile: {str(e)[-300:]}")
         u["scorable"] = not u["errors"] and not u["hook_errors"]
