@@ -93,7 +93,7 @@ pub fn reconcile(repo: &Path, changes: &[Change], sidecar: Option<&PrewriteSidec
                 .and_then(|s| existing(&s.equivalents, &function.equiv_hash, &live));
             if let Some(site) = dup {
                 report.findings.push(Finding {
-                    id: format!("duplicate:{}", &function.equiv_hash[..16.min(function.equiv_hash.len())]),
+                    id: format!("duplicate:{file}:{}", &function.equiv_hash[..16.min(function.equiv_hash.len())]),
                     file: file.to_string(),
                     line,
                     fact: format!("`{}` is provably equivalent (same behaviour for every input) to existing `{}`", function.name, site.label),
@@ -234,6 +234,21 @@ mod tests {
         sidecar.equivalents.insert(hash, vec![Site { label: "utils.dates::parse_date".into(), file: "utils/dates.py".into(), start: 5, end: 10 }]);
         let renamed = Change { file: "utils/dates.py".into(), after: original.replace("def parse_date", "def parse_iso_date"), before: Some(original) };
         assert!(ids(&reconcile(&repo, &[renamed], Some(&sidecar), &policy)).iter().all(|id| !id.starts_with("duplicate:")));
+    }
+
+    /// Acknowledging one copy must not silence another copy of the same function.
+    #[test]
+    fn two_copies_of_one_function_get_two_stable_ids() {
+        let repo = TempFixture::new("toy_repo_slopped");
+        let snapshot = RepositorySnapshot::capture(CaptureRequest { repo: &repo, index: None, policy: None, freshness: Freshness::Warn }).unwrap();
+        let path = snapshot.write_prewrite_sidecar().unwrap();
+        let sidecar = crate::analyze::prewrite::load_sidecar(&repo).unwrap().unwrap();
+        let _ = std::fs::remove_file(path);
+        let copies = [Change { file: "a/iso.py".into(), before: None, after: COPY.into() }, Change { file: "b/iso.py".into(), before: None, after: COPY.into() }];
+        let found: Vec<String> = ids(&reconcile(&repo, &copies, Some(&sidecar), &Policy::default())).into_iter().map(str::to_string).collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_ne!(found[0], found[1], "one id per copy");
+        assert_eq!(found, ids(&reconcile(&repo, &copies, Some(&sidecar), &Policy::default())), "ids are stable across runs");
     }
 
     #[test]

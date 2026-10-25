@@ -94,7 +94,7 @@ problems only:
 
 | id | fact |
 | --- | --- |
-| `duplicate:<hash>` | a new function is E-sound equivalent to an existing one |
+| `duplicate:<file>:<hash>` | a new function in `<file>` is E-sound equivalent to an existing one |
 | `missing:<file>:<name>` | a new call names something that does not exist |
 | `infra-bypass:<file>:<call>` | new direct acquisition of an effect outside its channel |
 

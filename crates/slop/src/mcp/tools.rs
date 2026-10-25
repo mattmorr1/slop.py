@@ -122,7 +122,7 @@ pub fn definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "repo": {"type": "string", "description": "Repo root (defaults to the server's launch repo)"},
-                    "id": {"type": "string", "description": "The finding id, e.g. `duplicate:3f2a9c0d1e4b5a6f`"},
+                    "id": {"type": "string", "description": "The finding id, e.g. `duplicate:utils/dates.py:3f2a9c0d1e4b5a6f`"},
                     "reason": {"type": "string", "description": "Why the finding is intentional"},
                     "session_id": {"type": "string", "description": "Claude Code session id, recorded with the acknowledgement"}
                 },
