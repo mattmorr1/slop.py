@@ -14,12 +14,20 @@ Status: v0. The detectors are dogfooded on real repositories. Where it is going
 
 ## Install
 
-Needs a recent Rust toolchain. Indexing Python/TypeScript needs `npx`; Rust needs
-`rust-analyzer`.
+Prebuilt for macOS and Linux (x86-64, ARM64), no Rust toolchain needed:
+
+```sh
+uv tool install slop-cli             # or run once: uvx --from slop-cli slop --help
+```
+
+From source, with a recent Rust toolchain:
 
 ```sh
 cargo install --path crates/slop     # or: cargo build --release
 ```
+
+Either way, indexing Python/TypeScript still needs `npx`; Rust needs
+`rust-analyzer`.
 
 ## Usage
 
