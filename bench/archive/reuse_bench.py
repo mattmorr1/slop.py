@@ -161,7 +161,11 @@ def prepare(args) -> None:
             forbidden |= mine
             if len(picked) == count:
                 break
-        if len(picked) < count:
+        pinned = getattr(args, "pinned", {}).get(name)
+        if pinned is not None:
+            # B5's pinned mode: the archived targets that still exist here, in archive order, instead of a fresh sample.
+            picked = [e for e in pinned if e in callees and callees[e]]
+        elif len(picked) < count:
             raise SystemExit(f"{name}: only {len(picked)} eligible targets for {count}")
 
         copy = out / f"{name}-gutted"
