@@ -189,44 +189,6 @@ pub fn launch(
     Ok(())
 }
 
-pub fn delegate(repo: &Path, prompt: &str) -> Result<()> {
-    let repo = canonical_repo(repo)?;
-    let ai = load_preferences()?.ai;
-    let mut command = Command::new(ai.executable());
-    command.current_dir(&repo);
-    match ai {
-        AgentHost::Claude => {
-            command.args(["-p", prompt, "--permission-mode", "acceptEdits"]);
-        }
-        AgentHost::Codex => {
-            command.args(["exec", prompt]);
-        }
-    }
-    let status = command
-        .status()
-        .with_context(|| format!("delegating fix to {}", ai.executable()))?;
-    if !status.success() {
-        bail!("{} exited with {}", ai.executable(), status);
-    }
-    Ok(())
-}
-
-pub fn open_target(target: &str) -> Result<()> {
-    let editor = load_preferences()?.editor;
-    let Some(exe) = editor.executable() else {
-        bail!("no editor is configured; rerun `slop setup --editor <editor>`");
-    };
-    let mut command = Command::new(exe);
-    if matches!(editor, Editor::VsCode | Editor::Cursor) {
-        command.arg("-g");
-    }
-    command
-        .arg(target)
-        .spawn()
-        .with_context(|| format!("opening {target} in {exe}"))?;
-    Ok(())
-}
-
 pub fn doctor(repo: &Path) -> Result<bool> {
     let repo = canonical_repo(repo)?;
     let preferences = load_preferences().ok();

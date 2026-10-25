@@ -28,7 +28,6 @@ slop-lsp = { workspace = true }
 slop-mcp = { workspace = true }
 slop-parse = { workspace = true }
 slop-resolve = { workspace = true }
-slop-tui = { workspace = true }
 
 [features]
 # E-equivalence research engine (egglog); off in release builds.

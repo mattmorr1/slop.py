@@ -19,9 +19,7 @@ mod setup;
 
 #[derive(Parser)]
 #[command(name = "slop", about = "Codebase-relative AI-slop analyzer", version)]
-#[command(
-    after_help = "Start with `slop setup`, then run `slop check`. The dashboard is available as `slop dash`."
-)]
+#[command(after_help = "Start with `slop setup`, then run `slop check`.")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -215,15 +213,6 @@ enum Command {
         /// Which hook event this invocation handles
         event: HookEvent,
     },
-    /// Open the optional interactive findings dashboard (full-screen TUI).
-    Dash {
-        /// Repo root (default: current directory)
-        #[arg(default_value = ".")]
-        repo: PathBuf,
-        /// Path to index.scip (default: <repo>/index.scip)
-        #[arg(long)]
-        index: Option<PathBuf>,
-    },
     /// Serve slop as a language server (LSP over stdio): publishes findings as
     /// editor diagnostics on open/save. Editor-agnostic — point VS Code,
     /// Neovim, Zed, or JetBrains at `slop lsp` (see editors/vscode for a shim).
@@ -316,19 +305,6 @@ enum Command {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Internal adapter used by the dashboard to delegate one scoped repair to
-    /// the AI selected by `slop setup`.
-    #[command(hide = true)]
-    Delegate {
-        #[arg(default_value = ".")]
-        repo: PathBuf,
-        #[arg(long)]
-        prompt: String,
-    },
-    /// Internal adapter used by the dashboard to open a finding in the editor
-    /// selected by `slop setup`.
-    #[command(hide = true)]
-    Open { target: String },
     /// Research adapter for the context benchmark: one capture, then a context
     /// artifact per (target, budget), after one line with the shared cost catalog.
     #[command(hide = true)]
@@ -489,12 +465,6 @@ fn main() -> Result<()> {
         return Ok(());
     };
     match command {
-        Command::Dash { repo, index } => {
-            if let Some(index_path) = index.as_deref() {
-                ensure_index(&repo, index_path)?;
-            }
-            slop_tui::run(repo, index)?;
-        }
         Command::Check {
             repo,
             index,
@@ -887,12 +857,6 @@ fn main() -> Result<()> {
             args,
         } => {
             setup::launch(&repo, ai, editor, no_setup, no_editor, &args)?;
-        }
-        Command::Delegate { repo, prompt } => {
-            setup::delegate(&repo, &prompt)?;
-        }
-        Command::Open { target } => {
-            setup::open_target(&target)?;
         }
         Command::ContextBench { repo, targets, budgets, selection, min_probability_ppm, with_text } => {
             run_context_bench(&repo, &targets, &budgets, &selection, min_probability_ppm, with_text)?

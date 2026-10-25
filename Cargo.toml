@@ -7,7 +7,6 @@ members = [
     "crates/slop-llm",
     "crates/slop-lsp",
     "crates/slop-mcp",
-    "crates/slop-tui",
     "crates/slop-parse",
     "crates/slop-resolve",
 ]
@@ -47,6 +46,5 @@ slop-llm = { version = "0.1.0", path = "crates/slop-llm" }
 slop-lsp = { version = "0.1.0", path = "crates/slop-lsp" }
 slop-mcp = { version = "0.1.0", path = "crates/slop-mcp" }
 slop-parse = { version = "0.1.0", path = "crates/slop-parse" }
-slop-tui = { version = "0.1.0", path = "crates/slop-tui" }
 slop-resolve = { version = "0.1.0", path = "crates/slop-resolve" }
 slop-analyze = { version = "0.1.0", path = "crates/slop-analyze" }
