@@ -365,6 +365,77 @@ R8's own sample. flask and httpx may be memorised, which should have helped
 bind. Gold includes callees nested inside the gutted target, which no arm can
 return. Two 7-8B models, one sample each.
 
+## B5b, vocabulary-primed sketches (gate G1b)
+
+Pre-registered in `bench/B5B_PREREGISTRATION.md` (a9ae027) before any
+generation. Question: B5's blind sketches name about 2 helpers; if the model
+sees only the names the repository already has near the target (same file,
+then same directory, alphabetical, at most 400 tokens, no signatures or
+bodies), does binding its sketch beat the envelope, and beat ranking that
+same vocabulary by BM25 with no sketch (`vocab-bm25`, the control)? B5's 96
+tasks (vigil pinned at f61607df), R8's `none` prompt plus the name block,
+llama3.1:8b and qwen3:8b on matt-pc: 192 sketches. Binder v0 unchanged.
+
+```
+python3 bench/b5_bench.py vocab --tasks DIR/tasks.jsonl --out DIR/tasks_b5b.jsonl
+python3 bench/b5_bench.py generate --tasks DIR/tasks_b5b.jsonl --model qwen3:8b --prompts vocab --out DIR/sketches_b5b.jsonl   # GPU host
+SLOP_BIN=target/release/slop python3 bench/b5_bench.py score --tasks DIR/tasks_b5b.jsonl --sketches DIR/sketches_b5b.jsonl
+```
+
+### Result (third ledger entry in `bench/results/bind.jsonl`): **G1b fails**
+
+**G1b fails, pooled and on vigil, on all three criteria.** Priming lifts bind
+from B5's 12.7% to 21.4% recall@5, which only ties the envelope, and the
+vocabulary ranked with no sketch does as well or better.
+
+Pooled, 96 tasks; 95% CIs, task-cluster bootstrap; tokens spent in brackets:
+
+| arm | recall@5 | precision@5 | cross-file recall@5 | recall@1k | @2k | @4k |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| bind (primed sketch) | 21.4% [15.8, 27.0] | 13.4% [9.5, 17.5] | **17.6%** [11.2, 24.6] | 21.7% (654) | 24.5% (1,105) | 25.9% (1,618) |
+| envelope | 21.4% [14.3, 28.7] | 8.4% [5.6, 11.2] | 2.3% [0.0, 6.9] | **41.9%** (942) | **51.5%** (1,752) | **59.4%** (3,054) |
+| vocab-bm25 (control) | 23.1% [16.1, 30.3] | 13.7% [9.4, 18.5] | 7.3% [2.3, 13.4] | 22.9% (836) | 29.5% (1,505) | 34.5% (2,583) |
+| file | 25.1% [17.3, 32.3] | 11.2% [7.8, 14.7] | 0.0% | 27.1% (925) | 34.7% (1,761) | 44.1% (2,774) |
+| bind+file (exploratory) | 25.9% [18.2, 33.4] | 11.3% [7.9, 14.9] | 2.9% | 28.8% (955) | 37.7% (1,871) | 52.0% (3,349) |
+
+| G1b criterion | needed | pooled (96) | vigil (46) |
+| --- | --- | --- | --- |
+| bind − envelope recall@5 | >= +10, CI above 0 | **+0.0 [−9.1, +9.0]** fail | **+0.4 [−12.8, +13.7]** fail |
+| bind precision@5 | >= 30% | **13.4%** fail | **16.5%** fail |
+| bind − vocab-bm25 recall@5 | > 0, CI above 0 | **−1.7 [−9.5, +6.0]** fail | **−2.6 [−14.8, +10.3]** fail |
+| per model llama3.1 / qwen3 (vs envelope) | | −0.2 / +0.2 | |
+| flask / httpx bind recall@5 | | 18.0% / 15.7% | |
+
+vigil alone: bind 26.3% recall@5 vs envelope 26.0%, vocab-bm25 29.0%, file
+33.6%; cross-file +19.8 [+9.9, +31.6] over the envelope.
+
+Calls in parsed sketches (184 parsed, 8 unparseable): **3.2 candidate calls
+per sketch** (B5 `none` on flask + httpx: 2.3; here flask 2.8, httpx 1.6,
+vigil 4.4), of which 1.8 resolve to a repository entity. Of all calls, 29.6%
+name a vocabulary entry, 26.3% another repository entity, 10.4% an imported
+name, and 33.7% are invented. Bind latency p50 16.0 ms, p95 32.8 ms; E-sound
+fired 0 times.
+
+What it says:
+
+- **The vocabulary does the work, not the sketch.** Ranking the shown names
+  against the stub, with no model, matches bind on recall and precision at 5
+  and beats it at every budget. The model copies about one name from the list
+  per sketch; the binder resolves it; a BM25 over the list finds the same one.
+- **Precision stays far from 30%.** Even primed, a sketch's resolved calls
+  fill under two of the five slots with gold.
+- **Cross-file is still bind's only win** (+15.3 over the envelope, +10.2
+  [+1.8, +19.2] over vocab-bm25): names outside the vocabulary that the model
+  writes and name resolution finds elsewhere. That gain is real but small in
+  absolute terms (cross-file gold is a minority of callees).
+- **Same-file context remains the cheapest strong arm**; at token budgets the
+  envelope dominates every list-based arm, as in B5.
+
+Caveats: as B5 (vigil pinned, two 7-8B models, one sample each, flask and
+httpx possibly memorised). One post-generation change, a crash fix in the
+call-bucket bookkeeping, is listed in the pre-registration; the ledger entry
+is marked dirty because that fix was uncommitted when it was scored.
+
 ## Scaling: Sentry (2026-09-24)
 
 getsentry/sentry at 67610b2a (shallow clone): 8,206 Python and 9,463
