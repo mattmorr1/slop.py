@@ -188,7 +188,7 @@ class Binder:
                 via[entity].add(signal.split(":")[0])
         ranked = sorted(merged, key=lambda e: (-merged[e], e))
         return {"ranked": ranked, "via": {e: sorted(via[e]) for e in ranked[:20]},
-                "esound": len(lists["esound"]), "calls": len(called), "unresolved": len(unresolved),
+                "esound": len(lists["esound"]), "calls": len(called), "called": called, "unresolved": len(unresolved),
                 "seconds": time.perf_counter() - started}
 
 

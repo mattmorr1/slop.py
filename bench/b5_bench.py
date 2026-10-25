@@ -34,8 +34,10 @@ BUDGETS = (1000, 2000, 4000)
 TOP = 5
 LISTED = 50
 PROMPTS = ("none", "sketch")
-ARMS = ("bind", "envelope", "bm25", "file", "bind+file")
-PAIRS = (("bind", "envelope"), ("bind", "bm25"), ("bind", "file"), ("bind+file", "envelope"))
+ARMS = ("bind", "envelope", "bm25", "file", "bind+file", "vocab-bm25")
+PAIRS = (("bind", "envelope"), ("bind", "bm25"), ("bind", "file"), ("bind+file", "envelope"), ("bind", "vocab-bm25"))
+VOCAB_CAP = 400
+VOCAB_INTRO = "Names that already exist in this repository near this function:"
 SKETCH_INSTRUCTION = ("Write this function as a sketch: call helpers by the names you would expect them to have, "
                       "and use `...` for parts you would look up. Reply with the complete function, signature "
                       "included, in a single ```python code block and nothing else.")
@@ -45,7 +47,54 @@ def prompt(task: dict, kind: str) -> str:
     none = task["prompts"]["none"]
     if r8.INSTRUCTION not in none:
         raise ValueError(f"{task['id']}: R8 instruction not found in its none prompt")
+    if kind == "vocab":
+        return task["prompts"]["vocab"]
     return none if kind == "none" else none.replace(r8.INSTRUCTION, SKETCH_INSTRUCTION)
+
+
+def vocabulary(cat, target: str, file: str) -> tuple[list[str], dict[str, str]]:
+    """B5b: kept names (alphabetical) and their entities, same file first then same directory under the token cap."""
+    here = file.rsplit("/", 1)[0] if "/" in file else ""
+    shown, tiers = {}, ([], [])
+    for e, v in sorted(cat.entries.items()):
+        parent = e.rsplit("::", 1)[0]
+        nested = "()" in e.split("::", 1)[1] or (parent in cat.entries and not cat.entries[parent]["class"])
+        if e == target or e.startswith(target + "::") or nested:
+            continue
+        if v["file"] == file or (v["file"].rsplit("/", 1)[0] if "/" in v["file"] else "") == here:
+            shown[e] = e.split("::", 1)[1].replace("::", ".")
+            tiers[v["file"] != file].append(shown[e])
+    kept = []
+    for name in dict.fromkeys(sorted(set(tiers[0])) + sorted(set(tiers[1]) - set(tiers[0]))):
+        if r8.tokens(", ".join(kept + [name])) > VOCAB_CAP:
+            break
+        kept.append(name)
+    return sorted(kept), {e: n for e, n in shown.items() if n in set(kept)}
+
+
+def vocab(args) -> None:
+    """B5b: add the vocabulary, its primed prompt and the vocab-bm25 control list to prepared tasks."""
+    import b5_bind
+    tasks = [json.loads(line) for line in args.tasks.read_text().splitlines()]
+    for copy in sorted({t["copy"] for t in tasks}):
+        cat = b5_bind.Catalog(Path(copy))
+        for t in (t for t in tasks if t["copy"] == copy):
+            names, entities = vocabulary(cat, t["target"], t["file"])
+            block = f"{VOCAB_INTRO}\n{', '.join(names) or '(none)'}\n"
+            none = t["prompts"]["none"]
+            if none.count(f"\n{r8.INSTRUCTION}") != 1:
+                raise ValueError(f"{t['id']}: R8 instruction not found once in its none prompt")
+            entry = cat.entries[t["target"]]
+            stub = [line for line in cat.lines[t["file"]][entry["start"]: entry["end"] + 1] if "raise NotImplementedError" not in line]
+            scores = r8.Bm25({e: b5_bind.words(n) for e, n in entities.items()}).scores(b5_bind.words("\n".join(stub)))
+            t["vocab"] = names
+            t["prompts"]["vocab"] = none.replace(f"\n{r8.INSTRUCTION}", f"\n{block}\n{r8.INSTRUCTION}")
+            t["vocab_bm25"] = [e for _, e in sorted((-v, e) for e, v in scores.items() if v > 0)][:LISTED]
+    args.out.write_text("".join(json.dumps(t) + "\n" for t in tasks))
+    sizes = sorted(len(t["vocab"]) for t in tasks)
+    print(f"{len(tasks)} tasks -> {args.out} (sha256 {hashlib.sha256(args.out.read_bytes()).hexdigest()}); "
+          f"names per task min {sizes[0]} median {sizes[len(sizes) // 2]} max {sizes[-1]}; "
+          f"{sum(r8.tokens(', '.join(t['vocab'])) >= VOCAB_CAP - 10 for t in tasks)} at the cap")
 
 
 def git_head(path: Path) -> str:
@@ -140,13 +189,15 @@ def bind_all(tasks: dict, sketches: list[dict]) -> tuple[dict, list, dict]:
     """Every sketch through binder v0, one warm MCP process per repository."""
     import b5_bind
     per_task, per_sketch, trace = {}, [], []
-    stats = {"latency": [], "esound": 0, "parse_errors": Counter()}
+    stats = {"latency": [], "esound": 0, "parse_errors": Counter(), "calls": []}
     for repo in sorted({t["repo"] for t in tasks.values()}):
         binder = b5_bind.Binder(Path(next(t["copy"] for t in tasks.values() if t["repo"] == repo)))
         cost, warm = binder.catalog.cost, False
         for t in (t for t in tasks.values() if t["repo"] == repo):
             per_task[t["id"]] = {"envelope": envelope_measure(t), "bm25": measure(t["bm25"], cost, t["gold"], t["gold_cross"]),
                                  "file": measure(t["file_rank"], cost, t["gold"], t["gold_cross"])}
+            if "vocab_bm25" in t:
+                per_task[t["id"]]["vocab-bm25"] = measure(t["vocab_bm25"], cost, t["gold"], t["gold_cross"])
         for s in (s for s in sketches if tasks[s["id"]]["repo"] == repo):
             t = tasks[s["id"]]
             node, ranked = r8.generated_function(s["response"], t["name"]), []
@@ -160,6 +211,11 @@ def bind_all(tasks: dict, sketches: list[dict]) -> tuple[dict, list, dict]:
                 ranked = result["ranked"]
                 stats["esound"] += result["esound"]
                 stats["latency"].append(result["seconds"])
+                cat, vocab_names = binder.catalog, {n.rsplit(".", 1)[-1] for n in t.get("vocab", [])}
+                imported = b5_bind.imported_names(cat.tree(t["file"]))
+                buckets = Counter("vocab" if n in vocab_names else "repo" if cat.by_name.get(n) or cat.by_norm.get(b5_bind.normalised(n))
+                                  else "imported" if n in imported else "invented" for n in result["called"])
+                stats["calls"].append({"repo": repo, "prompt": s["prompt"], **buckets})
                 trace.append({"id": s["id"], "prompt": s["prompt"], "model": s["model"], "top": ranked[:20], "via": result["via"],
                               "calls": result["calls"], "unresolved": result["unresolved"], "ms": round(result["seconds"] * 1000, 2)})
             per_sketch.append({"id": s["id"], "prompt": s["prompt"], "model": s["model"],
@@ -169,10 +225,30 @@ def bind_all(tasks: dict, sketches: list[dict]) -> tuple[dict, list, dict]:
     return per_task, per_sketch, {**stats, "trace": trace}
 
 
+def arms(per_task: dict) -> list[str]:
+    return [a for a in ARMS if a in ("bind", "bind+file") or a in next(iter(per_task.values()))]
+
+
+def pairs(per_task: dict) -> list[tuple[str, str]]:
+    return [(a, b) for a, b in PAIRS if b in arms(per_task)]
+
+
+def call_stats(calls: list[dict]) -> dict:
+    """Mean candidate calls per parsed sketch and their split into vocabulary / other repo / imported / invented."""
+    out = {}
+    for label, rows in [("pooled", calls)] + [(f"repo={r}", [c for c in calls if c["repo"] == r]) for r in sorted({c["repo"] for c in calls})]:
+        total = {k: sum(c.get(k, 0) for c in rows) for k in ("vocab", "repo", "imported", "invented")}
+        n = sum(total.values())
+        out[label] = {"sketches": len(rows), "calls_per_sketch": n / len(rows), "resolved_per_sketch": (total["vocab"] + total["repo"]) / len(rows),
+                      **{f"share_{k}": v / n if n else None for k, v in total.items()}}
+    return out
+
+
 def summarise(tasks: dict, per_task: dict, per_sketch: list[dict]) -> dict:
     metrics = ["recall5", "precision5", "cross5"] + [f"recall@{b}" for b in BUDGETS]
     scopes = [("pooled", None, None)] + [(f"repo={r}", "repo", r) for r in sorted({t["repo"] for t in tasks.values()})] \
-        + [(f"prompt={p}", "prompt", p) for p in PROMPTS] + [(f"model={m}", "model", m) for m in sorted({s["model"] for s in per_sketch})]
+        + [(f"prompt={p}", "prompt", p) for p in sorted({s["prompt"] for s in per_sketch})] \
+        + [(f"model={m}", "model", m) for m in sorted({s["model"] for s in per_sketch})]
     results = {}
     for label, key, want in scopes:
         by_task = defaultdict(list)
@@ -185,10 +261,10 @@ def summarise(tasks: dict, per_task: dict, per_sketch: list[dict]) -> dict:
         values = {i: {**per_task[i], **{arm: {m: mean([s[arm][m] for s in rows]) for m in metrics + [f"tokens@{b}" for b in BUDGETS]}
                                         for arm in ("bind", "bind+file")}} for i, rows in sorted(by_task.items())}
         entry = {"tasks": len(values), "sketches": sum(map(len, by_task.values()))}
-        for arm in ARMS:
+        for arm in arms(per_task):
             entry[arm] = {m: r8.bootstrap([v[arm][m] for v in values.values() if v[arm][m] is not None]) for m in metrics}
             entry[arm].update({f"tokens@{b}": mean([v[arm][f"tokens@{b}"] for v in values.values()]) for b in BUDGETS})
-        for a, b in PAIRS:
+        for a, b in pairs(per_task):
             for m in metrics:
                 entry[f"{a}_minus_{b}_{m}"] = r8.bootstrap([v[a][m] - v[b][m] for v in values.values() if v[a][m] is not None and v[b][m] is not None])
         results[label] = entry
@@ -200,8 +276,11 @@ def gate(results: dict) -> dict:
         if label not in results:
             return {"verdict": "not scored"}
         diff, precision = results[label]["bind_minus_envelope_recall5"], results[label]["bind"]["precision5"][0]
-        return {"verdict": "pass" if diff[0] >= 0.10 and diff[1] > 0 and precision >= 0.30 else "fail",
-                "recall5_diff": diff, "precision5": precision}
+        ok, row = diff[0] >= 0.10 and diff[1] > 0 and precision >= 0.30, {"recall5_diff": diff, "precision5": precision}
+        if "bind_minus_vocab-bm25_recall5" in results[label]:
+            control = row["vocab_bm25_recall5_diff"] = results[label]["bind_minus_vocab-bm25_recall5"]
+            ok = ok and control[0] > 0 and control[1] > 0
+        return {"verdict": "pass" if ok else "fail", **row}
     g1 = {"pooled": one("pooled"), "vigil": one("repo=vigil")}
     verdicts = {g1["pooled"]["verdict"], g1["vigil"]["verdict"]}
     g1["verdict"] = ("undecided: vigil not scored" if "repo=vigil" not in results else
@@ -214,13 +293,14 @@ def score(args) -> None:
     sketches = [json.loads(line) for path in args.sketches for line in path.read_text().splitlines()]
     unscored = Counter(s["id"].split(":", 1)[0] for s in sketches if s["id"] not in tasks)
     per_task, per_sketch, stats = bind_all(tasks, [s for s in sketches if s["id"] in tasks])
+    primed = "vocab-bm25" in next(iter(per_task.values()))
     if args.trace:
         args.trace.write_text("".join(json.dumps(row) + "\n" for row in stats["trace"]))
     results = summarise(tasks, per_task, per_sketch)
     lat = stats["latency"]
     extra = {"latency_ms": {"p50": percentile(lat, 0.5) * 1000, "p95": percentile(lat, 0.95) * 1000, "n": len(lat)},
              "esound_fires": stats["esound"], "parse_errors": dict(sorted(stats["parse_errors"].items())),
-             "unscored_sketches": dict(unscored), "g1": gate(results)}
+             "unscored_sketches": dict(unscored), "calls": call_stats(stats["calls"]), ("g1b" if primed else "g1"): gate(results)}
 
     pct = lambda e: f"{e[0] * 100:5.1f}% [{e[1] * 100:.1f}, {e[2] * 100:.1f}]"
     diff = lambda e: f"{e[0] * 100:+5.1f} [{e[1] * 100:+.1f}, {e[2] * 100:+.1f}]"
@@ -228,23 +308,23 @@ def score(args) -> None:
         print(f"\n{label} ({entry['tasks']} tasks, {entry['sketches']} sketches)")
         print("| arm | recall@5 | precision@5 | cross-file recall@5 | " + " | ".join(f"recall@{b // 1000}k (tokens)" for b in BUDGETS) + " |")
         print("| --- |" + " ---: |" * (3 + len(BUDGETS)))
-        for arm in ARMS:
+        for arm in (a for a in ARMS if a in entry):
             x = entry[arm]
             print(f"| {arm} | {pct(x['recall5'])} | {pct(x['precision5'])} | {pct(x['cross5'])} | "
                   + " | ".join(f"{x[f'recall@{b}'][0] * 100:.1f}% ({x[f'tokens@{b}']:.0f})" for b in BUDGETS) + " |")
-        for a, b in PAIRS:
+        for a, b in pairs(per_task):
             print(f"{a} - {b}: recall@5 {diff(entry[f'{a}_minus_{b}_recall5'])}, precision@5 {diff(entry[f'{a}_minus_{b}_precision5'])}, "
                   f"cross@5 {diff(entry[f'{a}_minus_{b}_cross5'])}, " + ", ".join(f"@{x // 1000}k {diff(entry[f'{a}_minus_{b}_recall@{x}'])}" for x in BUDGETS))
     print(f"\n{json.dumps(extra, indent=1)}")
     binary = Path(r8.SLOP).resolve()
     status = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"], capture_output=True, text=True, check=True).stdout
-    manifest = {"bench": "bind", "label": "pre-registered (bench/B5_PREREGISTRATION.md)", "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    manifest = {"bench": "bind", "label": f"pre-registered (bench/{'B5B' if primed else 'B5'}_PREREGISTRATION.md)", "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "commit": git_head(ROOT), "dirty": bool(status.strip()), "seed": r8.SEED,
                 "tasks_digest": hashlib.sha256(args.tasks.read_bytes()).hexdigest(),
                 "sketches_digest": hashlib.sha256(b"".join(p.read_bytes() for p in args.sketches)).hexdigest(),
                 "source_commits": {t["repo"]: t["source_commit"] for t in tasks.values()},
                 "binary": {"path": str(binary), "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(), "built_from": args.binary_commit},
-                "models": sorted({s["model"] for s in per_sketch}), "prompts": list(PROMPTS), "budgets": list(BUDGETS),
+                "models": sorted({s["model"] for s in per_sketch}), "prompts": sorted({s["prompt"] for s in per_sketch}), "budgets": list(BUDGETS),
                 "python": platform.python_version(), "platform": platform.platform()}
     ledger = ROOT / "bench/results/bind.jsonl"
     with ledger.open("a") as handle:
@@ -322,12 +402,15 @@ def main() -> None:
     s.add_argument("--sketches", type=Path, nargs="+", required=True)
     s.add_argument("--trace", type=Path, help="per-sketch bindings (top 20, signals, latency) for replay")
     s.add_argument("--binary-commit", default="278c7fb")
+    v = sub.add_parser("vocab")
+    v.add_argument("--tasks", type=Path, required=True, help="tasks.jsonl from prepare")
+    v.add_argument("--out", type=Path, required=True)
     d = sub.add_parser("dupes")
     d.add_argument("--repo", type=Path, required=True)
     d.add_argument("--in-place", action="store_true", help="destination is the copy's own file, not a new file beside it")
     d.add_argument("--group", action="append", required=True, help="LABEL=file:name,file:name,...")
     args = parser.parse_args()
-    {"prepare": prepare, "generate": generate, "score": score, "dupes": dupes}[args.stage](args)
+    {"prepare": prepare, "generate": generate, "score": score, "dupes": dupes, "vocab": vocab}[args.stage](args)
 
 
 if __name__ == "__main__":
