@@ -3,7 +3,7 @@
 //!
 //! This lives beside the analysis rather than in the CLI because staleness is
 //! a *correctness* property, not a UI one — judging a diff against yesterday's
-//! graph is the failure mode, and every entry point (check, gate, MCP, LSP,
+//! graph is the failure mode, and every entry point (check, gate, MCP,
 //! the hooks) funnels through the repository snapshot, which enforces it.
 //!
 //! Freshness is decided per document by content, never by mtime: each index

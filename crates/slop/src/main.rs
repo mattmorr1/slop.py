@@ -104,7 +104,7 @@ enum Command {
         /// Git ref to diff against (default: HEAD)
         #[arg(long, default_value = "HEAD")]
         base: String,
-        /// Emit findings as a JSON object (for editors / tooling) instead of
+        /// Emit findings as a JSON object (for CI / tooling) instead of
         /// the human report.
         #[arg(long)]
         json: bool,
@@ -633,7 +633,7 @@ fn print_check_human(repo: &Path, result: &CheckResult) {
 }
 
 /// The `--json` report for `slop check`: the same verdict shape `slop gate`
-/// emits, so an editor or CI step can consume either interchangeably.
+/// emits, so a CI step or tool can consume either interchangeably.
 fn print_check_json(result: &CheckResult) -> Result<()> {
     let warning = result
         .findings

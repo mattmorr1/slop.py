@@ -1,5 +1,7 @@
 # Context selection is scored by a calibrated relevance model
 
+Status: superseded; the context envelope was cut, see `docs/roadmap.md` "Re-plan after G1".
+
 The context envelope chooses which entities an agent sees, as skeletons, when
 it edits one. It used an additive score (graph distance, adjacency, effect
 overlap, exemplar bonus) with hand-set constants. B4 (`bench/context_bench.py`)

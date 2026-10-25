@@ -27,8 +27,8 @@ matches ride along as advice, never as blocks.
 | --- | --- | --- |
 | P0 | Cut and consolidate | done (merged) |
 | P1 | B5, B5b | done: G1 and G1b fail |
-| P3 | Claude Code plugin: reconcile gate (L2) on provable facts; unresolved-name check with cross-file suggestions; structural duplicates as advice | `docs/prd/P3-plugin-and-reconcile-gate.md` |
-| P5 | PyPI wheel `slop-cli` (`slop` is taken), so the plugin can run `uvx --from slop-cli slop` | `docs/prd/P5-pypi-wheel.md` |
+| P3 | Claude Code plugin: reconcile gate (L2) on provable facts; unresolved-name check with cross-file suggestions; structural duplicates as advice | done: `docs/prd/done/P3-plugin-and-reconcile-gate.md` |
+| P5 | PyPI wheel `slop-cli` (`slop` is taken), so the plugin can run `uvx --from slop-cli slop` | done: `docs/prd/done/P5-pypi-wheel.md` |
 | P4 | R9 on Claude Code: arms no plugin, L1, L2 | after budget is agreed |
 
 Dropped: P2 (a Rust port of the binder); its one useful signal moves into P3 as
