@@ -1,5 +1,5 @@
 //! The `check` flow shared by the CLI (`slop check`) and the MCP
-//! `validate_change` tool (M4c): build the graph, run detectors, suppress,
+//! `reconcile` tool (M4c): build the graph, run detectors, suppress,
 //! baseline, then either judge the whole repo
 //! (`--all`) or just the diff against a git ref (D7's diff-relative mode).
 

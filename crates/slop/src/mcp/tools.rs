@@ -1,5 +1,5 @@
-//! The additive MCP tools (M4c, D9): `find_capability`, `validate_change`,
-//! `assess_write`, `query_subgraph`. Each is a thin adapter that
+//! The MCP tools (M4c, D9): `find_capability`, `assess_write`, `query_subgraph`, `reconcile`,
+//! `acknowledge`. Each is a thin adapter that
 //! runs the *same* analysis the CLI runs (via `slop_core::analyze::check`) and
 //! serializes the result — never a reimplementation.
 
@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use slop_core::analyze::check::{self, CheckRequest};
+use slop_core::analyze::prewrite;
+use slop_core::analyze::reconcile as gate;
+use slop_core::analyze::session::{self, Session};
 use slop_core::analyze::refresh::Refresher;
 use slop_core::analyze::query;
 use slop_core::analyze::search;
@@ -69,18 +72,6 @@ pub fn definitions() -> Value {
             }
         },
         {
-            "name": "validate_change",
-            "description": "Run slop's full detector suite over a repo and return findings (blocking/warning/advisory) with machine-readable fix guidance. Defaults to judging the working-tree diff vs a git ref; set all=true for the whole repo. This is the same analysis `slop check` runs.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "repo": {"type": "string", "description": "Repo root (defaults to the server's launch repo)"},
-                    "base": {"type": "string", "description": "Git ref to diff against (default HEAD)"},
-                    "all": {"type": "boolean", "description": "Judge the whole repo instead of the diff"}
-                }
-            }
-        },
-        {
             "name": "assess_write",
             "description": "Assess proposed source before writing it. Returns direct sanctioned-channel bypasses and existing functions whose distinctive callee neighborhood suggests the code belongs there instead.",
             "inputSchema": {
@@ -111,6 +102,32 @@ pub fn definitions() -> Value {
                 },
                 "required": ["entity"]
             }
+        },
+        {
+            "name": "reconcile",
+            "description": "Check what you changed before finishing. Returns provable problems (an E-sound copy of an existing function, a call to a name that does not exist, a sanctioned-channel bypass), each with an id and an action, plus ranked advisory matches and slop's full detector findings. With session_id it judges only what this session changed; otherwise the working-tree diff against `base`. The Stop hook blocks on the same provable problems.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repo root (defaults to the server's launch repo)"},
+                    "session_id": {"type": "string", "description": "Claude Code session id, given at session start; scopes the check to this session's changes"},
+                    "base": {"type": "string", "description": "Git ref to diff against without a session (default HEAD)"}
+                }
+            }
+        },
+        {
+            "name": "acknowledge",
+            "description": "Record that a provable problem reported by `reconcile` or the Stop hook is intentional, so it no longer blocks. Appends the id and your reason to .slop/acks.jsonl, where reviewers see it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "Repo root (defaults to the server's launch repo)"},
+                    "id": {"type": "string", "description": "The finding id, e.g. `duplicate:3f2a9c0d1e4b5a6f`"},
+                    "reason": {"type": "string", "description": "Why the finding is intentional"},
+                    "session_id": {"type": "string", "description": "Claude Code session id, recorded with the acknowledgement"}
+                },
+                "required": ["id", "reason"]
+            }
         }
     ])
 }
@@ -120,9 +137,10 @@ pub fn definitions() -> Value {
 pub fn call(ctx: &ToolCtx, name: &str, args: &Value) -> Result<String> {
     match name {
         "find_capability" => find_capability(ctx, args),
-        "validate_change" => validate_change(ctx, args),
         "assess_write" => assess_write(ctx, args),
         "query_subgraph" => query_subgraph(ctx, args),
+        "reconcile" => reconcile(ctx, args),
+        "acknowledge" => acknowledge(ctx, args),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -185,31 +203,49 @@ fn find_capability(ctx: &ToolCtx, args: &Value) -> Result<String> {
     }))?)
 }
 
-fn validate_change(ctx: &ToolCtx, args: &Value) -> Result<String> {
+fn reconcile(ctx: &ToolCtx, args: &Value) -> Result<String> {
     let repo = ctx.repo(args);
+    let session_id = args.get("session_id").and_then(Value::as_str);
+    let session = match session_id {
+        Some(id) => session::load(&repo, id)?,
+        None => Session { head: Some(args.get("base").and_then(Value::as_str).unwrap_or("HEAD").to_string()), ..Session::default() },
+    };
+    let changes = session::changes(&repo, &session)?;
+    let analysis = ctx.analysis(&repo, args)?;
+    let sidecar = prewrite::load_sidecar(&repo)?;
+    let report = gate::reconcile(&repo, &changes, sidecar.as_ref(), &analysis.policy);
+    let acked = gate::acknowledged(&repo)?;
+    let (acknowledged, open): (Vec<_>, Vec<_>) = report.findings.into_iter().partition(|f| acked.contains(&f.id));
     let result = check::run(CheckRequest {
         repo,
         index: ctx.index(args),
         policy: None,
-        all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
-        base: args
-            .get("base")
-            .and_then(Value::as_str)
-            .unwrap_or("HEAD")
-            .to_string(),
+        all: false,
+        base: session.head.clone().unwrap_or_else(|| "HEAD".to_string()),
     })?;
     Ok(serde_json::to_string_pretty(&json!({
-        "schema_version": result.schema_version,
-        "snapshot": result.snapshot,
-        "freshness": result.freshness,
-        "scope": result.scope,
-        "coverage": result.coverage,
-        "findings": result.findings,
-        "blocking": result.blocking,
-        "health": result.health_line,
-        "current_health": result.current_health,
-        "policy_is_empty": result.policy_is_empty,
+        "scope": if session_id.is_some() { "session" } else { "diff" },
+        "changed_files": changes.iter().map(|c| &c.file).collect::<Vec<_>>(),
+        "provable": open.iter().map(|f| json!({ "id": f.id, "file": f.file, "line": f.line + 1, "fact": f.fact, "action": f.action })).collect::<Vec<_>>(),
+        "acknowledged": acknowledged.iter().map(|f| &f.id).collect::<Vec<_>>(),
+        "advisory": report.advisory,
+        "sidecar": if sidecar.is_some() { "loaded" } else { "absent: duplicates and suggestions need SessionStart or `slop index` to write it" },
+        "detectors": {
+            "snapshot": result.snapshot,
+            "freshness": result.freshness,
+            "coverage": result.coverage,
+            "findings": result.findings,
+            "blocking": result.blocking,
+            "health": result.health_line,
+        },
     }))?)
+}
+
+fn acknowledge(ctx: &ToolCtx, args: &Value) -> Result<String> {
+    let text = |key: &str| args.get(key).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()).ok_or_else(|| anyhow!("{key} is required"));
+    let (id, reason) = (text("id")?, text("reason")?);
+    gate::acknowledge(&ctx.repo(args), args.get("session_id").and_then(Value::as_str), id, reason)?;
+    Ok(serde_json::to_string_pretty(&json!({ "acknowledged": id, "reason": reason }))?)
 }
 
 fn parse_edge_kinds(args: &Value) -> Option<Vec<EdgeKind>> {

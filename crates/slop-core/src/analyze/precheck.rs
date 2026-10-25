@@ -11,7 +11,7 @@
 //! Narrower than [`crate::analyze::detect`] by construction: without the graph there is
 //! no transitive effect propagation, so this sees *direct* acquisition only.
 //! That is exactly the infra-bypass signal, and the deeper checks still run in
-//! `validate_change` / `slop gate`.
+//! `reconcile` / `slop gate`.
 
 use std::collections::BTreeMap;
 

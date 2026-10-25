@@ -157,8 +157,8 @@ enum Command {
         #[arg(long)]
         index: Option<PathBuf>,
     },
-    /// Serve slop's MCP tools (find_capability, assess_write, validate_change,
-    /// query_subgraph) over stdio. Launched by an agent host
+    /// Serve slop's MCP tools (find_capability, assess_write, query_subgraph, reconcile,
+    /// acknowledge) over stdio. Launched by an agent host
     /// (e.g. Claude Code); speaks newline-delimited JSON-RPC 2.0.
     Mcp {
         /// Repo root the tools default to (default: current directory)

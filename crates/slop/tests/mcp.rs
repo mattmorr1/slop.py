@@ -60,9 +60,12 @@ impl Drop for TempFixture {
 /// Run a batch of request lines through the server and return one parsed
 /// response per line the server emitted.
 fn exchange(repo: PathBuf, requests: &[Value]) -> Vec<Value> {
-    let fixture = TempFixture::new(&repo);
+    exchange_in(&TempFixture::new(&repo).0, requests)
+}
+
+fn exchange_in(repo: &Path, requests: &[Value]) -> Vec<Value> {
     let ctx = ToolCtx {
-        default_repo: fixture.0.clone(),
+        default_repo: repo.to_path_buf(),
         default_index: None,
         refresher: None,
     };
@@ -101,7 +104,7 @@ fn initialize_advertises_tools_capability() {
     assert!(out[0]["result"]["instructions"]
         .as_str()
         .unwrap()
-        .contains("validate_change"));
+        .contains("reconcile"));
 }
 
 #[test]
@@ -134,9 +137,10 @@ fn tools_list_returns_every_tool() {
         names,
         vec![
             "find_capability",
-            "validate_change",
             "assess_write",
-            "query_subgraph"
+            "query_subgraph",
+            "reconcile",
+            "acknowledge"
         ]
     );
 }
@@ -168,28 +172,40 @@ fn assess_write_returns_snapshot_bound_reuse_evidence() {
             .ends_with("notify_with_report")));
 }
 
+fn git(repo: &Path, args: &[&str]) {
+    assert!(std::process::Command::new("git").arg("-C").arg(repo).args(args).status().unwrap().success());
+}
+
+fn call(id: u64, name: &str, arguments: Value) -> Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } })
+}
+
 #[test]
-fn validate_change_returns_the_planted_findings() {
-    let out = exchange(
-        fixture("toy_repo_slopped"),
-        &[serde_json::json!({
-            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": { "name": "validate_change", "arguments": { "all": true } }
-        })],
-    );
-    assert_eq!(out[0]["result"]["isError"], false);
-    let payload = tool_json(&out[0]);
-    let rules: Vec<&str> = payload["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|f| f["rule"].as_str().unwrap())
-        .collect();
-    assert!(rules.contains(&"infra-bypass"), "rules: {rules:?}");
-    assert!(payload["health"].as_str().unwrap().contains("health"));
-    assert_eq!(payload["schema_version"], 1);
-    assert_eq!(payload["snapshot"].as_str().unwrap().len(), 64);
-    assert_eq!(payload["freshness"]["state"], "current");
+fn reconcile_reports_the_diff_and_acknowledge_clears_it() {
+    let fixture = TempFixture::new(&fixture("toy_repo_slopped"));
+    let repo = &fixture.0;
+    git(repo, &["init", "-q"]);
+    git(repo, &["add", "-A"]);
+    git(repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+    std::fs::write(repo.join("services/digest.py"), "import requests\n\n\ndef digest(rows):\n    requests.post(\"http://x\", json=rows)\n    return build_reprot(rows)\n").unwrap();
+    let missing = "missing:services/digest.py:build_reprot";
+    let out = exchange_in(repo, &[
+        call(1, "reconcile", serde_json::json!({})),
+        call(2, "acknowledge", serde_json::json!({ "id": missing, "reason": "generated at import time" })),
+        call(3, "reconcile", serde_json::json!({})),
+        call(4, "acknowledge", serde_json::json!({ "id": missing })),
+    ]);
+    let first = tool_json(&out[0]);
+    assert_eq!(first["scope"], "diff");
+    let ids: Vec<&str> = first["provable"].as_array().unwrap().iter().map(|f| f["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&missing) && ids.iter().any(|id| id.starts_with("infra-bypass:services/digest.py:")), "{first}");
+    assert!(first["detectors"]["findings"].as_array().unwrap().iter().any(|f| f["rule"] == "infra-bypass"), "{first}");
+    assert_eq!(tool_json(&out[1])["acknowledged"], missing);
+    let second = tool_json(&out[2]);
+    assert_eq!(second["acknowledged"], serde_json::json!([missing]));
+    assert!(second["provable"].as_array().unwrap().iter().all(|f| f["id"] != missing));
+    assert_eq!(out[3]["result"]["isError"], true);
+    assert!(std::fs::read_to_string(repo.join(".slop/acks.jsonl")).unwrap().contains("generated at import time"));
 }
 
 #[test]

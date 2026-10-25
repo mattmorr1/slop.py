@@ -287,7 +287,8 @@ pub fn handle_session_start(input: &Value, event: &str) -> Value {
     if let Some(error) = sidecar_error {
         context.push_str(&format!("slop: prewrite sidecar unavailable: {error:#}\n"));
     }
-    context.push_str("slop: before finishing, call slop's `reconcile` tool to check what you changed; use `query_subgraph` to find the channel for an effect.");
+    let scope = as_str(input, "session_id").map_or_else(String::new, |id| format!(" with session_id \"{id}\""));
+    context.push_str(&format!("slop: before finishing, call slop's `reconcile` tool{scope} to check what you changed; use `query_subgraph` to find the channel for an effect."));
     json!({
         "hookSpecificOutput": {
             "hookEventName": event,
