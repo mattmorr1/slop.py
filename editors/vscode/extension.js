@@ -1,5 +1,5 @@
 // The VS Code launch shim for slop's language server. All the analysis lives
-// in the `slop lsp` server (crate slop-lsp, headless-tested); this file only
+// in the `slop lsp` server (crate slop-cli, headless-tested); this file only
 // starts that server and points it at the workspace folder. It is the one
 // piece of the editor surface that isn't covered by an automated test, because
 // it needs a running VS Code extension host — keep it thin on purpose.

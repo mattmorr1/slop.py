@@ -4,15 +4,15 @@ use std::process::Command as Process;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use slop_analyze::baseline::Baseline;
-use slop_analyze::check::{self, CheckRequest, CheckResult};
-use slop_analyze::findings::Severity;
+use slop_core::analyze::baseline::Baseline;
+use slop_core::analyze::check::{self, CheckRequest, CheckResult};
+use slop_core::analyze::findings::Severity;
 
-use slop_analyze::index::{
+use slop_core::analyze::index::{
     default_project_name, ensure_index, run_indexer, run_scip_index, Indexer,
 };
-use slop_analyze::{gate, harness, infer, retrieve};
-use slop_resolve::{IndexSet, Resolver, ScipResolver};
+use slop_core::analyze::{gate, harness, infer, retrieve};
+use slop_core::resolve::{IndexSet, Resolver, ScipResolver};
 
 mod setup;
 
@@ -72,9 +72,9 @@ enum FailOn {
     Advisory,
 }
 
-impl From<FailOn> for slop_analyze::findings::Severity {
+impl From<FailOn> for slop_core::analyze::findings::Severity {
     fn from(f: FailOn) -> Self {
-        use slop_analyze::findings::Severity;
+        use slop_core::analyze::findings::Severity;
         match f {
             FailOn::Blocking => Severity::Blocking,
             FailOn::Warning => Severity::Warning,
@@ -436,10 +436,10 @@ fn main() -> Result<()> {
             harness::log_hook(&input, name, &output, started.elapsed());
         }
         Command::Lsp { repo, index } => {
-            slop_lsp::serve_stdio(repo, index)?;
+            slop_cli::lsp::serve_stdio(repo, index)?;
         }
         Command::Mcp { repo, index } => {
-            slop_mcp::serve_stdio(repo, index)?;
+            slop_cli::mcp::serve_stdio(repo, index)?;
         }
         Command::Index {
             repo,
@@ -449,7 +449,7 @@ fn main() -> Result<()> {
         } => {
             if indexer == IndexerArg::Auto && output.is_none() {
                 run_scip_index(&repo, None)?;
-                let paths = slop_analyze::index::index_paths(&repo, None);
+                let paths = slop_core::analyze::index::index_paths(&repo, None);
                 let resolver = IndexSet::load(&paths)?;
                 if resolver.definition_count() == 0 {
                     bail!(
@@ -532,7 +532,7 @@ fn main() -> Result<()> {
             baseline.save(&repo)?;
             println!(
                 "baselined {count} finding(s) into {}",
-                repo.join(slop_analyze::baseline::BASELINE_FILE).display()
+                repo.join(slop_core::analyze::baseline::BASELINE_FILE).display()
             );
         }
         Command::Init { repo, index, write } => {
@@ -584,8 +584,8 @@ fn run_suggest(
         let mut source = String::new();
         std::io::stdin().read_to_string(&mut source)?;
         let lang = file
-            .and_then(slop_parse::Language::from_path)
-            .unwrap_or(slop_parse::Language::Python);
+            .and_then(slop_core::parse::Language::from_path)
+            .unwrap_or(slop_core::parse::Language::Python);
         let query = retrieve::query_from_source(lang, &source);
         let matches = hood.matches(&query, None, limit);
         if matches.is_empty() {
@@ -616,10 +616,10 @@ fn run_suggest(
     let mut hits = 0usize;
     let mut probed = 0usize;
     for ff in &analysis.facts {
-        if slop_analyze::source::is_test_file(&ff.file) {
+        if slop_core::analyze::source::is_test_file(&ff.file) {
             continue;
         }
-        let Some(lang) = slop_parse::Language::from_path(&ff.file) else {
+        let Some(lang) = slop_core::parse::Language::from_path(&ff.file) else {
             continue;
         };
         let Ok(text) = std::fs::read_to_string(repo.join(&ff.file)) else {
@@ -647,7 +647,7 @@ fn run_suggest(
             // `Neighborhood::build`; without this they still leak in as queries.
             if label
                 .as_deref()
-                .is_some_and(slop_analyze::source::is_test_entity)
+                .is_some_and(slop_core::analyze::source::is_test_entity)
             {
                 continue;
             }
@@ -921,13 +921,13 @@ struct EquivSide {
     sound: String,
     graded: String,
     #[cfg_attr(not(feature = "egraph"), allow(dead_code))]
-    term: slop_parse::equiv::Term,
+    term: slop_core::parse::equiv::Term,
 }
 
 fn equiv_side(source: &str) -> Result<EquivSide> {
-    let facts = slop_parse::Language::Python.parse(source)?;
+    let facts = slop_core::parse::Language::Python.parse(source)?;
     let first = facts.first().context("no function in source")?;
-    let equiv = slop_parse::equiv::equivalence_facts(source)?
+    let equiv = slop_core::parse::equiv::equivalence_facts(source)?
         .into_iter()
         .next()
         .context("no function in source")?;
@@ -968,9 +968,9 @@ fn run_equiv(pairs: &Path, iterations: usize) -> Result<()> {
             "normalize_us": normalize_us,
         });
         #[cfg(feature = "egraph")]
-        for (key, tier) in [("egg_sound", slop_parse::equiv::Tier::Sound), ("egg_graded", slop_parse::equiv::Tier::Graded)] {
+        for (key, tier) in [("egg_sound", slop_core::parse::equiv::Tier::Sound), ("egg_graded", slop_core::parse::equiv::Tier::Graded)] {
             let start = std::time::Instant::now();
-            let proved = slop_parse::egraph::equal(&a.term, &b.term, tier, iterations)?;
+            let proved = slop_core::parse::egraph::equal(&a.term, &b.term, tier, iterations)?;
             verdict[key] = serde_json::json!(proved);
             verdict[format!("{key}_us")] = serde_json::json!(start.elapsed().as_micros() as u64);
         }

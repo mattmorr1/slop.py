@@ -2,12 +2,7 @@
 resolver = "2"
 members = [
     "crates/slop",
-    "crates/slop-analyze",
-    "crates/slop-graph",
-    "crates/slop-lsp",
-    "crates/slop-mcp",
-    "crates/slop-parse",
-    "crates/slop-resolve",
+    "crates/slop-core",
 ]
 
 [workspace.package]
@@ -39,9 +34,4 @@ ruff_python_parser = "0.0.3"
 ruff_python_ast = "0.0.3"
 ruff_text_size = "0.0.3"
 
-slop-graph = { version = "0.1.0", path = "crates/slop-graph" }
-slop-lsp = { version = "0.1.0", path = "crates/slop-lsp" }
-slop-mcp = { version = "0.1.0", path = "crates/slop-mcp" }
-slop-parse = { version = "0.1.0", path = "crates/slop-parse" }
-slop-resolve = { version = "0.1.0", path = "crates/slop-resolve" }
-slop-analyze = { version = "0.1.0", path = "crates/slop-analyze" }
+slop-core = { version = "0.1.0", path = "crates/slop-core" }

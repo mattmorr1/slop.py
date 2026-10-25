@@ -241,7 +241,7 @@ pub fn doctor(repo: &Path) -> Result<bool> {
         "{} project markers: {project_markers}",
         if project_markers > 0 { "ok  " } else { "warn" }
     );
-    let indexes = slop_analyze::index::index_paths(&repo, None);
+    let indexes = slop_core::analyze::index::index_paths(&repo, None);
     if indexes.iter().all(|path| path.is_file()) {
         println!("ok   index: {} artifact(s)", indexes.len());
     } else {

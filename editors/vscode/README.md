@@ -40,8 +40,8 @@ Then open a workspace that has an `index.scip`.
 
 ## Verifiability note
 
-The server (`crate slop-lsp`) is covered by headless tests that drive real
-`Content-Length`-framed JSON-RPC (`crates/slop-lsp/tests/lsp.rs`). **This VS
+The server (the `lsp` module of crate `slop-cli`) is covered by headless tests that drive real
+`Content-Length`-framed JSON-RPC (`crates/slop/tests/lsp.rs`). **This VS
 Code shim is not** — exercising it needs a running extension host, which can't
 be driven headlessly here. It is deliberately kept to a thin launcher so the
 untested surface is minimal; treat `extension.js` as unverified scaffolding
