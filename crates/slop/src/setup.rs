@@ -16,11 +16,11 @@ const CODEX_BLOCK_END: &str = "# <<< slop managed: mcp";
 const STATE_PATH: &str = ".slop/install-state.json";
 
 const PRE_TOOL_CMD: &str = "hook pre-tool-use";
+// Written by older setups; still recognised so setup and uninstall strip it.
 const POST_TOOL_CMD: &str = "hook post-tool-use";
 const PROMPT_CMD: &str = "hook user-prompt-submit";
 const SESSION_CMD: &str = "hook session-start";
 const SUBAGENT_CMD: &str = "hook subagent-start";
-const POST_TOOL_MATCHER: &str = "Read|Write|Edit|MultiEdit";
 const PRE_TOOL_MATCHER: &str = "Write|Edit|MultiEdit";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
@@ -823,18 +823,19 @@ fn merge_hooks(mut existing: Value, exe: &str) -> Value {
         .or_insert_with(|| json!({}));
     let hooks = ensure_object(hooks_value);
     for (event, matcher, tail) in [
-        ("PreToolUse", Some(PRE_TOOL_MATCHER), PRE_TOOL_CMD),
-        ("PostToolUse", Some(POST_TOOL_MATCHER), POST_TOOL_CMD),
-        ("UserPromptSubmit", None, PROMPT_CMD),
-        ("SessionStart", None, SESSION_CMD),
-        ("SubagentStart", None, SUBAGENT_CMD),
+        ("PreToolUse", Some(PRE_TOOL_MATCHER), Some(PRE_TOOL_CMD)),
+        ("PostToolUse", None, None),
+        ("UserPromptSubmit", None, Some(PROMPT_CMD)),
+        ("SessionStart", None, Some(SESSION_CMD)),
+        ("SubagentStart", None, Some(SUBAGENT_CMD)),
     ] {
         let mut groups = strip_slop_groups(hooks.get(event));
-        groups.push(command_group(
-            matcher,
-            format!("{} {tail}", shell_word(exe)),
-        ));
-        hooks.insert(event.into(), Value::Array(groups));
+        groups.extend(tail.map(|tail| command_group(matcher, format!("{} {tail}", shell_word(exe)))));
+        if groups.is_empty() {
+            hooks.remove(event);
+        } else {
+            hooks.insert(event.into(), Value::Array(groups));
+        }
     }
     existing
 }
@@ -904,10 +905,19 @@ mod tests {
     fn hook_commands_quote_binary_paths_with_spaces() {
         let out = merge_hooks(Value::Null, "/tmp/slop tools/slop");
         assert_eq!(
-            out["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-            "'/tmp/slop tools/slop' hook post-tool-use"
+            out["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "'/tmp/slop tools/slop' hook pre-tool-use"
         );
         assert_eq!(out, merge_hooks(out.clone(), "/tmp/slop tools/slop"));
+    }
+
+    #[test]
+    fn merge_drops_a_stale_post_tool_use_entry() {
+        let existing = json!({ "hooks": { "PostToolUse": [{ "matcher": "Read", "hooks": [
+            { "type": "command", "command": "/old/slop hook post-tool-use" }
+        ] }] } });
+        assert!(merge_hooks(existing.clone(), "/new/slop")["hooks"].get("PostToolUse").is_none());
+        assert!(remove_hooks(existing)["hooks"].get("PostToolUse").is_none());
     }
 
     #[test]

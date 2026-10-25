@@ -1,37 +1,27 @@
-//! Agent-host hooks (M4d, D10 §3.5): the read-path harness that steers an
-//! agent *before* context pollution. Two pure handlers, driven by the
-//! `slop hook <event>` CLI:
+//! Agent-host hooks (M4d): pure handlers driven by the `slop hook <event>` CLI.
 //!
-//! - `post-tool-use` — read-remap: deterministically strip comment/blank
-//!   noise from file reads (D11 whitespace/comment strip) and attach
-//!   sanctioned-channel steering as `additionalContext`.
+//! - `pre-tool-use` — pre-check a proposed write against policy and the
+//!   prewrite sidecar.
+//! - `post-tool-use` — attach sanctioned-channel steering to source reads.
+//!   `slop setup` no longer registers it; it stays so older installs keep working.
 //! - `user-prompt-submit` — inject the repo's sanctioned-channel policy as
 //!   pre-hoc steering ("route Net through core.http.Client; don't use urllib").
+//! - `session-start` / `subagent-start` — inject the codebase world model.
 //!
-//! Both derive steering from `slop.toml` alone (cheap — no SCIP index, no
-//! graph build), so they stay fast enough to run on every read/prompt. The
-//! heavier graph-backed checks live behind `validate_change` / `slop gate`.
+//! The per-call hooks derive steering from `slop.toml` alone (cheap — no SCIP
+//! index, no graph build). The heavier graph-backed checks live behind
+//! `validate_change` / `slop gate`.
 
 use std::path::{Path, PathBuf};
-
-use std::hash::{Hash, Hasher};
 
 use serde_json::{json, Value};
 
 use slop_parse::Language;
 
-use crate::compress::CompressConfig;
 use crate::policy::Policy;
 use crate::precheck::precheck;
 use crate::prewrite;
 use crate::world;
-
-/// Only bother remapping when the strip saves at least this fraction of
-/// characters — otherwise pass the read through untouched.
-const MIN_COMPRESSION_GAIN: f64 = 0.10;
-
-/// How many recently-edited files the session edit zone remembers.
-const MAX_ZONE_FILES: usize = 12;
 
 /// Nearest ancestor of `start` (inclusive) containing `slop.toml`, else the
 /// nearest `.git` root, else `start` itself. Hooks are launched from the
@@ -75,27 +65,6 @@ fn as_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
 
-/// The file's text content out of a PostToolUse payload, tolerating the
-/// field-name variation across agent hosts (`tool_output` vs `tool_response`,
-/// string vs `{content|file|text: ...}` object).
-fn read_output_text(input: &Value) -> Option<String> {
-    for key in ["tool_output", "tool_response"] {
-        match input.get(key) {
-            Some(Value::String(s)) => return Some(s.clone()),
-            Some(Value::Object(_)) => {
-                let obj = &input[key];
-                for inner in ["content", "file", "text", "stdout"] {
-                    if let Some(s) = obj.get(inner).and_then(Value::as_str) {
-                        return Some(s.to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 /// The read locus (path + cwd) from a PostToolUse payload.
 fn read_target(input: &Value) -> (Option<String>, PathBuf) {
     let file = input
@@ -109,67 +78,6 @@ fn read_target(input: &Value) -> (Option<String>, PathBuf) {
     (file, cwd)
 }
 
-/// Session edit-zone state file for `repo`, keyed by its path (in the system
-/// temp dir — hooks are separate short-lived processes, so the zone has to
-/// persist across invocations somewhere).
-fn zone_file(repo: &Path) -> PathBuf {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    repo.hash(&mut h);
-    std::env::temp_dir().join(format!("slop-editzone-{:x}.json", h.finish()))
-}
-
-/// Session state: files recently edited (the edit zone reads compress
-/// against) and files already read (a re-read signals the agent needs the
-/// real content — probably to edit it — so it's served verbatim).
-#[derive(Default)]
-struct Zone {
-    edits: Vec<String>,
-    reads: Vec<String>,
-}
-
-fn arr(v: &Value, key: &str) -> Vec<String> {
-    v.get(key)
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-        .unwrap_or_default()
-}
-
-fn load_state(zone_path: &Path) -> Zone {
-    let Ok(text) = std::fs::read_to_string(zone_path) else {
-        return Zone::default();
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return Zone::default();
-    };
-    Zone {
-        // `files` is the pre-read-tracking key name; keep reading it as edits.
-        edits: if v.get("edits").is_some() { arr(&v, "edits") } else { arr(&v, "files") },
-        reads: arr(&v, "reads"),
-    }
-}
-
-fn save_state(zone_path: &Path, zone: &Zone) {
-    let _ = std::fs::write(
-        zone_path,
-        serde_json::to_string(&json!({ "edits": zone.edits, "reads": zone.reads }))
-            .unwrap_or_default(),
-    );
-}
-
-/// Move `rel` to the most-recent end of `list`, deduped and capped.
-fn push_capped(list: &mut Vec<String>, rel: &str) {
-    list.retain(|f| f != rel);
-    list.push(rel.to_string());
-    let overflow = list.len().saturating_sub(MAX_ZONE_FILES);
-    list.drain(0..overflow);
-}
-
-fn record_edit(zone_path: &Path, rel: &str) {
-    let mut zone = load_state(zone_path);
-    push_capped(&mut zone.edits, rel);
-    save_state(zone_path, &zone);
-}
-
 /// Make `path` repo-relative (matching SCIP/graph `file` fields). Returns the
 /// path unchanged if it's already relative, `None` if it's outside `repo`.
 fn repo_relative(repo: &Path, path: &str) -> Option<String> {
@@ -178,23 +86,6 @@ fn repo_relative(repo: &Path, path: &str) -> Option<String> {
         return Some(rel.to_string_lossy().replace('\\', "/"));
     }
     p.is_relative().then(|| path.to_string())
-}
-
-/// Zoned graph-distance compression of a read (task's core token-efficiency
-/// win): skeletonize entities beyond the edit zone. Returns `None` — so the
-/// caller falls back to a plain noise-strip — when it isn't worth it (small
-/// file, no graph/index, edited files not in the graph, nothing skeletonized).
-pub fn compress_read(
-    repo: &Path,
-    rel_file: &str,
-    source: &str,
-    edit_files: &[String],
-) -> Option<String> {
-    let analysis = crate::check::load_analysis(repo, None).ok()?;
-    match analysis.compress_read(rel_file, source, edit_files, &CompressConfig::default()) {
-        crate::context::ReadContext::Compressed { source, .. } => Some(source),
-        crate::context::ReadContext::Verbatim { .. } => None,
-    }
 }
 
 /// The full proposed content of the file a write tool is about to produce.
@@ -250,7 +141,6 @@ pub fn log_hook(input: &Value, event: &str, output: &Value, elapsed: std::time::
         "injected_tokens": context.len() / 4,
         "duplicates": count("slop: new `"),
         "reuse": count("slop: proposed code overlaps"),
-        "compressed_read": hook.is_some_and(|h| h.get("updatedToolOutput").is_some()),
     });
     let path = repo.join(".slop/hooks.jsonl");
     let written = std::fs::create_dir_all(repo.join(".slop")).and_then(|()| {
@@ -317,82 +207,21 @@ pub fn handle_pre_tool_use(input: &Value) -> Value {
     })
 }
 
-/// PostToolUse handler. Returns the JSON to print to stdout: either a
-/// `hookSpecificOutput` with `updatedToolOutput`/`additionalContext`, or an
-/// empty object (no-op passthrough).
+/// PostToolUse handler: sanctioned-channel steering on a source-file read as
+/// `additionalContext`, or an empty object (no-op passthrough).
 pub fn handle_post_tool_use(input: &Value) -> Value {
-    let tool = as_str(input, "tool_name").unwrap_or("");
-
-    // Writes/edits define the edit zone that later reads compress against.
-    if matches!(tool, "Write" | "Edit" | "MultiEdit") {
-        if let Some(path) = input
-            .get("tool_input")
-            .and_then(|t| as_str(t, "file_path"))
-            .filter(|p| Language::from_path(p).is_some())
-        {
-            let repo = find_repo_root(&read_target(input).1);
-            if let Some(rel) = repo_relative(&repo, path) {
-                record_edit(&zone_file(&repo), &rel);
-            }
-        }
-        return json!({});
-    }
-
-    if tool != "Read" {
+    if as_str(input, "tool_name") != Some("Read") {
         return json!({});
     }
     let (file, cwd) = read_target(input);
-    let Some(file) = file.filter(|f| Language::from_path(f).is_some()) else {
+    if !file.is_some_and(|f| Language::from_path(&f).is_some()) {
         return json!({});
-    };
-    let repo = find_repo_root(&cwd);
-    let steering = channel_steering(&Policy::load(&repo).unwrap_or_default());
-
-    let mut hook = json!({ "hookEventName": "PostToolUse" });
-    let mut changed = false;
-
-    if let Some(src) = read_output_text(input) {
-        // Edit-invertibility: only ever remap a read by *zoned skeletonization
-        // of graph-distant context* (code you're editing elsewhere, so you
-        // won't string-edit against it). Everything else is served verbatim —
-        // no strip, no skeleton — so an edit can always match the real file.
-        // A re-read means the agent came back to the file (likely to edit it),
-        // so it's served verbatim too; this self-corrects a first-read edit
-        // that failed against a skeleton (fail -> re-read -> verbatim -> ok).
-        let compress_reads = std::env::var("SLOP_COMPRESS_READS")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        let zone_path = zone_file(&repo);
-        let mut zone = load_state(&zone_path);
-        let rel = repo_relative(&repo, &file);
-        let is_reread = rel.as_deref().is_some_and(|r| zone.reads.iter().any(|x| x == r));
-        if let Some(r) = &rel {
-            push_capped(&mut zone.reads, r);
-            save_state(&zone_path, &zone);
-        }
-
-        if compress_reads && !is_reread {
-            if let Some(out) = rel
-                .as_deref()
-                .and_then(|r| compress_read(&repo, r, &src, &zone.edits))
-            {
-                let gain = 1.0 - (out.len() as f64 / src.len().max(1) as f64);
-                if gain >= MIN_COMPRESSION_GAIN {
-                    hook["updatedToolOutput"] = Value::String(out);
-                    changed = true;
-                }
-            }
-        }
     }
-    if let Some(s) = steering {
-        hook["additionalContext"] = Value::String(s);
-        changed = true;
-    }
-
-    if changed {
-        json!({ "hookSpecificOutput": hook })
-    } else {
-        json!({})
+    match channel_steering(&Policy::load(&find_repo_root(&cwd)).unwrap_or_default()) {
+        Some(steering) => json!({
+            "hookSpecificOutput": { "hookEventName": "PostToolUse", "additionalContext": steering }
+        }),
+        None => json!({}),
     }
 }
 
@@ -486,19 +315,6 @@ mod tests {
     }
 
     #[test]
-    fn read_with_no_edit_zone_is_served_verbatim() {
-        // Edit-invertibility: with no edit zone (and no index), a read is never
-        // remapped — the agent must be able to string-edit against the real
-        // file. No updatedToolOutput.
-        let src = "def f():\n    # a comment\n    return 1\n";
-        let out = handle_post_tool_use(&json!({
-            "tool_name": "Read", "tool_input": {"file_path": "/nope/mod.py"},
-            "tool_output": src, "cwd": "/nope"
-        }));
-        assert!(out.get("hookSpecificOutput").is_none() || out["hookSpecificOutput"].get("updatedToolOutput").is_none());
-    }
-
-    #[test]
     fn channel_steering_lists_sorted_channels() {
         let policy: Policy = toml::from_str(
             "[channels]\nnet = [\"core.http.Client\"]\ndb = [\"core.db.Session\"]",
@@ -516,45 +332,6 @@ mod tests {
         // ...and UserPromptSubmit stays silent.
         let out = handle_user_prompt_submit(&input_in_dir_without_policy());
         assert_eq!(out, json!({}));
-    }
-
-    #[test]
-    fn edit_zone_roundtrips_deduped_and_capped() {
-        let dir = std::env::temp_dir().join(format!("slop-zone-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("zone.json");
-        let _ = std::fs::remove_file(&path);
-
-        record_edit(&path, "a.py");
-        record_edit(&path, "b.py");
-        record_edit(&path, "a.py"); // dedup -> moves a.py to the end
-        assert_eq!(load_state(&path).edits, vec!["b.py".to_string(), "a.py".to_string()]);
-
-        for i in 0..MAX_ZONE_FILES + 5 {
-            record_edit(&path, &format!("f{i}.py"));
-        }
-        assert_eq!(load_state(&path).edits.len(), MAX_ZONE_FILES);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn write_records_edit_zone() {
-        // A .py Write records the edited file (repo root falls back to cwd when
-        // there's no slop.toml/.git).
-        let dir = std::env::temp_dir().join(format!("slop-write-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let zone = zone_file(&dir);
-        let _ = std::fs::remove_file(&zone);
-        let file_path = dir.join("mod.py");
-
-        let out = handle_post_tool_use(&json!({
-            "tool_name": "Edit",
-            "cwd": dir.to_string_lossy(),
-            "tool_input": { "file_path": file_path.to_string_lossy() }
-        }));
-        assert_eq!(out, json!({})); // edits are silent, side-effect only
-        assert_eq!(load_state(&zone).edits, vec!["mod.py".to_string()]);
-        let _ = std::fs::remove_file(&zone);
     }
 
     /// A repo with a Net channel policy and a file on disk to Edit against.
@@ -655,35 +432,6 @@ mod tests {
                 "tool_name": "Read", "tool_input": {"file_path": "/x/a.py"}
             })),
             json!({})
-        );
-    }
-
-    #[test]
-    fn edit_zone_records_every_supported_language() {
-        // W3: the wedge is not Python-only. A .rs edit must register too.
-        let dir = std::env::temp_dir().join(format!("slop-lang-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let zone = zone_file(&dir);
-        let _ = std::fs::remove_file(&zone);
-        for name in ["a.rs", "b.ts", "c.py"] {
-            handle_post_tool_use(&json!({
-                "tool_name": "Edit",
-                "cwd": dir.to_string_lossy(),
-                "tool_input": { "file_path": dir.join(name).to_string_lossy() }
-            }));
-        }
-        assert_eq!(load_state(&zone).edits, vec!["a.rs", "b.ts", "c.py"]);
-        let _ = std::fs::remove_file(&zone);
-    }
-
-    #[test]
-    fn compress_read_skips_small_files() {
-        // Below min_lines it declines (caller noise-strips instead) rather than
-        // paying for a graph build.
-        let tiny = "def f():\n    return 1\n";
-        assert_eq!(
-            compress_read(Path::new("/nope"), "m.py", tiny, &["x.py".to_string()]),
-            None
         );
     }
 }
