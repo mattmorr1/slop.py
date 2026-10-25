@@ -146,17 +146,6 @@ enum Command {
         /// Which hook event this invocation handles
         event: HookEvent,
     },
-    /// Serve slop as a language server (LSP over stdio): publishes findings as
-    /// editor diagnostics on open/save. Editor-agnostic — point VS Code,
-    /// Neovim, Zed, or JetBrains at `slop lsp` (see editors/vscode for a shim).
-    Lsp {
-        /// Repo root the server analyzes (default: current directory)
-        #[arg(default_value = ".")]
-        repo: PathBuf,
-        /// Path to index.scip (default: <repo>/index.scip)
-        #[arg(long)]
-        index: Option<PathBuf>,
-    },
     /// Serve slop's MCP tools (find_capability, assess_write, query_subgraph, reconcile,
     /// acknowledge) over stdio. Launched by an agent host
     /// (e.g. Claude Code); speaks newline-delimited JSON-RPC 2.0.
@@ -187,7 +176,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = IndexerArg::Auto)]
         indexer: IndexerArg,
     },
-    /// Configure slop for an agent host and editor. Codex gets a repo-local MCP entry; Claude
+    /// Configure slop for an agent host. Codex gets a repo-local MCP entry; Claude
     /// Code gets the plugin, and older repo-local Claude entries are removed. Preferences are user-local.
     Setup {
         /// Repo root to configure (default: current directory)
@@ -197,14 +186,11 @@ enum Command {
         /// preference was saved by an earlier setup.
         #[arg(long, value_enum)]
         ai: Option<setup::AgentHost>,
-        /// Preferred editor to open from `slop launch`.
-        #[arg(long, value_enum)]
-        editor: Option<setup::Editor>,
         /// Replace invalid or conflicting slop-owned generated files.
         #[arg(long)]
         force: bool,
     },
-    /// Verify the saved AI/editor, harness receipt, project markers, and index.
+    /// Verify the saved AI, harness receipt, project markers, and index.
     Doctor {
         /// Repo root to diagnose (default: current directory)
         #[arg(default_value = ".")]
@@ -219,7 +205,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Open the preferred editor and run the preferred AI in this repository.
+    /// Run the preferred AI in this repository.
     Launch {
         /// Repo root (default: current directory)
         #[arg(default_value = ".")]
@@ -227,15 +213,9 @@ enum Command {
         /// Override the saved AI for this launch.
         #[arg(long, value_enum)]
         ai: Option<setup::AgentHost>,
-        /// Override the saved editor for this launch.
-        #[arg(long, value_enum)]
-        editor: Option<setup::Editor>,
         /// Do not refresh the repo-local harness before launching.
         #[arg(long)]
         no_setup: bool,
-        /// Do not open the configured editor.
-        #[arg(long)]
-        no_editor: bool,
         /// Args passed through to the AI host (everything after `--`).
         #[arg(last = true)]
         args: Vec<String>,
@@ -438,9 +418,6 @@ fn main() -> Result<()> {
             println!("{output}");
             harness::log_hook(&input, name, &output, started.elapsed());
         }
-        Command::Lsp { repo, index } => {
-            slop_cli::lsp::serve_stdio(repo, index)?;
-        }
         Command::Mcp { repo, index } => {
             slop_cli::mcp::serve_stdio(repo, index)?;
         }
@@ -494,17 +471,11 @@ fn main() -> Result<()> {
                 resolver.files().len()
             );
         }
-        Command::Setup {
-            repo,
-            ai,
-            editor,
-            force,
-        } => {
-            let preferences = setup::configure(&repo, ai, editor, force)?;
+        Command::Setup { repo, ai, force } => {
+            let preferences = setup::configure(&repo, ai, force)?;
             println!(
-                "configured {:?} + {:?}; run `slop doctor {}` to verify",
+                "configured {:?}; run `slop doctor {}` to verify",
                 preferences.ai,
-                preferences.editor,
                 repo.display()
             );
             if preferences.ai == setup::AgentHost::Claude {
@@ -524,12 +495,10 @@ fn main() -> Result<()> {
         Command::Launch {
             repo,
             ai,
-            editor,
             no_setup,
-            no_editor,
             args,
         } => {
-            setup::launch(&repo, ai, editor, no_setup, no_editor, &args)?;
+            setup::launch(&repo, ai, no_setup, &args)?;
         }
         Command::Equiv { pairs, iterations } => run_equiv(&pairs, iterations)?,
         Command::Baseline { repo, index } => {

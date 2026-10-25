@@ -15,16 +15,15 @@ pub struct Refresher {
 }
 
 impl Refresher {
-    /// One worker per repository; `on_done` runs after each reindex that succeeded.
-    pub fn spawn(repo: PathBuf, index: Option<PathBuf>, on_done: impl Fn() + Send + 'static) -> Self {
+    /// One worker per repository.
+    pub fn spawn(repo: PathBuf, index: Option<PathBuf>) -> Self {
         let (requests, pending) = mpsc::channel::<()>();
         std::thread::spawn(move || {
             while pending.recv().is_ok() {
                 while pending.try_recv().is_ok() {}
                 let request = CaptureRequest { repo: &repo, index: index.as_deref(), policy: None, freshness: Freshness::Reindex };
-                match RepositorySnapshot::capture(request) {
-                    Ok(_) => on_done(),
-                    Err(error) => eprintln!("slop: background reindex failed: {error:#}"),
+                if let Err(error) = RepositorySnapshot::capture(request) {
+                    eprintln!("slop: background reindex failed: {error:#}");
                 }
             }
         });

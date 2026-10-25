@@ -34,8 +34,8 @@ Python indexing uses exact npm package versions declared in `index.rs`, run via
 `npx`; Rust indexing uses the installed `rust-analyzer` toolchain component.
 
 The workspace is two packages: `slop-core` (the `parse`, `graph`, `resolve`
-and `analyze` modules) and `slop-cli` (the `slop` binary, with the MCP and LSP
-adapters as modules). Neither is published to crates.io; that is deferred (see
+and `analyze` modules) and `slop-cli` (the `slop` binary, with the MCP
+adapter as a module). Neither is published to crates.io; that is deferred (see
 `docs/roadmap.md`). Install from source with `cargo install --path crates/slop`.
 
 ## One-time PyPI setup

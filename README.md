@@ -37,7 +37,7 @@ Every command takes an optional repo path and defaults to the current directory.
 slop index              # SCIP index for each detected language
 slop check              # findings in the working-tree diff vs HEAD
 slop check --all        # whole repo
-slop check --json       # for editors and CI
+slop check --json       # for CI and tooling
 slop gate               # exit non-zero on blocking findings, JSON verdict
 slop suggest            # where proposed code (on stdin) belongs
 slop baseline           # grandfather current findings
@@ -121,7 +121,7 @@ prints the two commands above.
 ## Other agent hosts
 
 ```sh
-slop setup --ai codex --editor cursor   # MCP entry in .codex/config.toml
+slop setup --ai codex                   # MCP entry in .codex/config.toml
 slop launch
 slop doctor                             # check the saved host, receipt and index
 slop uninstall                          # removes only what setup wrote
@@ -135,19 +135,12 @@ slop never edits code itself; findings carry `fix_guidance` for the agent.
 
 Details: [docs/harness.md](docs/harness.md).
 
-## Editors
-
-`slop lsp` publishes findings as diagnostics on open and save (Blocking = Error,
-Warning = Warning, Advisory = Information). Any LSP client works;
-[editors/vscode](editors/vscode) has a VS Code/Cursor launcher.
-
 ## Limitations
 
 - Resolution is as good as the SCIP index: dynamic dispatch, `getattr` and duck
   typing can be missed.
 - `duplicate-equivalent` is Python-only; the other parser-backed rules cover
   Python, JS/TS and Rust.
-- The VS Code launcher has no tests; the LSP server does.
 
 ## Development
 

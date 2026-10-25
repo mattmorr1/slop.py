@@ -85,7 +85,7 @@ artifact names the repository snapshot it came from.
 **Judgment**:
 The deterministic projection that turns one repository snapshot into ordered
 findings after suppression, submodule exclusion, baseline classification, and
-scope selection. CLI, MCP, LSP, TUI, gate, baseline, and fix share it.
+scope selection. CLI, MCP, hooks, gate, and baseline share it.
 
 **Context artifact**:
 A deterministic, provenance-bearing selection of full source and contract

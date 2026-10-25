@@ -1,4 +1,3 @@
-//! The agent-host adapters behind the `slop mcp` and `slop lsp` commands.
+//! The agent-host adapter behind the `slop mcp` command.
 
-pub mod lsp;
 pub mod mcp;

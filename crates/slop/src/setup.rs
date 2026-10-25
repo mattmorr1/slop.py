@@ -40,30 +40,9 @@ impl AgentHost {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum Editor {
-    None,
-    VsCode,
-    Cursor,
-    Zed,
-}
-
-impl Editor {
-    fn executable(self) -> Option<&'static str> {
-        match self {
-            Self::None => None,
-            Self::VsCode => Some("code"),
-            Self::Cursor => Some("cursor"),
-            Self::Zed => Some("zed"),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Preferences {
     pub ai: AgentHost,
-    pub editor: Editor,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -85,17 +64,11 @@ struct FileChange {
     content: Option<Vec<u8>>,
 }
 
-pub fn configure(
-    repo: &Path,
-    ai: Option<AgentHost>,
-    editor: Option<Editor>,
-    force: bool,
-) -> Result<Preferences> {
+pub fn configure(repo: &Path, ai: Option<AgentHost>, force: bool) -> Result<Preferences> {
     let repo = canonical_repo(repo)?;
     let prior = load_preferences().ok();
     let ai = choose_ai(ai.or_else(|| prior.as_ref().map(|p| p.ai)))?;
-    let editor = choose_editor(editor.or_else(|| prior.as_ref().map(|p| p.editor)))?;
-    let preferences = Preferences { ai, editor };
+    let preferences = Preferences { ai };
     let exe = std::env::current_exe().context("resolving the slop binary path")?;
     let changes = install_changes(&repo, &exe, ai, force)?;
     apply_transaction(&repo, changes)?;
@@ -148,9 +121,7 @@ pub fn uninstall(repo: &Path, force: bool) -> Result<Vec<PathBuf>> {
 pub fn launch(
     repo: &Path,
     ai: Option<AgentHost>,
-    editor: Option<Editor>,
     no_setup: bool,
-    no_editor: bool,
     args: &[String],
 ) -> Result<()> {
     let repo = canonical_repo(repo)?;
@@ -158,14 +129,8 @@ pub fn launch(
     let ai = ai
         .or_else(|| saved.as_ref().map(|p| p.ai))
         .unwrap_or(AgentHost::Claude);
-    let editor = editor
-        .or_else(|| saved.as_ref().map(|p| p.editor))
-        .unwrap_or(Editor::None);
     if !no_setup {
-        let _ = configure(&repo, Some(ai), Some(editor), false)?;
-    }
-    if !no_editor {
-        launch_editor(editor, &repo)?;
+        let _ = configure(&repo, Some(ai), false)?;
     }
     let status = Command::new(ai.executable())
         .current_dir(&repo)
@@ -183,16 +148,9 @@ pub fn doctor(repo: &Path) -> Result<bool> {
     let preferences = load_preferences().ok();
     let mut healthy = true;
     match preferences {
-        Some(ref p) => {
-            healthy &= report_command("AI", p.ai.executable());
-            if let Some(editor) = p.editor.executable() {
-                healthy &= report_command("editor", editor);
-            } else {
-                println!("ok   editor: disabled");
-            }
-        }
+        Some(ref p) => healthy &= report_command("AI", p.ai.executable()),
         None => {
-            println!("fail preferences: run `slop setup --ai <claude|codex> --editor <...>`");
+            println!("fail preferences: run `slop setup --ai <claude|codex>`");
             healthy = false;
         }
     }
@@ -297,24 +255,6 @@ fn choose_ai(value: Option<AgentHost>) -> Result<AgentHost> {
     prompt(
         "Preferred AI",
         &[("Claude", AgentHost::Claude), ("Codex", AgentHost::Codex)],
-    )
-}
-
-fn choose_editor(value: Option<Editor>) -> Result<Editor> {
-    if let Some(value) = value {
-        return Ok(value);
-    }
-    if !std::io::stdin().is_terminal() {
-        bail!("--editor is required outside an interactive terminal");
-    }
-    prompt(
-        "Preferred editor",
-        &[
-            ("None", Editor::None),
-            ("VS Code", Editor::VsCode),
-            ("Cursor", Editor::Cursor),
-            ("Zed", Editor::Zed),
-        ],
     )
 }
 
@@ -627,17 +567,6 @@ fn write_new(path: &Path, content: &[u8]) -> Result<()> {
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let name = path.file_name().and_then(OsStr::to_str).unwrap_or("config");
     path.with_file_name(format!(".{name}.slop-{}-{suffix}", std::process::id()))
-}
-
-fn launch_editor(editor: Editor, repo: &Path) -> Result<()> {
-    let Some(exe) = editor.executable() else {
-        return Ok(());
-    };
-    Command::new(exe)
-        .arg(repo)
-        .spawn()
-        .with_context(|| format!("launching {exe} (is it on PATH?)"))?;
-    Ok(())
 }
 
 fn report_command(label: &str, command: &str) -> bool {

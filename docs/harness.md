@@ -36,7 +36,7 @@ two commands above.
 
 **Codex**: `slop setup <repo> --ai codex` adds a delimited MCP block to
 `.codex/config.toml`. Codex has no hooks. `slop uninstall` removes only what
-setup wrote; `slop doctor` checks the host, editor, receipt and index.
+setup wrote; `slop doctor` checks the host, receipt and index.
 
 `[agent] gate` in `slop.toml` sets how hard the hooks push:
 
