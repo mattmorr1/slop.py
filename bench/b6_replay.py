@@ -4,6 +4,7 @@
   python3 bench/b6_replay.py run --repo NAME=PATH [...] --work /tmp/b6 [--list]
   python3 bench/b6_replay.py score [--ledger bench/results/replay.jsonl] [--labels bench/results/b6_labels.jsonl]
 """
+from collections import Counter
 import argparse, json, os, platform, random, re, select, subprocess, sys, time, uuid
 from pathlib import Path
 
@@ -12,6 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 BIN = Path(os.environ.get("SLOP_BIN", ROOT / "target/release/slop"))
 LEDGER, LABELS = ROOT / "bench/results/replay.jsonl", ROOT / "bench/results/b6_labels.jsonl"
 INDEX_TIMEOUT, HOOK_TIMEOUT, MCP_TIMEOUT = 1200, 300, 600
+PARTIAL = False
+REFUSED = "refusing to persist prewrite evidence from stale snapshot"
 ADV = re.compile(r"^`[^`]*` \(([^:()]+):(\d+)\) (has the same shape as|overlaps existing) `[^`]*` \(([^:()]+):(\d+)\)")
 
 
@@ -123,8 +126,11 @@ def replay(repo, name, commit, parent, py_files):
         u["index"] = {"ok": True, "s": round(time.perf_counter() - at, 1)}
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         u["index"] = {"ok": False, "s": round(time.perf_counter() - at, 1), "error": str(e)[-400:]}
-        u["scorable"] = False
-        return u
+        # Exploratory only (pre-registration change 2): go on when the Python artifact was written.
+        u["partial_index"] = PARTIAL and (repo / ".slop/index/python.scip").is_file()
+        if not u["partial_index"]:
+            u["scorable"] = False
+            return u
     if (repo / "slop.toml").exists():
         u["policy"] = "committed slop.toml"
     else:
@@ -149,7 +155,7 @@ def replay(repo, name, commit, parent, py_files):
         ms, u["reconcile_retries"], rep = mcp_reconcile(repo, sid, tmp)
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         u["errors"].append(f"reconcile: {str(e)[-300:]}")
-        u["scorable"] = not u["errors"] and not u["hook_errors"]
+        u["scorable"] = not u["errors"] and not fatal(u)
         return u
     end = tip(repo, commit)
     u["reconcile_ms"], u["changed_files"], u["sidecar_reconcile"] = round(ms, 1), len(rep["changed_files"]), rep["sidecar"] == "loaded"
@@ -163,11 +169,28 @@ def replay(repo, name, commit, parent, py_files):
         f, l, kind, of, ol = m.groups()
         u["advisory"].append({"id": f"adv:{commit[:12]}:{n}", "kind": "shape" if kind.startswith("has") else "overlap", "file": f, "line": int(l), "existing": f"{of}:{ol}", "later_touched": later_touch(repo, commit, f, int(l), end)})
     u["detectors"] = len(rep["detectors"].get("findings") or [])
-    ids = {f["id"] for f in u["findings"]}
-    if not set(u["stop_ids"]) <= ids or len(u["stop_ids"]) != min(8, len(ids)):
+    if not consistent(u):
         u["errors"].append(f"stop ids {u['stop_ids']} != reconcile provable {[f['id'] for f in u['findings']]}")
-    u["scorable"] = not u["errors"] and not u["hook_errors"]
+    u["scorable"] = not u["errors"] and not fatal(u)
     return u
+
+
+def fatal(u):
+    """Hook errors that void a unit; under a partial index the sidecar refusal is expected and only recorded."""
+    return [e for e in u.get("hook_errors", []) if not (u.get("partial_index") and e.startswith(REFUSED))]
+
+
+def consistent(u):
+    """Stop listed min(8, n) of reconcile's n findings, as a multiset: two copies of one function share an id."""
+    stop, found = Counter(u["stop_ids"]), Counter(f["id"] for f in u["findings"])
+    return not stop - found and sum(stop.values()) == min(8, sum(found.values()))
+
+
+def scorable(u):
+    """The run-time check compared sets, which fails on a repeated id; recompute it as a multiset."""
+    if u.get("scorable"):
+        return True
+    return "findings" in u and not fatal(u) and consistent(u) and all(e.startswith("stop ids ") for e in u["errors"])
 
 
 def manifest(repos, seed_counts):
@@ -224,7 +247,7 @@ def score(a):
     labels = {l["id"]: l for l in map(json.loads, open(a.labels)) if l} if Path(a.labels).is_file() else {}
     advs = sorted((x for u in us for x in u.get("advisory", [])), key=lambda x: x["id"])
     adv_sample = {x["id"] for x in random.Random(SEED).sample(advs, min(40, len(advs)))}
-    key = lambda u, f: f"{u['commit'][:12]}:{f['id']}"
+    key = lambda u, f: f"{u['commit'][:12]}:{f['id']}@{f['file']}:{f['line']}"
     todo = [(u["repo"], key(u, f), f) for u in us for f in u.get("findings", []) if key(u, f) not in labels]
     todo += [(u["repo"], x["id"], x) for u in us for x in u.get("advisory", []) if x["id"] in adv_sample and x["id"] not in labels]
     def tally(items):
@@ -236,19 +259,19 @@ def score(a):
     print("| repo | units | unscorable | blocked | duplicate | missing | infra-bypass | block precision | advisory precision | Stop p50 / p95 ms |")
     print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |")
     for repo in sorted({u["repo"] for u in us}) + ["all"]:
-        ru = [u for u in us if repo in ("all", u["repo"])]
-        fs = [(u, f) for u in ru for f in u.get("findings", [])]
+        ru = [u for u in us if repo == u["repo"] or (repo == "all" and not u["repo"].endswith("-partial"))]
+        fs = [(u, f) for u in ru if scorable(u) for f in u.get("findings", [])]
         by = lambda r: sum(f["rule"] == r for _, f in fs)
-        stops = [u["stop_ms"] for u in ru if u.get("scorable") and "stop_ms" in u]
+        stops = [u["stop_ms"] for u in ru if scorable(u)]
         _, bp = tally([key(u, f) for u, f in fs])
         _, ap = tally([x["id"] for u in ru for x in u.get("advisory", []) if x["id"] in adv_sample])
-        print(f"| {repo} | {len(ru)} | {sum(not u.get('scorable') for u in ru)} | {sum(bool(u.get('blocked')) for u in ru)} | {by('duplicate')} | {by('missing')} | {by('infra-bypass')} | {bp} | {ap} | {pct(stops, .5):.0f} / {pct(stops, .95):.0f} |")
-    for title, ids in (("blocks", [key(u, f) for u in us for f in u.get("findings", [])]), ("advisory sample", sorted(adv_sample))):
+        print(f"| {repo} | {len(ru)} | {sum(not scorable(u) for u in ru)} | {sum(bool(u.get('blocked')) for u in ru if scorable(u))} ({100 * sum(bool(u.get('blocked')) for u in ru if scorable(u)) / max(1, sum(map(scorable, ru))):.0f}%) | {by('duplicate')} | {by('missing')} | {by('infra-bypass')} | {bp} | {ap} | {pct(stops, .5):.0f} / {pct(stops, .95):.0f} |")
+    for title, ids in (("blocks (primary)", [key(u, f) for u in us if scorable(u) and not u["repo"].endswith("-partial") for f in u.get("findings", [])]), ("advisory sample", sorted(adv_sample))):
         c, p = tally(ids)
-        print(f"\n{title}: n={len(ids)} {c} precision {p}; changed or removed later: {sum(f.get('later_touched') in ('line-changed', 'file-removed') for u in us for f in u.get('findings' if title == 'blocks' else 'advisory', []) if (key(u, f) if title == 'blocks' else f['id']) in ids)}")
+        print(f"\n{title}: n={len(ids)} {c} precision {p}; changed or removed later: {sum(f.get('later_touched') in ('line-changed', 'file-removed') for u in us for f in u.get('findings' if title.startswith('blocks') else 'advisory', []) if (key(u, f) if title.startswith('blocks') else f['id']) in ids)}")
     print(f"\nadvisory total {len(advs)}; unscorable causes:")
     for u in us:
-        if not u.get("scorable"):
+        if not scorable(u):
             print(f"  {u['repo']} {u['commit'][:10]}: {u.get('index', {}).get('error') or (u['errors'] + u.get('hook_errors', []))}")
     print(f"\nlatency: index s p50 {pct([u['index']['s'] for u in us if u.get('index', {}).get('ok')], .5)}; reconcile ms p50 {pct([u['reconcile_ms'] for u in us if 'reconcile_ms' in u], .5)}")
     if todo:
@@ -265,8 +288,10 @@ if __name__ == "__main__":
     r.add_argument("--work", default="/tmp/b6")
     r.add_argument("--out", default=str(LEDGER))
     r.add_argument("--list", action="store_true")
+    r.add_argument("--allow-partial-index", action="store_true", help="exploratory: continue when only a non-Python indexer failed")
     s = sub.add_parser("score")
     s.add_argument("--ledger", default=str(LEDGER))
     s.add_argument("--labels", default=str(LABELS))
     a = ap.parse_args()
+    PARTIAL = getattr(a, "allow_partial_index", False)
     run(a) if a.cmd == "run" else score(a)

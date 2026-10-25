@@ -149,3 +149,17 @@ Labels go to `bench/results/b6_labels.jsonl`, one line each:
    The background reindex does not rewrite the prewrite sidecar, so the
    provable and advisory lists are unaffected; only the detector list sees
    the reindexed tree. Reported as a slop bug, not fixed.
+2. Scoring only, seen at unit 41: step 8 compared id *sets*, but two new
+   copies of one function share one `duplicate:<hash>` id, so a correct Stop
+   failed the check. `score` recomputes step 8 as a multiset from the stored
+   ids; nothing else about that unit changes. The run-time check is fixed the
+   same way for later runs.
+3. Exploratory, after the primary run: 42 of 46 gen-ai-privacy units failed
+   `slop index` because its Rust crates cannot be indexed (rust-analyzer exits
+   1 under the pinned 1.90 toolchain, which lacks the component, and also under
+   stable). The primary result keeps them unscorable. A second, separately
+   reported run (`--allow-partial-index`, repo label `gen-ai-privacy-partial`)
+   continues when the Python artifact was written. SessionStart then refuses
+   to persist the sidecar from a stale snapshot, so only `missing` can fire;
+   that refusal is recorded, not counted as an error. It never enters the
+   primary totals.
