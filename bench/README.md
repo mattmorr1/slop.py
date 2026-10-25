@@ -273,12 +273,14 @@ signal, and neither ranker's other-file items add significant reuse.
 ## `b5_bench.py` — B5, bind recall (gate G1)
 
 Pre-registered in `bench/B5_PREREGISTRATION.md` (8c7d9f2) before any
-generation; two pre-scoring binder/arm changes are listed there. Question:
+generation; two pre-scoring binder/arm changes and the vigil pinning are
+listed there. Question:
 does binding a context-free sketch (`b5_bind.py`, binder v0: name resolution,
 MCP `assess_write` callee overlap and E-sound, per-call BM25, merged by
 reciprocal rank) surface the target's real callees better than the envelope
 built for the gutted target? R8's 100 targets; flask `d73fa1cd` and httpx
-`b5addb64` reproduce R8's archived tasks exactly. Sketches: prompts `none`
+`b5addb64` reproduce R8's archived tasks exactly; vigil is pinned at
+`f61607df` (below). Sketches: prompts `none`
 (R8's) and `sketch`, llama3.1:8b (the `none` rows reused from R8 run 1) and
 qwen3:8b, 400 in all. Binary built from 278c7fb.
 
@@ -289,61 +291,79 @@ python3 bench/b5_bench.py generate --tasks R8/tasks.jsonl --model qwen3:8b --out
 SLOP_BIN=target/release/slop python3 bench/b5_bench.py score --tasks DIR/tasks.jsonl --sketches DIR/sketches.jsonl
 ```
 
-### Result (first ledger entry in `bench/results/bind.jsonl`): flask + httpx only
+### Result (second ledger entry in `bench/results/bind.jsonl`): **G1 fails**
 
-**vigil was not scored**: its checkout is absent from this Mac and matt-pc,
-so its 200 sketches exist but have nothing to bind against. G1 as registered
-needs vigil, so the formal verdict is **undecided**. The scored half fails
-both criteria by a wide margin. The ledger's `g1.pooled` is these 50 tasks,
-not the registered 100.
+**G1 fails, pooled and on vigil.** bind trails the envelope on recall@5 and
+is nowhere near 30% precision. The roadmap stops at G1 for re-planning.
 
-50 tasks, 200 sketches; 95% CIs, task-cluster bootstrap:
+vigil (github.com/Vigil-SOC/vigil) is public; the no-memorisation argument
+holds because both models predate it. No public commit reproduces R8's
+sample: at 96fe466b (nearest R8) 0 of 50 ids recur; the best commit,
+f61607df (2026-08-21), has 46 of R8's 50 prompts byte for byte. vigil is
+scored there with R8's ids pinned, keeping those 46 (all with R8's exact
+callees): 96 tasks, 384 sketches (16 vigil sketches unscored). This is
+pre-registration change 3, a labelled deviation; the G1 verdict rests on it.
+The first ledger entry (flask + httpx only, "undecided") is superseded.
 
-| arm | recall@5 | precision@5 | cross-file recall@5 | recall@1k (tokens) | @2k | @4k |
+Pooled, 96 tasks; 95% CIs, task-cluster bootstrap; tokens spent in brackets:
+
+| arm | recall@5 | precision@5 | cross-file recall@5 | recall@1k | @2k | @4k |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| bind | 11.1% [5.9, 17.3] | 6.5% [3.8, 9.7] | **12.4%** [5.4, 21.1] | 11.4% (451) | 13.7% (695) | 14.0% (859) |
-| envelope | 17.1% [8.6, 27.2] | 5.6% [2.8, 8.8] | 3.2% [0.0, 9.7] | **38.1%** (949) | **50.1%** (1,833) | **59.8%** (3,260) |
-| bm25 | 18.5% [10.4, 28.9] | 7.6% [4.4, 11.6] | 10.8% [2.4, 22.0] | 15.5% (978) | 27.3% (1,973) | 30.2% (3,969) |
-| file | 17.2% [8.9, 26.7] | 7.6% [3.6, 13.2] | 0.0% | 19.4% (924) | 28.7% (1,787) | 39.1% (2,877) |
-| bind+file (exploratory) | 17.4% [9.2, 27.0] | 7.7% [4.0, 13.2] | 0.3% | 19.9% (958) | 30.8% (1,879) | 45.3% (3,208) |
+| bind | 12.7% [8.4, 17.2] | 6.9% [4.8, 9.2] | **12.9%** [8.3, 17.8] | 12.8% (622) | 17.5% (1,107) | 20.0% (1,751) |
+| envelope | 21.4% [14.3, 28.7] | 8.4% [5.6, 11.2] | 2.3% [0.0, 6.9] | **41.9%** (942) | **51.5%** (1,752) | **59.4%** (3,054) |
+| bm25 | 21.4% [14.8, 27.9] | 8.1% [5.8, 10.6] | 13.2% [6.2, 21.4] | 19.6% (975) | 27.6% (1,973) | 33.5% (3,965) |
+| file | 25.1% [17.3, 32.3] | 11.2% [7.8, 14.7] | 0.0% | 27.1% (925) | 34.7% (1,761) | 44.1% (2,774) |
+| bind+file (exploratory) | 25.6% [17.8, 33.0] | 10.9% [7.6, 14.3] | 1.9% | 28.2% (962) | 36.9% (1,890) | 51.2% (3,388) |
 
-| G1 criterion (flask + httpx) | needed | measured | |
+| G1 criterion | needed | pooled (96) | vigil (46) |
 | --- | --- | --- | --- |
-| bind − envelope recall@5 | >= +10, CI above 0 | **−6.1 [−16.5, +4.4]** | fail |
-| bind precision@5 | >= 30% | **6.5%** | fail |
-| same, per prompt `none` / `sketch` | | −3.1 / −9.0; precision 7.9% / 5.1% | fail |
-| same, per model llama3.1 / qwen3 | | −2.5 / −9.6; precision 9.9% / 3.1% | fail |
-| flask / httpx alone | | −5.3 / −6.8 | fail |
+| bind − envelope recall@5 | >= +10, CI above 0 | **−8.6 [−16.6, −0.8]** fail | **−11.4 [−22.3, +0.3]** fail |
+| bind precision@5 | >= 30% | **6.9%** fail | **7.2%** fail |
+| per prompt `none` / `sketch` (pooled) | | −6.8 / −10.4 | |
+| per model llama3.1 / qwen3 (pooled) | | −6.8 / −10.4 | |
+| flask / httpx alone | | −5.3 / −6.8 | |
 
-Arithmetic, not a forecast: for the registered 100-task pool to pass, vigil
-alone would need bind precision@5 of at least 53.5% and a recall@5 lead of
-at least +26 points over the envelope.
+vigil alone: bind 14.5% recall@5 vs envelope 26.0%, file 33.6%; cross-file
++12.3 [+5.7, +19.4]; at 1k/2k/4k bind 14.3/21.6/26.5% vs envelope
+46.1/53.2/58.9%.
 
-Bind latency (warm, one MCP process per repo, 182 parsed sketches): p50 7.1
-ms, p95 14.6 ms. E-sound fired 0 times. Unparseable: 18 of 200.
+Bind latency (warm, one MCP process per repo, 361 parsed sketches): p50 15.9
+ms, p95 42.6 ms. E-sound fired 0 times. Unparseable: 23 of 384.
 
 What it says:
 
-- **The sketch names too little to bind.** Parsed sketches make 2.3 (none)
-  and 1.6 (sketch) candidate calls on average; 45 of 92 parsed `sketch`
-  prompts produced no candidate at all. The prompt meant to elicit helper
-  names elicited fewer, so `sketch` is worse than `none` on every metric.
-- **Only name resolution earns hits**: of bind's top-5 items, name
-  resolution placed 283 with 35 gold, BM25 189 with 10, callee overlap 2
+- **The sketch names too little to bind.** On flask + httpx, parsed sketches
+  make 2.3 (none) and 1.6 (sketch) candidate calls on average; 45 of 92
+  parsed `sketch` prompts produced no candidate at all. The prompt meant to
+  elicit helper names elicited fewer, so `sketch` is worse than `none`.
+- **Only name resolution earns hits** (flask + httpx): of bind's top-5 items,
+  name resolution placed 283 with 35 gold, BM25 189 with 10, callee overlap 2
   with 0. Prewrite's 0.125 overlap floor almost never passes for a 2-call
   sketch, and overlap ranks homes, not helpers, as declared.
-- **The one place bind wins is cross-file**: +9.2 [+2.3, +16.4] over the
-  envelope at 5, because a resolved name reaches a helper in another file
-  that the envelope for a gutted target (no outgoing edges) does not rank.
-- **At budgets the envelope dominates** (−27 to −46 points), because bind
-  returns short lists and spends under 900 tokens at 4k; it has nothing more
-  to show. The envelope's 4k recall (59.8%) is mostly the target's file.
+- **The one place bind wins is cross-file**: +10.6 [+5.9, +15.3] pooled,
+  because a resolved name reaches a helper in another file that the envelope
+  for a gutted target (no outgoing edges) does not rank.
+- **At budgets the envelope dominates** (−29 to −39 points pooled): bind
+  returns short lists and has nothing more to show.
+- **Same-file context is the strongest cheap arm.** `file` beats the envelope
+  at 5 (25.1% vs 21.4%), and bind+file beats it on vigil (+8.6 [+1.6, +16.8],
+  exploratory, not a G1 result).
 
-Caveats: half the registered set (vigil, the private primary) is missing;
-public repos may be memorised, which should have helped bind. Gold includes
-callees nested inside the gutted target, which no arm can return. Two 7-8B
-models, one sample each. Secondary check (vigil duplicates) not run: needs
-the vigil checkout.
+Secondary check, vigil duplicates at f61607df (`b5_bench.py dupes`): the four
+slugify copies (`slugify` x2, `_slugify` x2), the darktrace/cloudflare webhook
+`_get_secret`, `_verify_signature` and `_parse_json`, and `_is_dev_mode` x2;
+`_env_bool` does not exist at this commit. Each copy fed as the sketch:
+**0 of 20 other copies rank in bind's top 5**, whether the destination is a
+new file beside the copy or the copy's own file. Binder v0 binds the calls a
+sketch makes, not the function it defines; the copies are not E-sound equal
+to each other (E-sound only re-found the fed copy itself, which is the
+excluded target). So the binder as specified cannot catch a re-written
+helper; that is a duplicate-detection job, not a bind one.
+
+Caveats: vigil is 46 pinned tasks at a commit older than R8's checkout, not
+R8's own sample. flask and httpx may be memorised, which should have helped
+bind. Gold includes callees nested inside the gutted target, which no arm can
+return. Two 7-8B models, one sample each.
 
 ## Scaling: Sentry (2026-09-24)
 

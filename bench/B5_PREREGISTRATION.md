@@ -14,7 +14,8 @@ before any code exists (the envelope, today's product)?
 
 ## Tasks
 
-- R8's 100 targets: 50 vigil (private, primary), 25 flask, 25 httpx, selected
+- R8's 100 targets: 50 vigil (primary; public, see
+  change 3), 25 flask, 25 httpx, selected
   by `bench/reuse_bench.py prepare` (seed 20260923, R8's rule), gutted to
   signature, docstring and `raise NotImplementedError` in a reindexed copy.
   Gold: each original's repository-internal callees (functions and classes,
