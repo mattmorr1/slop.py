@@ -37,8 +37,6 @@ pub struct HashState {
     /// literals and free names kept. See [`Tok`].
     pub alpha: blake3::Hasher,
     pub significant: u32,
-    pub comment_lines: u32,
-    pub code_lines: std::collections::BTreeSet<u32>,
     /// First-occurrence index per bound name, so a consistent rename produces
     /// an identical digest.
     bound_index: HashMap<String, u32>,
@@ -46,8 +44,7 @@ pub struct HashState {
 
 impl HashState {
     /// Fold one leaf token into all three hashes.
-    pub fn leaf(&mut self, kind: &str, text: &str, line: u32, tok: Tok) {
-        self.code_lines.insert(line);
+    pub fn leaf(&mut self, kind: &str, text: &str, tok: Tok) {
         self.significant += 1;
         field(&mut self.exact, kind, text.as_bytes());
 
@@ -99,40 +96,11 @@ impl HashState {
     }
 }
 
-#[derive(Default)]
-pub struct ControlFlow {
-    pub complexity: u32,
-    pub branch_points: u32,
-    pub max_depth: u32,
-    pub deepest_line: u32,
-}
-
-impl ControlFlow {
-    pub fn reached(&mut self, depth: u32, line: u32) {
-        if depth > self.max_depth {
-            self.max_depth = depth;
-            self.deepest_line = line;
-        }
-    }
-}
-
-/// Inclusive line spans of a body's top-level statements, in source order.
-/// Comments are skipped: they hold no occurrences, so counting them as
-/// statements would only inflate a component's size.
-///
-/// An expression-bodied arrow (`x => x + 1`) is one statement, not a partition
-/// of its own subexpressions — hence the block check rather than descending
-/// unconditionally.
-pub fn stmt_spans(body: Node) -> Vec<(u32, u32)> {
-    let span = |n: &Node| (n.start_position().row as u32, n.end_position().row as u32);
-    if !body.kind().ends_with("block") {
-        return vec![span(&body)];
-    }
-    let mut cursor = body.walk();
-    body.named_children(&mut cursor)
-        .filter(|c| !c.kind().contains("comment"))
-        .map(|c| span(&c))
-        .collect()
+/// Structural decision points in `node`'s subtree, not descending into nested functions.
+pub fn branch_points(node: Node, is_branch: fn(&str) -> bool, fn_kinds: &[&str]) -> u32 {
+    let mut cursor = node.walk();
+    let children: Vec<Node> = node.children(&mut cursor).filter(|c| !fn_kinds.contains(&c.kind())).collect();
+    children.into_iter().map(|c| u32::from(is_branch(c.kind())) + branch_points(c, is_branch, fn_kinds)).sum()
 }
 
 /// Identifiers a function binds locally, for the α-equivalence hash.

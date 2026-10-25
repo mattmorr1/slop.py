@@ -7,14 +7,12 @@
 //!   comments/formatting";
 //! - structural hash = leaf kind, with identifiers/literals collapsed —
 //!   "same shape, renamed";
-//! - cyclomatic complexity = 1 + branch nodes (incl. `&&`/`||`/`??`/ternary);
-//! - `branch_points` = structural decision points only (no boolean operators);
-//! - nesting depth counts branching constructs, treating `else if` as flat.
+//! - `branch_points` = structural decision points only (no boolean operators).
 
 use anyhow::{anyhow, Result};
 use tree_sitter::{Node, Parser};
 
-use crate::parse::ts_state::{collect_bound, stmt_spans, ControlFlow, HashState, Tok};
+use crate::parse::ts_state::{branch_points, collect_bound, HashState, Tok};
 use crate::parse::{FunctionFacts, MIN_SIGNIFICANT_TOKENS};
 
 /// Function-like nodes that carry a body worth analyzing.
@@ -145,53 +143,25 @@ fn function_facts(node: Node, src: &[u8]) -> Option<FunctionFacts> {
     let start_line = node.start_position().row as u32;
     let end_line = node.end_position().row as u32;
     let name_line = name_node.start_position().row as u32;
-    let signature = String::from_utf8_lossy(&src[node.start_byte()..body.start_byte()])
-        .trim_end()
-        .to_string();
 
-    // Hashing + token/line counts over the body, skipping nested functions.
     let mut bound = std::collections::HashSet::new();
     collect_bound(node, src, BINDERS, FN_KINDS, &mut bound);
     let mut hasher = HashState::default();
     hash_walk(body, src, &bound, &mut hasher);
 
-    let significant_tokens = hasher.significant;
-    let comment_lines = hasher.comment_lines;
-    let code_lines = hasher.code_lines.len() as u32;
     let (body_hash, structural_hash, alpha_hash) = hasher.finish(MIN_SIGNIFICANT_TOKENS);
-
-    // Control-flow shape over the body.
-    let mut cf = ControlFlow::default();
-    cf_walk(body, 1, &mut cf);
-
-    let param_count = node
-        .child_by_field_name("parameters")
-        .map(|p| p.named_child_count() as u32)
-        .unwrap_or(0);
 
     FunctionFacts {
         name,
         name_line,
         start_line,
         end_line,
-        stmt_spans: stmt_spans(body),
-        signature,
-        complexity: cf.complexity,
-        branch_points: cf.branch_points,
-        max_nesting_depth: cf.max_depth,
-        deepest_line: cf.deepest_line,
+        branch_points: branch_points(body, is_branch_stmt, FN_KINDS),
         body_hash,
         structural_hash,
         alpha_hash,
         equiv_hash: String::new(),
-        significant_tokens,
-        comment_lines,
-        code_lines,
         decorated: is_decorated(node),
-        param_count,
-        returns_value: returns_value(body),
-        forward_target: None,
-        forward_identity: false,
     }
     .into()
 }
@@ -220,12 +190,11 @@ fn is_decorated(node: Node) -> bool {
 }
 
 /// Walk the body's leaf tokens into the hashers, skipping nested function
-/// bodies (their tokens belong to them) and counting comment vs code lines.
+/// bodies (their tokens belong to them).
 fn hash_walk(node: Node, src: &[u8], bound: &std::collections::HashSet<String>, st: &mut HashState) {
     let kind = node.kind();
     if kind == "comment" {
         // A block comment spans multiple lines; a line comment is one.
-        st.comment_lines += node.end_position().row as u32 - node.start_position().row as u32 + 1;
         return;
     }
     if node.child_count() == 0 {
@@ -234,7 +203,7 @@ fn hash_walk(node: Node, src: &[u8], bound: &std::collections::HashSet<String>, 
             return;
         }
         let text = node.utf8_text(src).unwrap_or("");
-        st.leaf(kind, text, node.start_position().row as u32, classify(kind, text, bound));
+        st.leaf(kind, text, classify(kind, text, bound));
         return;
     }
     let mut cursor = node.walk();
@@ -245,109 +214,6 @@ fn hash_walk(node: Node, src: &[u8], bound: &std::collections::HashSet<String>, 
         }
         hash_walk(child, src, bound, st);
     }
-}
-
-/// Count cyclomatic complexity, structural branch points, and nesting depth
-/// over a subtree, skipping nested functions. `else if` is kept flat (the
-/// chained `if` stays at the parent's depth), matching the Python extractor.
-fn cf_walk(node: Node, depth: u32, cf: &mut ControlFlow) {
-    if cf.complexity == 0 {
-        cf.complexity = 1; // base path, set once at the body root
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        let kind = child.kind();
-        if FN_KINDS.contains(&kind) {
-            continue; // nested function: its own scope
-        }
-
-        // Boolean operators and ternaries add paths (complexity) but aren't
-        // structural branch points.
-        if kind == "ternary_expression" {
-            cf.complexity += 1;
-        }
-        if kind == "binary_expression" {
-            if let Some(op) = child.child_by_field_name("operator") {
-                if matches!(op.kind(), "&&" | "||" | "??") {
-                    cf.complexity += 1;
-                }
-            }
-        }
-
-        if is_branch_stmt(kind) {
-            cf.complexity += 1;
-            cf.branch_points += 1;
-            cf.reached(depth, child.start_position().row as u32);
-
-            if kind == "if_statement" {
-                // condition (for &&/||) at this level; consequence deeper;
-                // `else if` stays flat, plain `else` deeper.
-                if let Some(cond) = child.child_by_field_name("condition") {
-                    cf_walk(cond, depth, cf);
-                }
-                if let Some(cons) = child.child_by_field_name("consequence") {
-                    cf_walk(cons, depth + 1, cf);
-                }
-                if let Some(alt) = child.child_by_field_name("alternative") {
-                    descend_else(alt, depth, cf);
-                }
-                continue;
-            }
-            // Other branches: their whole subtree is one level deeper.
-            cf_walk(child, depth + 1, cf);
-            continue;
-        }
-
-        cf_walk(child, depth, cf);
-    }
-}
-
-/// The `else` arm: an `else if` chain stays at `depth`; a plain `else` block
-/// goes one level deeper.
-fn descend_else(else_clause: Node, depth: u32, cf: &mut ControlFlow) {
-    let mut cursor = else_clause.walk();
-    for child in else_clause.children(&mut cursor) {
-        if child.kind() == "if_statement" {
-            cf_walk_if_at(child, depth, cf); // chained else-if, same level
-        } else {
-            cf_walk(child, depth + 1, cf);
-        }
-    }
-}
-
-/// Process an `if_statement` reached as an `else if` — counted, but at the
-/// current depth rather than one deeper.
-fn cf_walk_if_at(if_node: Node, depth: u32, cf: &mut ControlFlow) {
-    cf.complexity += 1;
-    cf.branch_points += 1;
-    cf.reached(depth, if_node.start_position().row as u32);
-    if let Some(cond) = if_node.child_by_field_name("condition") {
-        cf_walk(cond, depth, cf);
-    }
-    if let Some(cons) = if_node.child_by_field_name("consequence") {
-        cf_walk(cons, depth + 1, cf);
-    }
-    if let Some(alt) = if_node.child_by_field_name("alternative") {
-        descend_else(alt, depth, cf);
-    }
-}
-
-/// A `return <expr>;` anywhere in the body, not descending into nested funcs.
-fn returns_value(node: Node) -> bool {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        let kind = child.kind();
-        if FN_KINDS.contains(&kind) {
-            continue;
-        }
-        if kind == "return_statement" && child.named_child_count() > 0 {
-            return true;
-        }
-        if returns_value(child) {
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -362,34 +228,14 @@ mod tests {
         assert!(names.contains(&"foo"));
         assert!(names.contains(&"bar"));
         assert!(names.contains(&"baz"));
-        let foo = facts.iter().find(|f| f.name == "foo").unwrap();
-        assert_eq!(foo.param_count, 2);
-        assert!(foo.returns_value);
-    }
-
-    /// A multi-line right-hand side stays one statement; an expression-bodied
-    /// arrow is one statement rather than a partition of its subexpressions.
-    #[test]
-    fn stmt_spans_group_multi_line_and_expression_bodies() {
-        let src = "function f(a) {\n  const x = 1;\n  // noise\n  const y = wrap(\n    a,\n    x,\n  );\n  return y;\n}\nconst g = (z) => z * 2;\n";
-        let facts = analyze_js(src, false).unwrap();
-        let f = facts.iter().find(|f| f.name == "f").unwrap();
-        assert_eq!(f.stmt_spans, vec![(1, 1), (3, 6), (7, 7)]);
-        let g = facts.iter().find(|f| f.name == "g").unwrap();
-        assert_eq!(g.stmt_spans, vec![(9, 9)]);
     }
 
     #[test]
-    fn complexity_counts_branches_and_booleans() {
+    fn branch_points_count_structural_branches_only() {
         let src = "function branchy(x) {\n  if (x > 0 && x < 10) {\n    for (const i of x) { if (i) x++; }\n  } else if (x < 0 || x === -5) {\n    while (x) x--;\n  }\n  return x ? 1 : 0;\n}\n";
         let facts = analyze_js(src, false).unwrap();
-        let f = &facts[0];
-        // if + && + for + if + elif + || + while + ternary = 8 over base 1 => 9
-        assert!(f.complexity >= 8, "complexity {}", f.complexity);
-        // structural branches: if, for, if, else-if, while = 5 (no booleans/ternary)
-        assert_eq!(f.branch_points, 5, "branch_points {}", f.branch_points);
-        // else-if is flat; deepest is for->if = depth 3
-        assert_eq!(f.max_nesting_depth, 3, "nesting {}", f.max_nesting_depth);
+        // if, for, if, else-if, while = 5 (no booleans/ternary)
+        assert_eq!(facts[0].branch_points, 5, "branch_points {}", facts[0].branch_points);
     }
 
     #[test]
