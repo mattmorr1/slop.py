@@ -26,7 +26,6 @@ pub mod scan;
 pub mod search;
 pub mod snapshot;
 pub mod source;
-pub mod split;
 pub mod suppress;
 pub mod world;
 

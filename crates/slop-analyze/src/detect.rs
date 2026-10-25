@@ -927,8 +927,6 @@ pub fn run_all(
     findings.extend(source_detectors(built, facts));
     findings.extend(parallel_implementation(built, facts));
     findings.extend(crate::coverage::untested_effect(built, policy, &branching, &decorated));
-    // `split::split_candidate` is deliberately absent: adjudicated at ~1 useful
-    // finding in 1184 functions, so it does not ship. See the module header.
     findings.sort_by(|a, b| {
         b.severity
             .cmp(&a.severity)
