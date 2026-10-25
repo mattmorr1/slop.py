@@ -56,12 +56,21 @@ def git_head(path: Path) -> str:
 def prepare(args) -> None:
     import b5_bind
     r8_dir = args.out / "r8"
-    r8.prepare(argparse.Namespace(repo=args.repo, out=r8_dir, budget=4000))
+    archived = {t["id"]: t for t in map(json.loads, args.r8_tasks.read_text().splitlines())} if args.r8_tasks else {}
+    if args.pin and not archived:
+        raise SystemExit("--pin needs --r8-tasks")
+    pinned = {repo: [i.split(":", 1)[1] for i, t in archived.items() if t["repo"] == repo] for repo in args.pin}
+    r8.prepare(argparse.Namespace(repo=args.repo, out=r8_dir, budget=4000, pinned=pinned))
     prepared = [json.loads(line) for line in (r8_dir / "tasks.jsonl").read_text().splitlines()]
-    if args.r8_tasks:
-        archived = {t["id"]: t for t in map(json.loads, args.r8_tasks.read_text().splitlines())}
-        bad = [t["id"] for t in prepared if t["id"] not in archived or archived[t["id"]]["callees"] != t["callees"]
-               or archived[t["id"]]["prompts"]["none"] != t["prompts"]["none"]]
+    same_prompt = lambda t: t["id"] in archived and archived[t["id"]]["prompts"]["none"] == t["prompts"]["none"]
+    for repo in args.pin:
+        mine = [t for t in prepared if t["repo"] == repo]
+        print(f"{repo} pinned: {len(mine)} of {len(pinned[repo])} archived targets exist, {sum(map(same_prompt, mine))} with the archived "
+              f"prompt (kept), {sum(same_prompt(t) and archived[t['id']]['callees'] == t['callees'] for t in mine)} of those with the archived callees",
+              file=sys.stderr)
+    prepared = [t for t in prepared if t["repo"] not in args.pin or same_prompt(t)]
+    if archived:
+        bad = [t["id"] for t in prepared if t["repo"] not in args.pin and not (same_prompt(t) and archived[t["id"]]["callees"] == t["callees"])]
         if bad:
             raise SystemExit(f"{len(bad)} tasks differ from R8's archive, e.g. {bad[:3]}")
     sources = {spec.split("=", 1)[0]: Path(spec.split("=", 1)[1].rsplit(":", 1)[0]).expanduser().resolve() for spec in args.repo}
@@ -278,6 +287,7 @@ def main() -> None:
     p.add_argument("--repo", action="append", required=True, help="NAME=PATH:COUNT")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--r8-tasks", type=Path, help="R8's archived tasks.jsonl; prepared tasks must match it")
+    p.add_argument("--pin", action="append", default=[], help="repo whose targets are R8's archived ids instead of a fresh sample")
     g = sub.add_parser("generate")
     g.add_argument("--tasks", type=Path, required=True)
     g.add_argument("--model", required=True)

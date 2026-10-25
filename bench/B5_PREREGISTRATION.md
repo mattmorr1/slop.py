@@ -159,3 +159,18 @@ one copy as the sketch; reported is whether each other copy ranks in the top 5.
    other arm (catalog functions and classes outside tests), not R8's whole
    gutted catalog including tests. Decided while writing `prepare`, before
    scoring.
+3. **vigil is public, and is scored on pinned targets (after flask and httpx
+   were scored, before any vigil scoring).** vigil is github.com/Vigil-SOC/vigil,
+   public; the no-memorisation argument stands because both models predate
+   it. No public commit reproduces R8's sample: at 96fe466b (nearest R8,
+   2026-09-23) 0 of 50 ids recur, with R8's binary (7e52daa) or the pinned
+   one; three of R8's files were deleted on main on 2026-09-21, so R8's local
+   checkout was older. Scanning every commit from 2026-07-01 to 2026-09-24
+   for R8's stubs and imports, the best is f61607df (2026-08-21), where 46 of
+   R8's 50 prompts recur byte for byte; R8's selection there still diverges
+   because the other four perturb the seeded shuffle. So vigil is prepared at
+   f61607df with R8's archived ids pinned (`prepare --pin vigil`), keeping the
+   46 whose prompts are identical; all 46 also have R8's exact callees. The
+   pooled set is 96 tasks. Under rule "vigil is scored only if R8's selection
+   reproduces", the registered verdict would stay undecided; this deviation
+   is what the G1 verdict below rests on, and is labelled so.
