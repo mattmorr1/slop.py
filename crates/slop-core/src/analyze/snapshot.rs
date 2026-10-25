@@ -480,7 +480,9 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
     }
     let indexed_files: BTreeSet<String> =
         resolver.files().into_iter().map(str::to_string).collect();
-    let (degraded, reasons, failed) = coverage(&digests, &indexed_files, &stamps, &failures);
+    // An indexed path the walk skips (a symlink) still exists; only a vanished one is removed.
+    let present: BTreeSet<String> = indexed_files.iter().filter(|f| digests.contains_key(*f) || std::fs::symlink_metadata(repo.join(f)).is_err()).cloned().collect();
+    let (degraded, reasons, failed) = coverage(&digests, &present, &stamps, &failures);
     let vouched = reasons.is_empty();
     let freshness = if vouched && failed.is_empty() {
         SnapshotFreshness::Current
@@ -591,6 +593,19 @@ mod tests {
             .find(|other| **other != file)
             .expect("second file");
         assert_eq!(second.document_state(other), DocumentState::Resolved);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_indexed_symlink_does_not_make_the_snapshot_stale() {
+        let repo = fixture("toy_repo");
+        let first = RepositorySnapshot::capture(warn(&repo)).expect("first capture");
+        let file = first.sources.keys().next().expect("a source").clone();
+        let target = format!("{file}.txt");
+        std::fs::rename(repo.join(&file), repo.join(&target)).unwrap();
+        std::os::unix::fs::symlink(Path::new(&target).file_name().unwrap(), repo.join(&file)).unwrap();
+        let second = RepositorySnapshot::capture(warn(&repo)).expect("second capture");
+        assert_eq!(second.freshness(), &SnapshotFreshness::Current, "{file} is a symlink the walk skips, not a deleted file");
     }
 
     #[test]
