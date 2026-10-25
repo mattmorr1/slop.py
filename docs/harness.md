@@ -105,7 +105,9 @@ acknowledged or already blocked once this session.
 
 An existing function counts as the original only if it held that name and hash
 both at the baseline and now. A renamed original, or the new copy indexed by a
-sidecar rebuilt mid-session, never matches.
+sidecar rebuilt mid-session, never matches. A file the session deleted or moved
+is a change whose functions are all gone, so a moved file never matches its old
+path, and a `missing` call the deleted file already made is not new.
 
 E-sound equivalence keeps a leading docstring, so a copy with a different
 docstring is not provably equivalent. It surfaces as advice instead.

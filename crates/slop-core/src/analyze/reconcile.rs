@@ -64,6 +64,8 @@ pub fn reconcile(repo: &Path, changes: &[Change], sidecar: Option<&PrewriteSidec
         let holds = |fns: &Vec<FunctionFacts>| fns.iter().any(|f| f.name == simple(&site.label) && (f.equiv_hash == hash || f.structural_hash == hash));
         parsed.get(site.file.as_str()).is_none_or(|states| states.iter().all(holds))
     };
+    // A move deletes one file and adds another: calls the deleted side already made are not new.
+    let moved: HashSet<String> = changes.iter().filter(|c| c.after.is_empty()).flat_map(|c| new_missing(&mut resolver, &c.file, None, c.before.as_deref().unwrap_or(""))).map(|m| m.name).collect();
     for change in changes {
         let Some(language) = Language::from_path(&change.file) else { continue };
         let (file, after) = (change.file.as_str(), change.after.as_str());
@@ -107,12 +109,12 @@ pub fn reconcile(repo: &Path, changes: &[Change], sidecar: Option<&PrewriteSidec
                 }
                 let body: String = after.lines().skip(function.start_line as usize).take((function.end_line - function.start_line + 1) as usize).collect::<Vec<_>>().join("\n");
                 let query = crate::analyze::retrieve::query_from_source(language, &body);
-                if let Some(m) = sidecar.neighborhood.matches(&query, 3).into_iter().find(|m| m.score_ppm >= MIN_REUSE_SCORE_PPM && !(m.file == file && simple(&m.label) == function.name)) {
+                if let Some(m) = sidecar.neighborhood.matches(&query, 3).into_iter().find(|m| m.score_ppm >= MIN_REUSE_SCORE_PPM && !(m.file == file && simple(&m.label) == function.name) && parsed.get(m.file.as_str()).is_none_or(|[_, now]| now.iter().any(|f| f.name == simple(&m.label)))) {
                     report.advisory.push(format!("`{}` ({file}:{}) overlaps existing `{}` ({}:{}) through calls [{}]", function.name, line + 1, m.label, m.file, m.line + 1, m.distinctive.join(", ")));
                 }
             }
         }
-        report.findings.extend(new_missing(&mut resolver, file, change.before.as_deref(), after).iter().map(|call| missing_finding(file, call, sidecar)));
+        report.findings.extend(new_missing(&mut resolver, file, change.before.as_deref(), after).iter().filter(|call| !moved.contains(&call.name)).map(|call| missing_finding(file, call, sidecar)));
     }
     report.advisory.truncate(MAX_ADVISORY);
     report
@@ -232,5 +234,30 @@ mod tests {
         sidecar.equivalents.insert(hash, vec![Site { label: "utils.dates::parse_date".into(), file: "utils/dates.py".into(), start: 5, end: 10 }]);
         let renamed = Change { file: "utils/dates.py".into(), after: original.replace("def parse_date", "def parse_iso_date"), before: Some(original) };
         assert!(ids(&reconcile(&repo, &[renamed], Some(&sidecar), &policy)).iter().all(|id| !id.starts_with("duplicate:")));
+    }
+
+    #[test]
+    fn a_moved_file_is_neither_a_copy_of_itself_nor_new_missing_calls() {
+        let repo = TempFixture::new("toy_repo_slopped");
+        let snapshot = RepositorySnapshot::capture(CaptureRequest { repo: &repo, index: None, policy: None, freshness: Freshness::Warn }).unwrap();
+        let path = snapshot.write_prewrite_sidecar().unwrap();
+        let sidecar = crate::analyze::prewrite::load_sidecar(&repo).unwrap().unwrap();
+        let _ = std::fs::remove_file(path);
+        std::fs::write(repo.join("utils/legacy.py"), "def run(step):\n    return goto(step)\n").unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&*repo).args(args).output().unwrap().status.success(), "git {args:?}");
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        crate::analyze::session::start(&repo, "moved").unwrap();
+        std::fs::create_dir_all(repo.join("utils/moved")).unwrap();
+        for file in ["dates.py", "legacy.py"] {
+            std::fs::rename(repo.join("utils").join(file), repo.join("utils/moved").join(file)).unwrap();
+        }
+        let session = crate::analyze::session::load(&repo, "moved").unwrap();
+        let changes = crate::analyze::session::changes(&repo, &session).unwrap();
+        assert!(changes.iter().any(|c| c.file == "utils/dates.py" && c.after.is_empty()), "a deleted file is a change");
+        let report = reconcile(&repo, &changes, Some(&sidecar), &Policy::default());
+        assert!(report.findings.is_empty(), "{:?}", ids(&report));
+        assert!(report.advisory.iter().all(|a| !a.contains("utils/dates.py")), "{:?}", report.advisory);
     }
 }

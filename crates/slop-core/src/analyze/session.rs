@@ -27,6 +27,7 @@ pub struct Session {
 pub struct Change {
     pub file: String,
     pub before: Option<String>,
+    /// Empty when the session deleted the file: every function it had is gone.
     pub after: String,
 }
 
@@ -126,13 +127,17 @@ pub fn changes(repo: &Path, session: &Session) -> Result<Vec<Change>> {
     names.extend(session.dirty.keys().cloned());
     let mut out = Vec::new();
     for file in names {
-        let after = match std::fs::read_to_string(repo.join(&file)) {
-            Ok(text) => text,
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData) => continue,
+        let (after, digest_now) = match std::fs::read_to_string(repo.join(&file)) {
+            Ok(text) => {
+                let digest = hash(text.as_bytes());
+                (text, digest)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), String::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
             Err(error) => return Err(error).with_context(|| format!("reading {file}")),
         };
         let before = match session.dirty.get(&file) {
-            Some(digest) if *digest == hash(after.as_bytes()) => continue,
+            Some(digest) if *digest == digest_now => continue,
             Some(digest) if digest.is_empty() => None,
             Some(digest) => Some(std::fs::read_to_string(blob(repo, digest)).with_context(|| format!("reading the session-start copy of {file}"))?),
             None => session.head.as_deref().and_then(|head| git(repo, &["show", &format!("{head}:{file}")]).ok()).map(|b| String::from_utf8_lossy(&b).into_owned()),
