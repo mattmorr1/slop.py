@@ -213,7 +213,7 @@ def bind_all(tasks: dict, sketches: list[dict]) -> tuple[dict, list, dict]:
                 stats["latency"].append(result["seconds"])
                 cat, vocab_names = binder.catalog, {n.rsplit(".", 1)[-1] for n in t.get("vocab", [])}
                 imported = b5_bind.imported_names(cat.tree(t["file"]))
-                buckets = Counter("vocab" if n in vocab_names else "repo" if cat.by_name.get(n) or cat.by_norm.get(b5_bind.normalised(n))
+                buckets = Counter("vocab" if n in vocab_names else "other" if cat.by_name.get(n) or cat.by_norm.get(b5_bind.normalised(n))
                                   else "imported" if n in imported else "invented" for n in result["called"])
                 stats["calls"].append({"repo": repo, "prompt": s["prompt"], **buckets})
                 trace.append({"id": s["id"], "prompt": s["prompt"], "model": s["model"], "top": ranked[:20], "via": result["via"],
@@ -237,9 +237,9 @@ def call_stats(calls: list[dict]) -> dict:
     """Mean candidate calls per parsed sketch and their split into vocabulary / other repo / imported / invented."""
     out = {}
     for label, rows in [("pooled", calls)] + [(f"repo={r}", [c for c in calls if c["repo"] == r]) for r in sorted({c["repo"] for c in calls})]:
-        total = {k: sum(c.get(k, 0) for c in rows) for k in ("vocab", "repo", "imported", "invented")}
+        total = {k: sum(c.get(k, 0) for c in rows) for k in ("vocab", "other", "imported", "invented")}
         n = sum(total.values())
-        out[label] = {"sketches": len(rows), "calls_per_sketch": n / len(rows), "resolved_per_sketch": (total["vocab"] + total["repo"]) / len(rows),
+        out[label] = {"sketches": len(rows), "calls_per_sketch": n / len(rows), "resolved_per_sketch": (total["vocab"] + total["other"]) / len(rows),
                       **{f"share_{k}": v / n if n else None for k, v in total.items()}}
     return out
 

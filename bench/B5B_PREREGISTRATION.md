@@ -109,4 +109,7 @@ is exploratory and labelled so.
 
 ## Changes after the first generation
 
-None yet.
+1. **Crash fix only (after generation, before any result was seen).** The
+   first score run crashed before printing anything: the call bucket named
+   `repo` overwrote the record's repository field. The bucket is renamed
+   `other`; definitions and metrics are unchanged.
