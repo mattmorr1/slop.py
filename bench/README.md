@@ -320,6 +320,77 @@ monorepo, the worst case for a duplicate check. Before any live trial
 boundary; otherwise the first `git mv` in a session costs a turn per
 function moved.
 
+## `b6_replay.py b7`: B7, known vigil copies replayed through Stop
+
+Pre-registered in `B7_PREREGISTRATION.md` (committed a33dfdf, before any gate
+run). Vigil-SOC/vigil at `fbf68f87`. There are 10 positives: copies of
+`slugify`, `_env_bool`, the three webhook helpers and `_is_dev_mode`, each
+written after another member of its group already existed. The precision
+sample is 60 seeded one-parent `.py` commits. Arm A is `gate-fixes`
+(f4686f2) and arm B is `equiv-nodoc` (a33dfdf; its slop code equals 290243c,
+which adds the docstring-blind E-sound hash). Each parent is indexed once by
+A and restored for B. The run took 194 min (11618 s) for 68 units x 2 arms.
+None were unscorable. Stop p50 was 242 ms (A) and 257 ms (B), and `slop index`
+p50 was 35 s.
+
+```
+python3 bench/b6_replay.py b7 --arm A:gate-fixes:/tmp/b7/bin/slop-A --arm B:equiv-nodoc:/tmp/b7/bin/slop-B
+python3 bench/b6_replay.py b7-score
+```
+
+### Result (last `"bench": "B7"` entry in `bench/results/replay.jsonl`, labels in `bench/results/b7_labels.jsonl`): **park the gate**
+
+| group | file | commit | arm A hit | arm B hit | advisory hit (A/B) | why missed |
+| --- | --- | --- | --- | --- | --- | --- |
+| env_bool | backend/middleware/security_headers.py | c05e4e27 | no | no | yes / yes | not equivalent: the truthy tuple is in a different order and `default` has a default; listed only as "same shape" advice |
+| env_bool | backend/middleware/csrf.py | 64ea444b | yes | yes | no / no | |
+| env_bool | backend/services/auth_cookies.py | 165849f7 | yes | yes | no / no | |
+| get_secret | backend/api/cloudflare_webhooks.py | 66e09911 | no | no | no / no | different body (secrets manager, then env); no shape or callee overlap |
+| verify_signature | backend/api/cloudflare_webhooks.py | 66e09911 | no | no | no / no | two `if` guards merged into one `or`: same behaviour, different statements, and E-sound does not normalise control flow |
+| parse_json | backend/api/cloudflare_webhooks.py | 66e09911 | no | no | no / no | unverified: probably the local `import json` statement in the original (the copy uses the module import and renames `e` to `exc`) |
+| is_dev_mode | backend/services/auth_service.py | 91f40aa6 | no | no | no / no | different predicate (`== "true"` vs `in ("true", "1", "yes")`) and different default |
+| slugify | backend/services/custom_agent_service.py | bcc689f1 | no | no | no / no | different algorithm (regex vs `str.replace` chain) |
+| slugify | services/custom_workflow_service.py | 454873c1 | no | no | no / no | different algorithm, and a `[:60]` cap and fallback |
+| slugify | backend/api/llm_providers.py | d82f75e0 | no | no | no / no | regex like the others, but different fallback literal and no docstring; none of the earlier three is behaviour-equal |
+
+Recall is **2/10 (20%) in both arms**. Advisory recall is 1/10 in both arms.
+The docstring arm changed no positive: of the 10 positives, the 8 misses
+differ in behaviour or in statements, not in docstrings.
+
+| arm | block findings | TRUE | USELESS | FALSE | UNSURE | precision (all) | precision (sample only) |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| A | 3 | 2 | 0 | 1 | 0 | 2/3 = 67% | 0/1 = 0% |
+| B | 4 | 2 | 1 | 1 | 0 | 2/4 = 50% | 0/2 = 0% |
+
+Each arm blocked 3 of 68 units. The only sample block (88434dd5, medic trust
+statements) is the only block outside the known copies:
+
+- **`_sub`: FALSE in both arms.** It is text-identical to
+  `pack_build._sub`, but each reads its own module global `_SCHEMA`, and the
+  two load different schema files. "Provably equivalent (same behaviour for
+  every input)" is wrong. The E-sound hash treats a free module-level name as
+  equal across modules, which is a soundness bug. It is reported, not fixed.
+- **`canonical`: USELESS, arm B only.** It equals
+  `medic_last_seen.snapshot_bytes` once the docstring is ignored. Acting on it
+  would import `core/platform` into the separately shipped medic contracts
+  package for one `json.dumps` line.
+
+**Verdict: park the gate.** Arm B blocks 20% of positives, well under the 50%
+bar. Precision exactly meets 50%, but only because 2 of the 4 block findings
+are the known copies themselves. On the 60 ordinary commits it is 0/2, and
+one of those two is unsound. The duplicate rule catches only text-identical
+copies. The copying that actually happens in vigil (re-typed helpers with
+reordered literals, merged guards, a different fallback string) is beyond
+E-sound by construction, and the docstring change does not move it.
+"Same shape" advice caught one more copy (c05e4e27). That points to advice,
+not blocking, as the useful channel, but advisory recall of 1/10 does not
+justify keeping it either.
+
+Found on the way, and fixed before the run because it would have zeroed B7:
+vigil tracks a symlinked `tools/splunk.py`. The source walk skips it but
+scip-python indexes it, so every capture was stale and SessionStart never
+wrote the sidecar (f4686f2).
+
 ## Archive
 
 The scripts in `bench/archive/` measured surfaces removed in P0 (the context
