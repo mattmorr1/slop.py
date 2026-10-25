@@ -318,29 +318,9 @@ pub fn load_sidecar(repo: &Path) -> Result<Option<PrewriteSidecar>> {
     Ok(Some(sidecar))
 }
 
-pub fn assess_from_sidecar(
-    repo: &Path,
-    policy: &Policy,
-    file: &str,
-    source: &str,
-    limit: usize,
-) -> Result<Option<WriteAssessment>> {
-    let Some(sidecar) = load_sidecar(repo)? else {
-        return Ok(None);
-    };
+pub fn assess_from_sidecar(repo: &Path, sidecar: &PrewriteSidecar, policy: &Policy, file: &str, source: &str, limit: usize) -> Result<WriteAssessment> {
     let current = std::fs::read_to_string(repo.join(file)).ok();
-    assess(
-        sidecar.snapshot,
-        sidecar.freshness,
-        policy,
-        &sidecar.neighborhood,
-        &sidecar.equivalents,
-        file,
-        source,
-        current.as_deref(),
-        limit,
-    )
-    .map(Some)
+    assess(sidecar.snapshot.clone(), sidecar.freshness.clone(), policy, &sidecar.neighborhood, &sidecar.equivalents, file, source, current.as_deref(), limit)
 }
 
 #[cfg(test)]
@@ -417,15 +397,16 @@ mod tests {
         let first = std::fs::read(&path).unwrap();
         snapshot.write_prewrite_sidecar().expect("rewrite sidecar");
         assert_eq!(std::fs::read(&path).unwrap(), first);
+        let sidecar = load_sidecar(&repo).expect("read sidecar").expect("sidecar exists");
         let assessment = assess_from_sidecar(
             &repo,
+            &sidecar,
             &snapshot.policy,
             "services/new_notify.py",
             "def emit(rows):\n    report = build_report(rows)\n    send_notification(report)\n",
             3,
         )
-        .expect("read sidecar")
-        .expect("sidecar exists");
+        .expect("assess");
         assert_eq!(assessment.snapshot, snapshot.id().clone());
         assert!(!assessment.reuse_suggestions.is_empty());
         let _ = std::fs::remove_file(path);

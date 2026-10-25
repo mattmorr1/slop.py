@@ -111,18 +111,22 @@ pub fn reconcile(repo: &Path, changes: &[Change], sidecar: Option<&PrewriteSidec
                 }
             }
         }
-        let was_missing: HashSet<String> = match change.before.as_deref().map(|b| missing::check(&mut resolver, file, b)) {
-            Some(Outcome::Checked(found)) => found.into_iter().map(|m| m.name).collect(),
-            _ => HashSet::new(),
-        };
-        if let Outcome::Checked(found) = missing::check(&mut resolver, file, after) {
-            for call in found.into_iter().filter(|m| !was_missing.contains(&m.name)) {
-                report.findings.push(missing_finding(file, &call, sidecar));
-            }
-        }
+        report.findings.extend(new_missing(&mut resolver, file, change.before.as_deref(), after).iter().map(|call| missing_finding(file, call, sidecar)));
     }
     report.advisory.truncate(MAX_ADVISORY);
     report
+}
+
+/// Calls to provably missing names in `after` that `before` did not already make.
+pub fn new_missing(resolver: &mut Resolver, file: &str, before: Option<&str>, after: &str) -> Vec<missing::Missing> {
+    let was: HashSet<String> = match before.map(|b| missing::check(resolver, file, b)) {
+        Some(Outcome::Checked(found)) => found.into_iter().map(|m| m.name).collect(),
+        _ => HashSet::new(),
+    };
+    match missing::check(resolver, file, after) {
+        Outcome::Checked(found) => found.into_iter().filter(|m| !was.contains(&m.name)).collect(),
+        Outcome::Skipped(_) => Vec::new(),
+    }
 }
 
 /// A `missing` call as a finding, with up to three "did you mean" suggestions from the sidecar.

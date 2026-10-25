@@ -24,8 +24,8 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// Hook events slop can handle. Kebab-cased on the CLI by clap:
-/// `post-tool-use`, `user-prompt-submit`.
+/// Hook events slop can handle, kebab-cased on the CLI. `post-tool-use` and
+/// `user-prompt-submit` are no-ops kept so hooks from older installs still exit cleanly.
 #[derive(Clone, Copy, ValueEnum)]
 enum HookEvent {
     PreToolUse,
@@ -427,8 +427,8 @@ fn main() -> Result<()> {
             let started = std::time::Instant::now();
             let (name, output) = match event {
                 HookEvent::PreToolUse => ("PreToolUse", harness::handle_pre_tool_use(&input)),
-                HookEvent::PostToolUse => ("PostToolUse", harness::handle_post_tool_use(&input)),
-                HookEvent::UserPromptSubmit => ("UserPromptSubmit", harness::handle_user_prompt_submit(&input)),
+                HookEvent::PostToolUse => ("PostToolUse", serde_json::json!({})),
+                HookEvent::UserPromptSubmit => ("UserPromptSubmit", serde_json::json!({})),
                 HookEvent::SessionStart => ("SessionStart", harness::handle_session_start(&input, "SessionStart")),
                 HookEvent::SubagentStart => ("SubagentStart", harness::handle_session_start(&input, "SubagentStart")),
                 HookEvent::Stop => ("Stop", harness::handle_stop(&input)),

@@ -177,3 +177,24 @@ fn stop_and_pre_tool_use_stay_cheap() {
     let pre = time(&|| repo.pre_write("s7", "utils/iso3.py", PARSE_COPY));
     assert!(stop < Duration::from_millis(1500) && pre < Duration::from_millis(1000), "stop {stop:?}, pre {pre:?}");
 }
+
+#[test]
+fn pre_tool_use_warns_about_a_missing_helper_without_denying() {
+    let repo = Repo::new();
+    repo.start("s8");
+    let out = repo.pre_write("s8", "services/digest.py", TYPO_CALL);
+    let context = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default();
+    assert!(context.contains("slop: missing `build_reprot`") && context.contains("services.reports.build_report"), "{out}");
+    assert!(out["hookSpecificOutput"].get("permissionDecision").is_none());
+}
+
+#[test]
+fn gate_off_silences_every_hook() {
+    let repo = Repo::new();
+    let policy = std::fs::read_to_string(repo.0.join("slop.toml")).unwrap();
+    repo.write("slop.toml", &format!("[agent]\ngate = \"off\"\n\n{policy}"));
+    repo.start("s9");
+    repo.write("services/digest.py", TYPO_CALL);
+    assert_eq!(repo.pre_write("s9", "services/digest.py", TYPO_CALL), serde_json::json!({}));
+    assert_eq!(repo.stop("s9"), serde_json::json!({}));
+}
