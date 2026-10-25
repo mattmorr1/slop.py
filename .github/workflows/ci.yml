@@ -21,3 +21,15 @@ jobs:
           components: clippy
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  wheel-version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: astral-sh/setup-uv@v6
+      - name: Wheel version matches workspace version
+        run: |
+          pkgid="$(cargo pkgid -p slop-cli)"
+          uvx maturin sdist --out dist
+          test -f "dist/slop_cli-${pkgid##*@}.tar.gz" || { ls dist; exit 1; }
