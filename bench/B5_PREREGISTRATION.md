@@ -149,4 +149,13 @@ one copy as the sketch; reported is whether each other copy ranks in the top 5.
 
 ## Changes after the first generation
 
-None yet.
+1. **Imported names skip BM25 (binder; made before any sketch was scored or
+   read).** A hand-written smoke sketch of flask's `with_appcontext` sent
+   `update_wrapper` (imported from functools at the top of `cli.py`) to
+   name similarity, which ranked an unrelated `update` view first. A name
+   the target's file imports says where it lives, so it now binds by name
+   resolution or not at all. Rule 1 is otherwise unchanged.
+2. **BM25 candidate set.** The bm25 arm ranks the same candidates as every
+   other arm (catalog functions and classes outside tests), not R8's whole
+   gutted catalog including tests. Decided while writing `prepare`, before
+   scoring.
