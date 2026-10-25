@@ -21,7 +21,8 @@ const POST_TOOL_CMD: &str = "hook post-tool-use";
 const PROMPT_CMD: &str = "hook user-prompt-submit";
 const SESSION_CMD: &str = "hook session-start";
 const SUBAGENT_CMD: &str = "hook subagent-start";
-const PRE_TOOL_MATCHER: &str = "Write|Edit|MultiEdit";
+/// What Claude Code users run instead: hooks, MCP and the skill ship as the plugin in `plugin/`.
+pub const CLAUDE_PLUGIN_STEPS: [&str; 2] = ["/plugin marketplace add mattmorr1/slop.py", "/plugin install slop@slop"];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -362,7 +363,7 @@ fn install_changes(repo: &Path, exe: &Path, ai: AgentHost, force: bool) -> Resul
     let exe = exe.to_string_lossy();
     let repo_text = repo.to_string_lossy();
     let host_changes = match ai {
-        AgentHost::Claude => claude_changes(repo, &exe, &repo_text, force)?,
+        AgentHost::Claude => Vec::new(),
         AgentHost::Codex => codex_changes(repo, &exe, &repo_text, force)?,
     };
     let files = host_changes
@@ -393,6 +394,8 @@ fn install_changes(repo: &Path, exe: &Path, ai: AgentHost, force: bool) -> Resul
     Ok(changes)
 }
 
+/// A previous install's owned entries, removed when the host changes, and always for Claude,
+/// whose integration is now the plugin.
 fn migration_removals(repo: &Path, next: AgentHost, force: bool) -> Result<Vec<FileChange>> {
     let path = repo.join(STATE_PATH);
     let Some(bytes) = read_optional(&path)? else {
@@ -400,7 +403,7 @@ fn migration_removals(repo: &Path, next: AgentHost, force: bool) -> Result<Vec<F
     };
     let state: InstallState =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
-    if state.ai == next {
+    if state.ai == next && next != AgentHost::Claude {
         return Ok(Vec::new());
     }
     let mut changes = Vec::new();
@@ -427,36 +430,6 @@ fn migration_removals(repo: &Path, next: AgentHost, force: bool) -> Result<Vec<F
         });
     }
     Ok(changes)
-}
-
-fn claude_changes(repo: &Path, exe: &str, repo_text: &str, force: bool) -> Result<Vec<FileChange>> {
-    let mcp_path = repo.join(".mcp.json");
-    let settings_path = repo.join(".claude/settings.json");
-    let skill_path = repo.join(".claude/skills/slop/SKILL.md");
-    let mcp = merge_mcp(read_json(&mcp_path, force)?, exe, repo_text);
-    let settings = merge_hooks(read_json(&settings_path, force)?, exe);
-    if let Some(existing) = read_optional(&skill_path)? {
-        if existing != SKILL.as_bytes() && !force {
-            bail!(
-                "{} already exists and is not slop-managed (pass --force)",
-                skill_path.display()
-            );
-        }
-    }
-    Ok(vec![
-        FileChange {
-            path: mcp_path,
-            content: Some(json_bytes(&mcp)?),
-        },
-        FileChange {
-            path: settings_path,
-            content: Some(json_bytes(&settings)?),
-        },
-        FileChange {
-            path: skill_path,
-            content: Some(SKILL.as_bytes().to_vec()),
-        },
-    ])
 }
 
 fn codex_changes(repo: &Path, exe: &str, repo_text: &str, force: bool) -> Result<Vec<FileChange>> {
@@ -542,29 +515,6 @@ fn remove_owned_content(relative: &str, current: &[u8]) -> Result<Option<Vec<u8>
         return Ok(Some(json_bytes(&remove_hooks(value))?));
     }
     Ok(None)
-}
-
-fn read_json(path: &Path, force: bool) -> Result<Value> {
-    let Some(bytes) = read_optional(path)? else {
-        return Ok(Value::Null);
-    };
-    if bytes.iter().all(u8::is_ascii_whitespace) {
-        return Ok(Value::Null);
-    }
-    match serde_json::from_slice(&bytes) {
-        Ok(value) => Ok(value),
-        Err(error) if force => {
-            eprintln!(
-                "warning: {} is invalid JSON ({error}); replacing it",
-                path.display()
-            );
-            Ok(Value::Null)
-        }
-        Err(error) => bail!(
-            "{} is invalid JSON ({error}); fix it or pass --force",
-            path.display()
-        ),
-    }
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -719,26 +669,6 @@ fn toml_string(value: &str) -> String {
     toml::Value::String(value.to_string()).to_string()
 }
 
-fn ensure_object(value: &mut Value) -> &mut serde_json::Map<String, Value> {
-    if !value.is_object() {
-        *value = json!({});
-    }
-    value
-        .as_object_mut()
-        .expect("value was normalized to an object")
-}
-
-fn merge_mcp(mut existing: Value, exe: &str, repo: &str) -> Value {
-    let servers = ensure_object(&mut existing)
-        .entry("mcpServers")
-        .or_insert_with(|| json!({}));
-    ensure_object(servers).insert(
-        "slop".into(),
-        json!({ "type": "stdio", "command": exe, "args": ["mcp", repo] }),
-    );
-    existing
-}
-
 fn is_slop_command(hook: &Value) -> bool {
     let Some(command) = hook.get("command").and_then(Value::as_str) else {
         return false;
@@ -759,17 +689,6 @@ fn is_slop_command(hook: &Value) -> bool {
             .file_name()
             .is_some_and(|name| name == "slop")
     })
-}
-
-fn shell_word(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\"'\"'"))
-    }
 }
 
 fn strip_slop_groups(groups: Option<&Value>) -> Vec<Value> {
@@ -795,37 +714,6 @@ fn strip_slop_groups(groups: Option<&Value>) -> Vec<Value> {
             Some(group)
         })
         .collect()
-}
-
-fn command_group(matcher: Option<&str>, command: String) -> Value {
-    let hook = json!({ "type": "command", "command": command });
-    matcher.map_or_else(
-        || json!({ "hooks": [hook] }),
-        |matcher| json!({ "matcher": matcher, "hooks": [hook] }),
-    )
-}
-
-fn merge_hooks(mut existing: Value, exe: &str) -> Value {
-    let hooks_value = ensure_object(&mut existing)
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-    let hooks = ensure_object(hooks_value);
-    for (event, matcher, tail) in [
-        ("PreToolUse", Some(PRE_TOOL_MATCHER), Some(PRE_TOOL_CMD)),
-        ("PostToolUse", None, None),
-        ("UserPromptSubmit", None, Some(PROMPT_CMD)),
-        ("SessionStart", None, Some(SESSION_CMD)),
-        ("SubagentStart", None, Some(SUBAGENT_CMD)),
-    ] {
-        let mut groups = strip_slop_groups(hooks.get(event));
-        groups.extend(tail.map(|tail| command_group(matcher, format!("{} {tail}", shell_word(exe)))));
-        if groups.is_empty() {
-            hooks.remove(event);
-        } else {
-            hooks.insert(event.into(), Value::Array(groups));
-        }
-    }
-    existing
 }
 
 fn remove_hooks(mut existing: Value) -> Value {
@@ -874,44 +762,44 @@ mod tests {
     }
 
     #[test]
-    fn exact_hook_matching_preserves_similar_user_command() {
-        let existing = json!({ "hooks": { "PostToolUse": [{ "hooks": [
-            { "type": "command", "command": "my-slop hook post-tool-use --audit" },
-            { "type": "command", "command": "/old/slop hook post-tool-use" }
-        ] }] } });
-        let out = merge_hooks(existing, "/new/slop");
-        let commands: Vec<_> = out["hooks"]["PostToolUse"][0]["hooks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|v| v["command"].as_str())
-            .collect();
-        assert_eq!(commands, vec!["my-slop hook post-tool-use --audit"]);
+    fn hook_removal_keeps_similar_user_commands() {
+        let existing = json!({ "hooks": {
+            "PostToolUse": [{ "hooks": [
+                { "type": "command", "command": "my-slop hook post-tool-use --audit" },
+                { "type": "command", "command": "/old/slop hook post-tool-use" }
+            ] }],
+            "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "'/a b/slop' hook user-prompt-submit" }] }]
+        } });
+        let out = remove_hooks(existing);
+        assert_eq!(out["hooks"]["PostToolUse"][0]["hooks"], json!([{ "type": "command", "command": "my-slop hook post-tool-use --audit" }]));
+        assert!(out["hooks"].get("UserPromptSubmit").is_none());
     }
 
     #[test]
-    fn hook_commands_quote_binary_paths_with_spaces() {
-        let out = merge_hooks(Value::Null, "/tmp/slop tools/slop");
-        assert_eq!(
-            out["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-            "'/tmp/slop tools/slop' hook pre-tool-use"
-        );
-        assert_eq!(out, merge_hooks(out.clone(), "/tmp/slop tools/slop"));
-    }
-
-    #[test]
-    fn merge_drops_a_stale_post_tool_use_entry() {
-        let existing = json!({ "hooks": { "PostToolUse": [{ "matcher": "Read", "hooks": [
-            { "type": "command", "command": "/old/slop hook post-tool-use" }
-        ] }] } });
-        assert!(merge_hooks(existing.clone(), "/new/slop")["hooks"].get("PostToolUse").is_none());
-        assert!(remove_hooks(existing)["hooks"].get("PostToolUse").is_none());
-    }
-
-    #[test]
-    fn claude_merge_is_idempotent() {
-        let once = merge_hooks(Value::Null, "/bin/slop");
-        assert_eq!(once, merge_hooks(once.clone(), "/bin/slop"));
+    fn claude_setup_removes_what_an_older_setup_installed() {
+        let repo = std::env::temp_dir().join(format!("slop-setup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&repo);
+        fs::create_dir_all(repo.join(".claude/skills/slop")).unwrap();
+        fs::create_dir_all(repo.join(".slop")).unwrap();
+        let settings = json!({ "model": "x", "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": "/bin/slop hook session-start" }] }] } });
+        let mcp = json!({ "mcpServers": { "slop": { "command": "/bin/slop" }, "other": { "command": "o" } } });
+        let files = [(".claude/settings.json", json_bytes(&settings).unwrap(), false), (".mcp.json", json_bytes(&mcp).unwrap(), false), (".claude/skills/slop/SKILL.md", b"old skill".to_vec(), true)];
+        let state = InstallState { schema: 2, ai: AgentHost::Claude, files: files.iter().map(|(rel, content, created)| (rel.to_string(), OwnedFile { installed_hash: hash(content), created: *created })).collect() };
+        for (rel, content, _) in &files {
+            fs::write(repo.join(rel), content).unwrap();
+        }
+        fs::write(repo.join(STATE_PATH), serde_json::to_vec(&state).unwrap()).unwrap();
+        let canonical = canonical_repo(&repo).unwrap();
+        apply_transaction(&canonical, install_changes(&canonical, Path::new("/bin/slop"), AgentHost::Claude, false).unwrap()).unwrap();
+        let settings: Value = serde_json::from_slice(&fs::read(repo.join(".claude/settings.json")).unwrap()).unwrap();
+        assert_eq!(settings, json!({ "model": "x", "hooks": {} }));
+        let mcp: Value = serde_json::from_slice(&fs::read(repo.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(mcp, json!({ "mcpServers": { "other": { "command": "o" } } }));
+        assert!(!repo.join(".claude/skills/slop/SKILL.md").exists());
+        let receipt = read_install_state(&repo.join(STATE_PATH)).unwrap();
+        assert!(receipt.files.is_empty());
+        assert!(install_changes(&canonical, Path::new("/bin/slop"), AgentHost::Claude, false).unwrap().len() == 1, "a second run only rewrites the receipt");
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]

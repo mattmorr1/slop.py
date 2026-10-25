@@ -187,9 +187,8 @@ enum Command {
         #[arg(long, value_enum, default_value_t = IndexerArg::Auto)]
         indexer: IndexerArg,
     },
-    /// Configure slop for an agent host and editor, then install the repo-local
-    /// harness transactionally. Preferences are user-local; harness files are
-    /// project-local and can be removed with `slop uninstall`.
+    /// Configure slop for an agent host and editor. Codex gets a repo-local MCP entry; Claude
+    /// Code gets the plugin, and older repo-local Claude entries are removed. Preferences are user-local.
     Setup {
         /// Repo root to configure (default: current directory)
         #[arg(default_value = ".")]
@@ -508,6 +507,10 @@ fn main() -> Result<()> {
                 preferences.editor,
                 repo.display()
             );
+            if preferences.ai == setup::AgentHost::Claude {
+                println!("Claude Code gets slop's hooks, MCP tools and skill from the plugin. In Claude Code, run:");
+                setup::CLAUDE_PLUGIN_STEPS.iter().for_each(|step| println!("  {step}"));
+            }
         }
         Command::Doctor { repo } => {
             if !setup::doctor(&repo)? {
