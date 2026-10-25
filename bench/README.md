@@ -270,6 +270,81 @@ fill, so H5 compares less context against more. Across both runs: at 7–8B, on
 implementing a stub, the target's own file carries almost all the usable
 signal, and neither ranker's other-file items add significant reuse.
 
+## `b5_bench.py` — B5, bind recall (gate G1)
+
+Pre-registered in `bench/B5_PREREGISTRATION.md` (8c7d9f2) before any
+generation; two pre-scoring binder/arm changes are listed there. Question:
+does binding a context-free sketch (`b5_bind.py`, binder v0: name resolution,
+MCP `assess_write` callee overlap and E-sound, per-call BM25, merged by
+reciprocal rank) surface the target's real callees better than the envelope
+built for the gutted target? R8's 100 targets; flask `d73fa1cd` and httpx
+`b5addb64` reproduce R8's archived tasks exactly. Sketches: prompts `none`
+(R8's) and `sketch`, llama3.1:8b (the `none` rows reused from R8 run 1) and
+qwen3:8b, 400 in all. Binary built from 278c7fb.
+
+```
+SLOP_BIN=target/release/slop python3 bench/b5_bench.py prepare --repo flask=PATH:25 --repo httpx=PATH:25 \
+  [--repo vigil=PATH:50] --r8-tasks R8/tasks.jsonl --out DIR
+python3 bench/b5_bench.py generate --tasks R8/tasks.jsonl --model qwen3:8b --out DIR/sketches.jsonl   # GPU host
+SLOP_BIN=target/release/slop python3 bench/b5_bench.py score --tasks DIR/tasks.jsonl --sketches DIR/sketches.jsonl
+```
+
+### Result (first ledger entry in `bench/results/bind.jsonl`): flask + httpx only
+
+**vigil was not scored**: its checkout is absent from this Mac and matt-pc,
+so its 200 sketches exist but have nothing to bind against. G1 as registered
+needs vigil, so the formal verdict is **undecided**. The scored half fails
+both criteria by a wide margin. The ledger's `g1.pooled` is these 50 tasks,
+not the registered 100.
+
+50 tasks, 200 sketches; 95% CIs, task-cluster bootstrap:
+
+| arm | recall@5 | precision@5 | cross-file recall@5 | recall@1k (tokens) | @2k | @4k |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| bind | 11.1% [5.9, 17.3] | 6.5% [3.8, 9.7] | **12.4%** [5.4, 21.1] | 11.4% (451) | 13.7% (695) | 14.0% (859) |
+| envelope | 17.1% [8.6, 27.2] | 5.6% [2.8, 8.8] | 3.2% [0.0, 9.7] | **38.1%** (949) | **50.1%** (1,833) | **59.8%** (3,260) |
+| bm25 | 18.5% [10.4, 28.9] | 7.6% [4.4, 11.6] | 10.8% [2.4, 22.0] | 15.5% (978) | 27.3% (1,973) | 30.2% (3,969) |
+| file | 17.2% [8.9, 26.7] | 7.6% [3.6, 13.2] | 0.0% | 19.4% (924) | 28.7% (1,787) | 39.1% (2,877) |
+| bind+file (exploratory) | 17.4% [9.2, 27.0] | 7.7% [4.0, 13.2] | 0.3% | 19.9% (958) | 30.8% (1,879) | 45.3% (3,208) |
+
+| G1 criterion (flask + httpx) | needed | measured | |
+| --- | --- | --- | --- |
+| bind − envelope recall@5 | >= +10, CI above 0 | **−6.1 [−16.5, +4.4]** | fail |
+| bind precision@5 | >= 30% | **6.5%** | fail |
+| same, per prompt `none` / `sketch` | | −3.1 / −9.0; precision 7.9% / 5.1% | fail |
+| same, per model llama3.1 / qwen3 | | −2.5 / −9.6; precision 9.9% / 3.1% | fail |
+| flask / httpx alone | | −5.3 / −6.8 | fail |
+
+Arithmetic, not a forecast: for the registered 100-task pool to pass, vigil
+alone would need bind precision@5 of at least 53.5% and a recall@5 lead of
+at least +26 points over the envelope.
+
+Bind latency (warm, one MCP process per repo, 182 parsed sketches): p50 7.1
+ms, p95 14.6 ms. E-sound fired 0 times. Unparseable: 18 of 200.
+
+What it says:
+
+- **The sketch names too little to bind.** Parsed sketches make 2.3 (none)
+  and 1.6 (sketch) candidate calls on average; 45 of 92 parsed `sketch`
+  prompts produced no candidate at all. The prompt meant to elicit helper
+  names elicited fewer, so `sketch` is worse than `none` on every metric.
+- **Only name resolution earns hits**: of bind's top-5 items, name
+  resolution placed 283 with 35 gold, BM25 189 with 10, callee overlap 2
+  with 0. Prewrite's 0.125 overlap floor almost never passes for a 2-call
+  sketch, and overlap ranks homes, not helpers, as declared.
+- **The one place bind wins is cross-file**: +9.2 [+2.3, +16.4] over the
+  envelope at 5, because a resolved name reaches a helper in another file
+  that the envelope for a gutted target (no outgoing edges) does not rank.
+- **At budgets the envelope dominates** (−27 to −46 points), because bind
+  returns short lists and spends under 900 tokens at 4k; it has nothing more
+  to show. The envelope's 4k recall (59.8%) is mostly the target's file.
+
+Caveats: half the registered set (vigil, the private primary) is missing;
+public repos may be memorised, which should have helped bind. Gold includes
+callees nested inside the gutted target, which no arm can return. Two 7-8B
+models, one sample each. Secondary check (vigil duplicates) not run: needs
+the vigil checkout.
+
 ## Scaling: Sentry (2026-09-24)
 
 getsentry/sentry at 67610b2a (shallow clone): 8,206 Python and 9,463
