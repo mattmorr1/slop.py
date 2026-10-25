@@ -104,26 +104,31 @@ pub fn run_with_freshness(req: CheckRequest, freshness: Freshness) -> Result<Che
         policy: req.policy.as_deref(),
         freshness,
     })?;
+    report(&analysis, req.all, req.base)
+}
+
+/// The check result for an already captured snapshot: no capture, so no reindex.
+pub fn report(analysis: &Analysis, all: bool, base: String) -> Result<CheckResult> {
     let built = &analysis.built;
-    let effective = effective_findings(&analysis);
+    let effective = effective_findings(analysis);
 
     let current_health = health::score(&effective, built);
-    let coverage = scan::coverage(&analysis);
-    let (scope, findings, health_line) = if req.all {
+    let coverage = scan::coverage(analysis);
+    let (scope, findings, health_line) = if all {
         (
             ScanScope::Repository,
             effective,
             format!("health: {current_health}/100"),
         )
     } else {
-        let changed = scan::worktree_changes(&analysis, &req.base)?;
+        let changed = scan::worktree_changes(analysis, &base)?;
         let findings = scan::filter_to_changes(effective, &changed);
         let line = format!(
             "health: {current_health}/100 · {} finding(s) affect worktree",
             findings.len()
         );
         (
-            ScanScope::Worktree { base: req.base },
+            ScanScope::Worktree { base },
             findings,
             line,
         )

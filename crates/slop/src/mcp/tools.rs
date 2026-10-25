@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use slop_core::analyze::check::{self, CheckRequest};
+use slop_core::analyze::check;
 use slop_core::analyze::prewrite;
 use slop_core::analyze::reconcile as gate;
 use slop_core::analyze::session::{self, Session};
@@ -211,18 +211,16 @@ fn reconcile(ctx: &ToolCtx, args: &Value) -> Result<String> {
         None => Session { head: Some(args.get("base").and_then(Value::as_str).unwrap_or("HEAD").to_string()), ..Session::default() },
     };
     let changes = session::changes(&repo, &session)?;
-    let analysis = ctx.analysis(&repo, args)?;
+    // One capture that reindexes in the foreground, never beside a background refresh.
+    let analysis = {
+        let _exclusive = ctx.refresher.as_ref().filter(|_| repo == ctx.default_repo).map(Refresher::exclusive);
+        check::load_analysis_fresh(&repo, ctx.index(args).as_deref(), check::Freshness::Reindex)?
+    };
     let sidecar = prewrite::load_sidecar(&repo)?;
     let report = gate::reconcile(&repo, &changes, sidecar.as_ref(), &analysis.policy);
     let acked = gate::acknowledged(&repo)?;
     let (acknowledged, open): (Vec<_>, Vec<_>) = report.findings.into_iter().partition(|f| acked.contains(&f.id));
-    let result = check::run(CheckRequest {
-        repo,
-        index: ctx.index(args),
-        policy: None,
-        all: false,
-        base: session.head.clone().unwrap_or_else(|| "HEAD".to_string()),
-    })?;
+    let result = check::report(&analysis, false, session.head.clone().unwrap_or_else(|| "HEAD".to_string()))?;
     Ok(serde_json::to_string_pretty(&json!({
         "scope": if session_id.is_some() { "session" } else { "diff" },
         "changed_files": changes.iter().map(|c| &c.file).collect::<Vec<_>>(),

@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::analyze::snapshot::{CaptureRequest, Freshness, RepositorySnapshot, SnapshotId};
 
@@ -12,22 +12,32 @@ pub struct Refresher {
     /// Snapshots already sent: one whose edits a reindex cannot clear (an indexer
     /// failure memo) must not be requested again, or refresh would loop.
     sent: Arc<Mutex<HashSet<SnapshotId>>>,
+    /// Held by every background reindex, and by a caller that reindexes in the foreground.
+    exclusive: Arc<Mutex<()>>,
 }
 
 impl Refresher {
     /// One worker per repository.
     pub fn spawn(repo: PathBuf, index: Option<PathBuf>) -> Self {
         let (requests, pending) = mpsc::channel::<()>();
+        let exclusive = Arc::new(Mutex::new(()));
+        let held = exclusive.clone();
         std::thread::spawn(move || {
             while pending.recv().is_ok() {
                 while pending.try_recv().is_ok() {}
+                let _guard = held.lock().unwrap_or_else(PoisonError::into_inner);
                 let request = CaptureRequest { repo: &repo, index: index.as_deref(), policy: None, freshness: Freshness::Reindex };
                 if let Err(error) = RepositorySnapshot::capture(request) {
                     eprintln!("slop: background reindex failed: {error:#}");
                 }
             }
         });
-        Self { requests, sent: Arc::default() }
+        Self { requests, sent: Arc::default(), exclusive }
+    }
+
+    /// Wait out any background reindex and keep the next one from starting while held.
+    pub fn exclusive(&self) -> MutexGuard<'_, ()> {
+        self.exclusive.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Queue a reindex if `snapshot` holds edits the index has not seen; returns whether it did.

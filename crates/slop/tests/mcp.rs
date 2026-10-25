@@ -208,6 +208,45 @@ fn reconcile_reports_the_diff_and_acknowledge_clears_it() {
     assert!(std::fs::read_to_string(repo.join(".slop/acks.jsonl")).unwrap().contains("generated at import time"));
 }
 
+/// The call's own capture queues a background reindex; a second, foreground capture
+/// reindexed beside it and failed on the rewritten index (B6: 9 retries).
+#[test]
+fn reconcile_never_reindexes_beside_its_own_queued_refresh() {
+    use std::io::{BufRead, Write};
+    let fixture = TempFixture::new(&fixture("toy_repo_slopped"));
+    let repo = &fixture.0;
+    git(repo, &["init", "-q"]);
+    git(repo, &["add", "-A"]);
+    git(repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+    let dates = std::fs::read_to_string(repo.join("utils/dates.py")).unwrap();
+    std::fs::write(repo.join("utils/dates.py"), dates + "\n\ndef today():\n    return datetime.now()\n").unwrap();
+    let bin = repo.join(".fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = repo.join(".fakebin/npx.log");
+    std::fs::write(bin.join("npx"), format!("#!/bin/sh\necho run >> '{}'\nsleep 1\nexit 1\n", log.display())).unwrap();
+    std::process::Command::new("chmod").arg("+x").arg(bin.join("npx")).status().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_slop"))
+        .args(["mcp", &repo.to_string_lossy()])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, "{}", call(1, "reconcile", serde_json::json!({}))).unwrap();
+    let mut reply = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut reply).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let runs = std::fs::read_to_string(&log).unwrap_or_default().lines().count();
+    assert!(runs <= 1, "the call reindexed in the foreground beside its queued refresh: {runs} indexer runs");
+}
+
 #[test]
 fn query_subgraph_reports_neighbors_and_effects() {
     let out = exchange(
