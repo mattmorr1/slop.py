@@ -33,6 +33,7 @@ enum HookEvent {
     UserPromptSubmit,
     SessionStart,
     SubagentStart,
+    Stop,
 }
 
 /// Which SCIP indexer `slop index` runs. Mirrors [`Indexer`]; separate only
@@ -418,13 +419,11 @@ fn main() -> Result<()> {
             use std::io::Read;
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
-            // Hooks run on every read/write, so payload we can't parse is a
-            // silent no-op rather than an error: a non-zero exit here would
-            // surface as a hook failure in the agent host on each tool call.
-            // Same discipline as the read-remap, which passes a read through
-            // untouched rather than risk corrupting it.
-            let input: serde_json::Value =
-                serde_json::from_str(&buf).unwrap_or_else(|_| serde_json::json!({}));
+            // A payload we can't parse is a logged no-op: a non-zero exit would fail every tool call.
+            let input: serde_json::Value = serde_json::from_str(&buf).unwrap_or_else(|error| {
+                harness::log_error(Path::new("."), "hook", &anyhow::Error::new(error).context("unparseable hook payload"));
+                serde_json::json!({})
+            });
             let started = std::time::Instant::now();
             let (name, output) = match event {
                 HookEvent::PreToolUse => ("PreToolUse", harness::handle_pre_tool_use(&input)),
@@ -432,6 +431,7 @@ fn main() -> Result<()> {
                 HookEvent::UserPromptSubmit => ("UserPromptSubmit", harness::handle_user_prompt_submit(&input)),
                 HookEvent::SessionStart => ("SessionStart", harness::handle_session_start(&input, "SessionStart")),
                 HookEvent::SubagentStart => ("SubagentStart", harness::handle_session_start(&input, "SubagentStart")),
+                HookEvent::Stop => ("Stop", harness::handle_stop(&input)),
             };
             println!("{output}");
             harness::log_hook(&input, name, &output, started.elapsed());

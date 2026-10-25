@@ -141,6 +141,9 @@ pub fn log_hook(input: &Value, event: &str, output: &Value, elapsed: std::time::
         "injected_tokens": context.len() / 4,
         "duplicates": count("slop: new `"),
         "reuse": count("slop: proposed code overlaps"),
+        "missing": count("slop: missing"),
+        "decision": as_str(output, "decision"),
+        "blocked": as_str(output, "reason").map_or(0, |r| r.lines().filter(|l| l.starts_with(|c: char| c.is_ascii_digit())).count()),
     });
     append_log(&repo, &line);
 }
@@ -221,6 +224,43 @@ pub fn handle_pre_tool_use(input: &Value) -> Value {
             "additionalContext": context.join("\n"),
         }
     })
+}
+
+/// Stop handler (L2): block the end of a turn, once per finding, while the code this session
+/// changed holds an unacknowledged provable problem. Any internal error allows the stop.
+pub fn handle_stop(input: &Value) -> Value {
+    if input.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
+        return json!({});
+    }
+    let repo = find_repo_root(&read_target(input).1);
+    stop(&repo, input).unwrap_or_else(|error| {
+        log_error(&repo, "Stop", &error.context("failing open"));
+        json!({})
+    })
+}
+
+fn stop(repo: &Path, input: &Value) -> anyhow::Result<Value> {
+    use anyhow::Context;
+    let policy = Policy::load(repo)?;
+    if policy.agent.gate != crate::analyze::policy::Gate::Reconcile {
+        return Ok(json!({}));
+    }
+    let id = as_str(input, "session_id").context("Stop payload has no session_id")?;
+    let mut session = crate::analyze::session::load(repo, id)?;
+    let changes = crate::analyze::session::changes(repo, &session)?;
+    if changes.is_empty() {
+        return Ok(json!({}));
+    }
+    let sidecar = prewrite::load_sidecar(repo)?;
+    let report = crate::analyze::reconcile::reconcile(repo, &changes, sidecar.as_ref(), &policy);
+    let acked = crate::analyze::reconcile::acknowledged(repo)?;
+    let fresh: Vec<_> = report.findings.into_iter().filter(|f| !acked.contains(&f.id) && !session.blocked.contains(&f.id)).collect();
+    if fresh.is_empty() {
+        return Ok(json!({}));
+    }
+    session.blocked.extend(fresh.iter().map(|f| f.id.clone()));
+    crate::analyze::session::save(repo, id, &session)?;
+    Ok(json!({ "decision": "block", "reason": crate::analyze::reconcile::render(&fresh, &report.advisory) }))
 }
 
 /// PostToolUse handler: sanctioned-channel steering on a source-file read as

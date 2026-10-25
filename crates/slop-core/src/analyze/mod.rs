@@ -21,6 +21,7 @@ pub mod policy;
 pub mod precheck;
 pub mod prewrite;
 pub mod query;
+pub mod reconcile;
 pub mod refresh;
 pub mod retrieve;
 pub mod scan;
