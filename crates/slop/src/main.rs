@@ -102,10 +102,6 @@ enum Command {
         /// Path to a slop.toml policy (default: <repo>/slop.toml)
         #[arg(long)]
         policy: Option<PathBuf>,
-        /// Tier-3: judge semantic-redundancy candidates via the Claude API
-        /// (requires ANTHROPIC_API_KEY; findings are Advisory only)
-        #[arg(long)]
-        tier3: bool,
         /// Git ref to diff against (default: HEAD)
         #[arg(long, default_value = "HEAD")]
         base: String,
@@ -139,10 +135,6 @@ enum Command {
         /// Graph hops from the edit zone kept full-fidelity
         #[arg(long, default_value_t = 1)]
         hops: usize,
-        /// Add an LLM one-line summary to each skeleton (via ollama;
-        /// OLLAMA_MODEL, default qwen2.5:1.5b)
-        #[arg(long)]
-        densify: bool,
         /// Print compression stats to stderr
         #[arg(long)]
         stats: bool,
@@ -159,9 +151,6 @@ enum Command {
         /// Judge the whole repo instead of the diff
         #[arg(long)]
         all: bool,
-        /// Also run advisory Tier-3 semantic-redundancy judging
-        #[arg(long)]
-        tier3: bool,
         /// Git ref to diff against (default: HEAD)
         #[arg(long, default_value = "HEAD")]
         base: String,
@@ -439,7 +428,6 @@ fn main() -> Result<()> {
             index,
             all,
             policy,
-            tier3,
             base,
             json,
             reindex,
@@ -454,7 +442,6 @@ fn main() -> Result<()> {
                 index,
                 policy,
                 all,
-                tier3,
                 base,
             })?;
 
@@ -474,7 +461,6 @@ fn main() -> Result<()> {
             mut edit,
             edit_file,
             hops,
-            densify,
             stats,
         } => {
             let analysis = check::load_analysis(&repo, index.as_deref())?;
@@ -489,23 +475,6 @@ fn main() -> Result<()> {
             let source = std::fs::read_to_string(repo.join(&file))
                 .with_context(|| format!("reading {file}"))?;
 
-            // --densify: one ollama summary per skeletonized entity, built from
-            // its own body sliced out of the source we already hold.
-            let src_lines: Vec<&str> = source.lines().collect();
-            let ollama = densify.then(slop_llm::ollama::Ollama::from_env);
-            let densifier = ollama.as_ref().map(|client| {
-                move |e: &slop_graph::CodeEntity| -> Option<String> {
-                    let (s, end) = e.source_range;
-                    let end = end.min(src_lines.len().saturating_sub(1));
-                    let body = src_lines.get(s..=end)?.join("\n");
-                    client.summarize(&body).ok().filter(|s| !s.is_empty())
-                }
-            });
-            let densifier_ref: Option<&compress::Densifier> = match &densifier {
-                Some(f) => Some(f as &compress::Densifier),
-                None => None,
-            };
-
             let (out, st) = compress::compress_file(
                 &analysis.built,
                 &analysis.facts,
@@ -516,7 +485,7 @@ fn main() -> Result<()> {
                     edit_zone_hops: hops,
                     min_lines: 0,
                 },
-                densifier_ref,
+                None,
             );
             print!("{out}");
             if stats {
@@ -540,7 +509,6 @@ fn main() -> Result<()> {
             repo,
             index,
             all,
-            tier3,
             base,
             fail_on,
             reindex,
@@ -576,7 +544,6 @@ fn main() -> Result<()> {
                     index,
                     policy: None,
                     all,
-                    tier3,
                     base,
                 },
                 fail_on.into(),

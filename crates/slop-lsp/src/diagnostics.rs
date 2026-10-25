@@ -22,7 +22,6 @@ pub fn compute(repo: &Path, index: Option<&Path>) -> Result<BTreeMap<String, Vec
             index: index.map(Path::to_path_buf),
             policy: None,
             all: true,
-            tier3: false,
             base: "HEAD".to_string(),
         },
         check::Freshness::Warn,

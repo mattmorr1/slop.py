@@ -55,8 +55,6 @@ functions whose names lie about their effects, and tangled control flow.
 - `slop baseline <repo>` grandfathers existing findings *and* records each
   function's effect signature — which is what later enables `effect-creep`
   (a function that was pure then, doing I/O now).
-- Tier-3 semantic-redundancy uses an LLM judge: add `--tier3` (needs
-  `ANTHROPIC_API_KEY`, or `SLOP_JUDGE=ollama` for a local model).
 - If slop's MCP server is registered (via `slop install`), the
   `assess_write`, `validate_change`, `query_subgraph`, and `get_context_envelope` tools are
   available directly — prefer `validate_change` over shelling out mid-session.

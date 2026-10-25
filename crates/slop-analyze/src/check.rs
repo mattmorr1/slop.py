@@ -1,6 +1,6 @@
 //! The `check` flow shared by the CLI (`slop check`) and the MCP
-//! `validate_change` tool (M4c): build the graph, run detectors (+
-//! optional Tier-3), suppress, baseline, then either judge the whole repo
+//! `validate_change` tool (M4c): build the graph, run detectors, suppress,
+//! baseline, then either judge the whole repo
 //! (`--all`) or just the diff against a git ref (D7's diff-relative mode).
 
 use std::path::{Path, PathBuf};
@@ -10,10 +10,9 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::findings::{Finding, Severity};
-use crate::policy::Policy;
 use crate::snapshot::{CaptureRequest, RepositorySnapshot, SnapshotFreshness, SnapshotId};
 use crate::scan::{self, CoverageReport, ScanScope};
-use crate::{build, health, source, suppress};
+use crate::{health, source, suppress};
 
 pub use crate::snapshot::Freshness;
 
@@ -25,9 +24,6 @@ pub struct CheckRequest {
     pub policy: Option<PathBuf>,
     /// Judge the whole repo instead of the diff (audit-lite).
     pub all: bool,
-    /// Run Tier-3 semantic-redundancy via the Claude API (needs
-    /// `ANTHROPIC_API_KEY`). Slow and network-bound — off by default.
-    pub tier3: bool,
     /// Git ref to diff against in diff-relative mode.
     pub base: String,
 }
@@ -39,7 +35,6 @@ impl Default for CheckRequest {
             index: None,
             policy: None,
             all: false,
-            tier3: false,
             base: "HEAD".to_string(),
         }
     }
@@ -58,203 +53,6 @@ pub struct CheckResult {
     pub blocking: usize,
     /// True when the repo has no slop.toml — infra-bypass stays silent.
     pub policy_is_empty: bool,
-}
-
-fn tier3_findings(
-    built: &build::BuiltGraph,
-    facts: &[source::FileFacts],
-    repo: &Path,
-) -> Result<Vec<Finding>> {
-    use slop_llm::{judge_from_env, JudgeInput};
-
-    let candidates = crate::tier3::candidates(built, facts, repo);
-    if candidates.is_empty() {
-        eprintln!("tier3: no semantic-redundancy candidates");
-        return Ok(Vec::new());
-    }
-    let judge = judge_from_env()?;
-    eprintln!(
-        "tier3: judging {} semantic-redundancy pair(s) via {}",
-        candidates.len(),
-        judge.model()
-    );
-    let render = |c: &crate::tier3::CandidateFn| {
-        format!(
-            "# {} ({}:{})\n# docstring: {}\n{}",
-            c.entity,
-            c.file,
-            c.lines.0 + 1,
-            c.docstring.as_deref().unwrap_or("<none>"),
-            c.snippet
-        )
-    };
-    let inputs: Vec<JudgeInput> = candidates
-        .iter()
-        .enumerate()
-        .map(|(i, pair)| JudgeInput {
-            index: i,
-            a_label: pair.a.entity.clone(),
-            a_context: render(&pair.a),
-            b_label: pair.b.entity.clone(),
-            b_context: render(&pair.b),
-        })
-        .collect();
-    let verdicts = judge.judge(&inputs)?;
-
-    let mut findings = Vec::new();
-    for verdict in verdicts.into_iter().filter(|v| v.redundant) {
-        let Some(pair) = candidates.get(verdict.index) else {
-            continue;
-        };
-        findings.push(Finding {
-            rule: "semantic-redundancy",
-            severity: Severity::Advisory,
-            entity: pair.a.entity.clone(),
-            file: pair.a.file.clone(),
-            lines: pair.a.lines,
-            related: vec![crate::findings::EvidenceLocus {
-                entity: pair.b.entity.clone(),
-                file: pair.b.file.clone(),
-                lines: pair.b.lines,
-            }],
-            message: format!(
-                "`{}` and `{}` appear to serve the same purpose ({} confidence): {}",
-                pair.a.entity, pair.b.entity, verdict.confidence, verdict.reason
-            ),
-            fix_guidance: format!(
-                "Unify `{}` and `{}` behind one implementation",
-                pair.a.entity, pair.b.entity
-            ),
-        });
-    }
-    Ok(findings)
-}
-
-/// Tier-3 gate for `trivial-wrapper`: the structural pass finds one-line
-/// forwarders with 1-2 callers; the judge rules whether each name earns its
-/// keep. Only judge-confirmed slop becomes a Warning — no structural
-/// false-positive gates CI on its own.
-pub fn tier3_wrapper_findings(
-    built: &build::BuiltGraph,
-    policy: &Policy,
-    facts: &[source::FileFacts],
-    _repo: &Path,
-) -> Result<Vec<Finding>> {
-    use slop_llm::{judge_from_env, JudgeInput};
-
-    let candidates = crate::detect::trivial_wrapper_candidates(built, policy, facts);
-    if candidates.is_empty() {
-        eprintln!("tier3: no trivial-wrapper candidates");
-        return Ok(Vec::new());
-    }
-    let judge = judge_from_env()?;
-    eprintln!(
-        "tier3: judging {} trivial-wrapper(s) via {}",
-        candidates.len(),
-        judge.model()
-    );
-    let inputs: Vec<JudgeInput> = candidates
-        .iter()
-        .enumerate()
-        .map(|(i, c)| JudgeInput {
-            index: i,
-            a_label: c.name.clone(),
-            a_context: format!(
-                "{}\n# {} caller(s); whole body: return {}(...)",
-                c.signature, c.callers, c.forward_target
-            ),
-            b_label: c.forward_target.clone(),
-            b_context: String::new(),
-        })
-        .collect();
-    let verdicts = judge.judge_wrappers(&inputs)?;
-
-    let mut findings = Vec::new();
-    for v in verdicts.into_iter().filter(|v| v.redundant) {
-        let Some(c) = candidates.get(v.index) else {
-            continue;
-        };
-        let fix_guidance = if c.forward_identity {
-            format!(
-                "Inline `{}`: replace `{}(...)` at its {} call site(s) with `{}(...)`, then delete the wrapper",
-                c.name, c.name, c.callers, c.forward_target
-            )
-        } else {
-            format!(
-                "Inline `{}`'s body into its {} call site(s) and delete the wrapper",
-                c.name, c.callers
-            )
-        };
-        findings.push(Finding {
-            rule: "trivial-wrapper",
-            severity: Severity::Warning,
-            entity: c.entity.clone(),
-            file: c.file.clone(),
-            lines: c.lines,
-            related: Vec::new(),
-            message: format!(
-                "`{}` only forwards to `{}` ({} caller(s)) and its name adds nothing the call site would miss: {}",
-                c.name, c.forward_target, c.callers, v.reason
-            ),
-            fix_guidance,
-        });
-    }
-    Ok(findings)
-}
-
-/// Confirms or demotes Tier-2 `duplicate-structural` findings: matching
-/// shape is a weak signal on its own (see `detect::shape_groups`), so when
-/// `--tier3` is on, ask the judge whether each group's canonical member and
-/// its first peer actually serve the same purpose. Returns
-/// `(canonical entity, confirmed redundant, reason)` for `run` to apply
-/// against the findings `detect::run_all` already produced.
-fn tier3_structural_verdicts(
-    built: &build::BuiltGraph,
-    facts: &[source::FileFacts],
-    repo: &Path,
-) -> Result<Vec<(String, bool, String)>> {
-    use slop_llm::{judge_from_env, JudgeInput};
-
-    let candidates = crate::tier3::structural_candidates(built, facts, repo);
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let judge = judge_from_env()?;
-    eprintln!(
-        "tier3: confirming {} duplicate-structural group(s) via {}",
-        candidates.len(),
-        judge.model()
-    );
-    let render = |c: &crate::tier3::CandidateFn| {
-        format!(
-            "# {} ({}:{})\n# docstring: {}\n{}",
-            c.entity,
-            c.file,
-            c.lines.0 + 1,
-            c.docstring.as_deref().unwrap_or("<none>"),
-            c.snippet
-        )
-    };
-    let inputs: Vec<JudgeInput> = candidates
-        .iter()
-        .enumerate()
-        .map(|(i, pair)| JudgeInput {
-            index: i,
-            a_label: pair.a.entity.clone(),
-            a_context: render(&pair.a),
-            b_label: pair.b.entity.clone(),
-            b_context: render(&pair.b),
-        })
-        .collect();
-    let verdicts = judge.judge(&inputs)?;
-
-    Ok(verdicts
-        .into_iter()
-        .filter_map(|v| {
-            let pair = candidates.get(v.index)?;
-            Some((pair.a.entity.clone(), v.redundant, v.reason))
-        })
-        .collect())
 }
 
 pub type Analysis = RepositorySnapshot;
@@ -306,29 +104,10 @@ pub struct AuditResult {
 /// tagging each with whether the baseline grandfathers it. Unlike `run`, this
 /// never hides grandfathered findings — it marks them, so a UI can show the
 /// real state and let the user choose what to look at.
-fn evaluated_findings(analysis: &RepositorySnapshot, tier3: bool) -> Result<Vec<AuditFinding>> {
+fn evaluated_findings(analysis: &RepositorySnapshot) -> Result<Vec<AuditFinding>> {
     let (built, facts) = (&analysis.built, &analysis.facts);
     let mut raw = crate::detect::run_all(built, &analysis.policy, facts, analysis.repo());
     raw.extend(crate::detect::effect_creep(built, &analysis.baseline));
-    if tier3 {
-        for (entity, redundant, reason) in tier3_structural_verdicts(built, facts, analysis.repo())? {
-            let Some(f) = raw.iter_mut().find(|f| f.rule == "duplicate-structural" && f.entity == entity)
-            else {
-                continue;
-            };
-            if redundant {
-                f.severity = Severity::Warning;
-                f.message = format!("{} — confirmed by semantic review: {reason}", f.message);
-            } else {
-                f.message = format!(
-                    "{} (unconfirmed — semantic review found a different purpose: {reason})",
-                    f.message
-                );
-            }
-        }
-        raw.extend(tier3_findings(built, facts, analysis.repo())?);
-        raw.extend(tier3_wrapper_findings(built, &analysis.policy, facts, analysis.repo())?);
-    }
     let suppressions = suppress::scan(analysis.repo(), facts);
     let submodules = source::submodule_paths(analysis.repo());
     let all: Vec<_> = suppress::filter(raw, &suppressions)
@@ -361,8 +140,8 @@ fn evaluated_findings(analysis: &RepositorySnapshot, tier3: bool) -> Result<Vec<
     Ok(findings)
 }
 
-pub fn effective_findings(analysis: &RepositorySnapshot, tier3: bool) -> Result<Vec<Finding>> {
-    Ok(evaluated_findings(analysis, tier3)?
+pub fn effective_findings(analysis: &RepositorySnapshot) -> Result<Vec<Finding>> {
+    Ok(evaluated_findings(analysis)?
         .into_iter()
         .filter(|record| !record.grandfathered)
         .map(|record| record.finding)
@@ -392,7 +171,7 @@ pub fn baseline_findings(analysis: &RepositorySnapshot) -> Vec<Finding> {
 }
 
 pub fn audit_snapshot(analysis: &RepositorySnapshot) -> Result<AuditResult> {
-    let findings = evaluated_findings(analysis, false)?;
+    let findings = evaluated_findings(analysis)?;
     let all: Vec<Finding> = findings.iter().map(|record| record.finding.clone()).collect();
     let new_only: Vec<Finding> = findings
         .iter()
@@ -428,7 +207,7 @@ pub fn run_with_freshness(req: CheckRequest, freshness: Freshness) -> Result<Che
         freshness,
     })?;
     let built = &analysis.built;
-    let effective = effective_findings(&analysis, req.tier3)?;
+    let effective = effective_findings(&analysis)?;
 
     let current_health = health::score(&effective, built);
     let coverage = scan::coverage(&analysis);
@@ -502,7 +281,7 @@ mod tests {
         let repo = fixture("toy_repo_slopped");
         let snapshot = load_analysis_fresh(&repo, None, Freshness::Reindex).expect("snapshot");
         let audit = audit_snapshot(&snapshot).expect("audit");
-        let fix = effective_findings(&snapshot, false).expect("fix projection");
+        let fix = effective_findings(&snapshot).expect("fix projection");
         let check = run(CheckRequest {
             repo: repo.to_path_buf(),
             all: true,

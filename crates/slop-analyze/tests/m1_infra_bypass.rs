@@ -112,24 +112,6 @@ fn naming_flags_camel_deviant_and_slop_marker() {
 }
 
 #[test]
-fn tier3_buckets_produce_the_planted_semantic_pair() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/toy_repo_slopped");
-    let resolver = ScipResolver::load(&root.join("index.scip")).unwrap();
-    let mut built = build::build_graph(&resolver);
-    effects::infer_effects(&mut built);
-    let facts = slop_analyze::source::parse_repo(&root, &resolver.files());
-    let candidates = slop_analyze::tier3::candidates(&built, &facts, &root);
-    let planted = candidates.iter().find(|p| {
-        let pair = [p.a.entity.as_str(), p.b.entity.as_str()];
-        pair.contains(&"utils.dates::parse_date") && pair.contains(&"utils.when::to_datetime")
-    });
-    assert!(planted.is_some(), "candidates: {:#?}", candidates.iter().map(|p| (&p.a.entity, &p.b.entity)).collect::<Vec<_>>());
-    let planted = planted.unwrap();
-    assert!(!planted.a.snippet.is_empty());
-}
-
-#[test]
 fn tier1_duplicate_pairs_exact_bodies() {
     let (_, findings) = analyze("toy_repo_slopped", true);
     // One finding per exact-duplicate set, not one per member — the

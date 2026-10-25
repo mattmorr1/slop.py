@@ -35,7 +35,6 @@ pub mod snapshot;
 pub mod source;
 pub mod split;
 pub mod suppress;
-pub mod tier3;
 pub mod world;
 
 #[cfg(test)]

@@ -144,7 +144,7 @@ pub struct FunctionFacts {
     /// Any decorator present: the function may be framework-registered
     /// (routes, MCP handlers, fixtures) and called without a by-name ref.
     pub decorated: bool,
-    /// Total parameter count (self included) — Tier-3 bucket key component.
+    /// Total parameter count (self included).
     pub param_count: u32,
     /// Body contains `return <expr>` at any depth.
     pub returns_value: bool,

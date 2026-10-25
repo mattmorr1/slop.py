@@ -78,8 +78,7 @@ pub fn definitions() -> Value {
                 "properties": {
                     "repo": {"type": "string", "description": "Repo root (defaults to the server's launch repo)"},
                     "base": {"type": "string", "description": "Git ref to diff against (default HEAD)"},
-                    "all": {"type": "boolean", "description": "Judge the whole repo instead of the diff"},
-                    "tier3": {"type": "boolean", "description": "Also run advisory semantic-redundancy judging (needs ANTHROPIC_API_KEY)"}
+                    "all": {"type": "boolean", "description": "Judge the whole repo instead of the diff"}
                 }
             }
         },
@@ -224,7 +223,6 @@ fn validate_change(ctx: &ToolCtx, args: &Value) -> Result<String> {
         index: ctx.index(args),
         policy: None,
         all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
-        tier3: args.get("tier3").and_then(Value::as_bool).unwrap_or(false),
         base: args
             .get("base")
             .and_then(Value::as_str)

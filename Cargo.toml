@@ -4,7 +4,6 @@ members = [
     "crates/slop",
     "crates/slop-analyze",
     "crates/slop-graph",
-    "crates/slop-llm",
     "crates/slop-lsp",
     "crates/slop-mcp",
     "crates/slop-parse",
@@ -39,10 +38,8 @@ toml = "0.8"
 ruff_python_parser = "0.0.3"
 ruff_python_ast = "0.0.3"
 ruff_text_size = "0.0.3"
-ureq = { version = "2", features = ["json"] }
 
 slop-graph = { version = "0.1.0", path = "crates/slop-graph" }
-slop-llm = { version = "0.1.0", path = "crates/slop-llm" }
 slop-lsp = { version = "0.1.0", path = "crates/slop-lsp" }
 slop-mcp = { version = "0.1.0", path = "crates/slop-mcp" }
 slop-parse = { version = "0.1.0", path = "crates/slop-parse" }
