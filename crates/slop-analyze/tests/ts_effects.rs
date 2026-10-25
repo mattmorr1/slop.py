@@ -53,8 +53,8 @@ fn typescript_effects_propagate_through_external_seeds() {
 
 #[test]
 fn parser_based_detectors_fire_on_typescript() {
-    // The tree-sitter JS/TS parser feeds the same duplication/complexity
-    // detectors as Python — and the facts join back to the scip-typescript
+    // The tree-sitter JS/TS parser feeds the same duplication detectors as
+    // Python — and the facts join back to the scip-typescript
     // graph entities by line.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/ts_probe");
     let resolver = ScipResolver::load(&root.join("index.scip")).expect("ts_probe index");
@@ -68,7 +68,7 @@ fn parser_based_detectors_fire_on_typescript() {
         "the .ts file should yield parsed function facts"
     );
 
-    let findings: Vec<Finding> = detect::run_all(&built, &Policy::default(), &facts, &root);
+    let findings: Vec<Finding> = detect::run_all(&built, &Policy::default(), &facts);
     let has = |rule: &str, needle: &str| {
         findings
             .iter()
@@ -80,10 +80,5 @@ fn parser_based_detectors_fire_on_typescript() {
         has("duplicate-exact", "sum"),
         "duplicate-exact should fire on sumA/sumB: {:#?}",
         findings.iter().map(|f| (f.rule, &f.entity)).collect::<Vec<_>>()
-    );
-    // `tangled` nests for->for->if->while = depth 4 -> complexity-spike.
-    assert!(
-        has("complexity-spike", "tangled"),
-        "complexity-spike should fire on `tangled`"
     );
 }

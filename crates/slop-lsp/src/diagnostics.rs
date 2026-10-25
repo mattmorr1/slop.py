@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn module_level_max_end_line_clamps_to_single_line() {
         let f = Finding {
-            rule: "circular-import",
+            rule: "infra-bypass",
             severity: Severity::Blocking,
             entity: "services.notify".into(),
             file: "services/notify.py".into(),

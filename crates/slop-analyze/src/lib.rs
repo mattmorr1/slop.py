@@ -15,7 +15,6 @@ pub mod harness;
 pub mod health;
 pub mod index;
 pub mod infer;
-pub mod naming;
 pub mod overlay;
 pub mod policy;
 pub mod precheck;

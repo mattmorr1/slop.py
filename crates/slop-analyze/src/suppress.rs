@@ -91,4 +91,26 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().all(|f| f.lines == (10, 12) || f.rule == "dead-island"));
     }
+
+    /// Removed rule ids stay reserved: an old allow for one parses and silences nothing.
+    #[test]
+    fn allow_for_a_removed_rule_is_inert() {
+        let dir = std::env::temp_dir().join(format!("slop-suppress-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def f():  # slop: allow naming-convention — legacy\n    pass\n").unwrap();
+        let sups = scan(&dir, &[FileFacts { file: "a.py".into(), functions: Vec::new() }]);
+        assert_eq!(sups.iter().map(|s| s.rule.as_str()).collect::<Vec<_>>(), ["naming-convention"]);
+        let finding = Finding {
+            rule: "dead-island",
+            severity: Severity::Warning,
+            entity: "a::f".into(),
+            file: "a.py".into(),
+            lines: (0, 1),
+            related: Vec::new(),
+            message: String::new(),
+            fix_guidance: String::new(),
+        };
+        assert_eq!(filter(vec![finding], &sups).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

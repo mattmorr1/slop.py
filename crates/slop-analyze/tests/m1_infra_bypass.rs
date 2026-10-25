@@ -21,7 +21,7 @@ fn analyze(fixture: &str, with_policy: bool) -> (build::BuiltGraph, Vec<Finding>
     let mut built = build::build_graph(&resolver);
     effects::infer_effects(&mut built);
     let facts = slop_analyze::source::parse_repo(&root, &resolver.files());
-    let findings = detect::run_all(&built, &policy, &facts, &root);
+    let findings = detect::run_all(&built, &policy, &facts);
     (built, findings)
 }
 
@@ -59,21 +59,6 @@ fn infra_bypass_fires_on_planted_bypasses_only() {
 }
 
 #[test]
-fn circular_import_finds_the_planted_cycle() {
-    let (_, findings) = analyze("toy_repo_slopped", true);
-    assert_eq!(
-        entities_for(&findings, "circular-import"),
-        vec!["services.notify", "services.reports"]
-    );
-    let f = findings
-        .iter()
-        .find(|f| f.rule == "circular-import")
-        .unwrap();
-    assert_eq!(f.severity, Severity::Blocking);
-    assert!(f.message.contains("services.notify -> services.reports"));
-}
-
-#[test]
 fn dead_island_flags_unreferenced_functions_only() {
     let (_, findings) = analyze("toy_repo_slopped", true);
     assert_eq!(
@@ -92,23 +77,6 @@ fn dead_island_flags_unreferenced_functions_only() {
             "utils.when::to_datetime"
         ]
     );
-}
-
-#[test]
-fn naming_flags_camel_deviant_and_slop_marker() {
-    let (_, findings) = analyze("toy_repo_slopped", true);
-    assert_eq!(
-        entities_for(&findings, "naming-convention"),
-        vec!["utils.when::fetchConfigV2"]
-    );
-    assert_eq!(
-        entities_for(&findings, "slop-name"),
-        vec!["utils.when::fetchConfigV2"]
-    );
-    assert!(findings
-        .iter()
-        .filter(|f| f.rule == "naming-convention" || f.rule == "slop-name")
-        .all(|f| f.severity == Severity::Advisory));
 }
 
 #[test]
@@ -137,31 +105,6 @@ fn tier2_flags_structural_twin_only() {
     );
     let f = findings.iter().find(|f| f.rule == "duplicate-structural").unwrap();
     assert!(f.message.contains("utils.cleaning::scale_rows"), "{}", f.message);
-}
-
-#[test]
-fn complexity_spike_fires_on_deeply_nested_router() {
-    let (_, findings) = analyze("toy_repo_slopped", true);
-    assert_eq!(
-        entities_for(&findings, "complexity-spike"),
-        vec!["services.routing::route_event"]
-    );
-    // The recalibrated detector reports the real tangle shape and anchors
-    // guidance on the deepest block's line, not a generic "split branches".
-    let f = findings.iter().find(|f| f.rule == "complexity-spike").unwrap();
-    assert!(f.message.contains("nested 5 deep"), "{}", f.message);
-    assert!(f.fix_guidance.contains("deepest block"), "{}", f.fix_guidance);
-}
-
-#[test]
-fn over_commenting_fires_on_narrated_function() {
-    let (_, findings) = analyze("toy_repo_slopped", true);
-    assert_eq!(
-        entities_for(&findings, "over-commenting"),
-        vec!["services.routing::apply_discount"]
-    );
-    let f = findings.iter().find(|f| f.rule == "over-commenting").unwrap();
-    assert_eq!(f.severity, Severity::Advisory);
 }
 
 #[test]
@@ -267,7 +210,7 @@ fn empty_policy_silences_policy_gated_detectors_only() {
     // (but dead-island loses its entry_points exemptions).
     let (_, findings) = analyze("toy_repo_slopped", false);
     assert!(entities_for(&findings, "infra-bypass").is_empty());
-    assert!(!entities_for(&findings, "circular-import").is_empty());
+    assert!(!entities_for(&findings, "duplicate-exact").is_empty());
 }
 
 #[test]

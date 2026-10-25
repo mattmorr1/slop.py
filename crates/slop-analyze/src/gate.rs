@@ -23,7 +23,7 @@ pub struct GateOutcome {
 /// fail the gate (caller exits non-zero); everything else is reported but
 /// passes. `fail_on` defaults to `Blocking` at the CLI, but lowering it to
 /// `Warning` is what lets the fix-loop act on `duplicate-exact` /
-/// `complexity-spike` (both Warnings), not just the deterministic blockers.
+/// `purity-lie` (both Warnings), not just the deterministic blockers.
 pub fn evaluate(req: CheckRequest, fail_on: Severity) -> Result<GateOutcome> {
     let result = check::run(req)?;
     let failing = result
@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn fail_on_warning_catches_non_blocking_slop() {
         // The clean repo still passes at Blocking; the slopped repo, which has
-        // Warning-tier findings (duplicate/complexity/purity), fails once the
+        // Warning-tier findings (duplicate/purity), fails once the
         // threshold drops to Warning — this is what makes those rules drive
         // the loop.
         let blocking = gate_all("toy_repo_slopped", Severity::Blocking);

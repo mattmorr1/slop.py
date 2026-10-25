@@ -28,24 +28,18 @@ functions whose names lie about their effects, and tangled control flow.
    - `slop check <repo>` — judges the working-tree diff vs HEAD
    - `slop check <repo> --all` — audits everything
 3. **Triage by severity** (every finding carries a `fix_guidance` line):
-   - **BLOCKING** — `infra-bypass`, `circular-import`, `effect-creep`. Fix these.
-   - **WARNING** — `duplicate-exact`, `duplicate-equivalent`, `complexity-spike`, `purity-lie`,
+   - **BLOCKING** — `infra-bypass`, `effect-creep`. Fix these.
+   - **WARNING** — `duplicate-exact`, `duplicate-equivalent`, `purity-lie`,
      `effect-layer-violation`, `dead-island`. Should fix.
-   - **ADVISORY** — `naming-convention`, `slop-name`, `over-commenting`,
-     `duplicate-structural`, `semantic-redundancy`. Consider.
-4. **Auto-fix the mechanical ones**: `slop fix <repo>` (dry-run) →
-   `slop fix <repo> --write`. Fixes `over-commenting` (deletes comments that
-   restate the code) and `naming-convention` (renames camelCase *free
-   functions* to snake_case, rewriting every reference). Re-index after.
-5. **Act on `fix_guidance`** for the rest, using what each rule tells you:
+   - **ADVISORY** — `duplicate-structural`, `semantic-redundancy`. Consider.
+4. **Act on `fix_guidance`** for the rest, using what each rule tells you:
    - `infra-bypass` / `effect-layer-violation` → route the I/O through the named
      sanctioned channel / a lower layer, don't do it inline.
    - `duplicate-exact` / `duplicate-equivalent` / `duplicate-structural` / `semantic-redundancy` → unify
      behind one implementation and delete the copies.
-   - `complexity-spike` → extract the deepest nested block it names into a helper.
    - `purity-lie` → rename to reflect the I/O, or extract the pure part.
    - `dead-island` → delete, or declare it in `slop.toml` `entry_points`.
-6. **Gate before committing**: `slop gate <repo> --fail-on warning` exits
+5. **Gate before committing**: `slop gate <repo> --fail-on warning` exits
    non-zero (with a JSON verdict) if slop remains — loop until it passes.
 
 ## Notes

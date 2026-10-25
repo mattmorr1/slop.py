@@ -106,7 +106,7 @@ pub struct AuditResult {
 /// real state and let the user choose what to look at.
 fn evaluated_findings(analysis: &RepositorySnapshot) -> Result<Vec<AuditFinding>> {
     let (built, facts) = (&analysis.built, &analysis.facts);
-    let mut raw = crate::detect::run_all(built, &analysis.policy, facts, analysis.repo());
+    let mut raw = crate::detect::run_all(built, &analysis.policy, facts);
     raw.extend(crate::detect::effect_creep(built, &analysis.baseline));
     let suppressions = suppress::scan(analysis.repo(), facts);
     let submodules = source::submodule_paths(analysis.repo());
@@ -149,12 +149,7 @@ pub fn effective_findings(analysis: &RepositorySnapshot) -> Result<Vec<Finding>>
 }
 
 pub fn baseline_findings(analysis: &RepositorySnapshot) -> Vec<Finding> {
-    let raw = crate::detect::run_all(
-        &analysis.built,
-        &analysis.policy,
-        &analysis.facts,
-        analysis.repo(),
-    );
+    let raw = crate::detect::run_all(&analysis.built, &analysis.policy, &analysis.facts);
     let suppressions = suppress::scan(analysis.repo(), &analysis.facts);
     let submodules = source::submodule_paths(analysis.repo());
     let mut findings: Vec<Finding> = suppress::filter(raw, &suppressions)

@@ -1,7 +1,7 @@
 //! Rust per-function facts, via tree-sitter — the third-language
 //! implementation behind [`crate::Language`]. Mirrors the Python and JS
 //! extractors' semantics so the parser-based detectors (duplication,
-//! complexity, over-commenting) behave the same across languages.
+//! purity, branch coverage) behave the same across languages.
 //!
 //! Only `fn` items are entities. Closures are deliberately excluded: SCIP
 //! doesn't emit them as symbols, so they'd never join to a graph node, and

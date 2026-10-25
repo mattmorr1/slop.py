@@ -64,9 +64,9 @@ impl From<IndexerArg> for Indexer {
 /// Severity threshold at which `slop gate` fails (exits non-zero).
 #[derive(Clone, Copy, ValueEnum)]
 enum FailOn {
-    /// Only deterministic blockers (infra-bypass, circular-import). Default.
+    /// Only deterministic blockers (infra-bypass). Default.
     Blocking,
-    /// ...also Warnings (duplicate-exact, duplicate-equivalent, complexity-spike, purity-lie).
+    /// ...also Warnings (duplicate-exact, duplicate-equivalent, purity-lie).
     Warning,
     /// ...also Advisories (everything).
     Advisory,
@@ -129,7 +129,7 @@ enum Command {
         #[arg(long, default_value = "HEAD")]
         base: String,
         /// Severity at or above which the gate fails. Lower it to `warning` to
-        /// make the loop act on duplicate-exact / duplicate-equivalent / complexity-spike.
+        /// make the loop act on duplicate-exact / duplicate-equivalent / purity-lie.
         #[arg(long, value_enum, default_value_t = FailOn::Blocking)]
         fail_on: FailOn,
         /// Regenerate the SCIP index (auto-detected indexer) before checking

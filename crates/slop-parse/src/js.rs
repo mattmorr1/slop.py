@@ -1,7 +1,7 @@
 //! JavaScript / TypeScript per-function facts, via tree-sitter — the
 //! second-language implementation behind [`crate::Language`]. Mirrors the
 //! Python extractor's semantics so the parser-based detectors (duplication,
-//! complexity, over-commenting) behave the same across languages:
+//! purity, branch coverage) behave the same across languages:
 //!
 //! - exact hash = leaf kind + text (comments excluded) — "duplicate modulo
 //!   comments/formatting";

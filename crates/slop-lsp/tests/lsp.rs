@@ -88,22 +88,6 @@ fn didopen_on_slopped_repo_publishes_findings() {
 }
 
 #[test]
-fn module_level_finding_has_a_sane_range() {
-    let repo = fixture("toy_repo_slopped");
-    let notify_uri = path_to_file_uri(&repo.join("services/notify.py"));
-    let out = exchange(repo.clone(), &[didopen(&notify_uri)]);
-    let diags = diagnostics_for(&out, &notify_uri).expect("notify.py diagnostics");
-    // circular-import is module-level (end line usize::MAX upstream) — the
-    // range must stay finite and small.
-    let cyc = diags
-        .iter()
-        .find(|d| d["code"] == "circular-import")
-        .expect("circular-import diagnostic");
-    let end = cyc["range"]["end"]["line"].as_u64().unwrap();
-    assert!(end < 1000, "range end should be clamped, got {end}");
-}
-
-#[test]
 fn didopen_on_clean_repo_clears_diagnostics() {
     let repo = fixture("toy_repo");
     let uri = path_to_file_uri(&repo.join("core/http_client.py"));

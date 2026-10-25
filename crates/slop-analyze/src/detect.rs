@@ -3,7 +3,7 @@
 
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
-use slop_graph::{CodeEntity, EdgeKind, Effect, NodeType};
+use slop_graph::{EdgeKind, Effect, NodeType};
 
 use crate::build::BuiltGraph;
 use crate::findings::{EvidenceLocus, Finding, Severity};
@@ -92,79 +92,6 @@ pub fn infra_bypass(built: &BuiltGraph, policy: &Policy) -> Vec<Finding> {
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.lines.0.cmp(&b.lines.0))
     });
-    findings
-}
-
-/// Is this Imports edge just Rust's module hierarchy? `mod child;` in the parent
-/// is a *containment* declaration, and `crate::`/`super::` paths in the child
-/// point back up through it, so a module and its own ancestor reference each
-/// other by construction — for every module in every crate. That is not an
-/// import cycle.
-///
-/// Deliberately Rust-only: in Python, `pkg/__init__` importing `pkg.sub` while
-/// `pkg.sub` imports from `pkg` is a genuine cycle that can fail at import time.
-/// Filtering at the edge keeps real Rust cycles (between *sibling* modules)
-/// visible instead of suppressing the whole SCC.
-fn rust_module_hierarchy(a: &CodeEntity, b: &CodeEntity) -> bool {
-    fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
-        descendant.len() > ancestor.len()
-            && descendant.starts_with(ancestor)
-            && descendant[ancestor.len()..].starts_with("::")
-    }
-    a.file.ends_with(".rs")
-        && b.file.ends_with(".rs")
-        && (is_ancestor(&a.id, &b.id) || is_ancestor(&b.id, &a.id))
-}
-
-/// Circular imports: Tarjan SCC on the `Imports` subgraph. A cycle is the
-/// finding (D6) — one per SCC, anchored on every member module so the diff
-/// filter keeps it when any member file changes.
-pub fn circular_import(built: &BuiltGraph) -> Vec<Finding> {
-    use petgraph::graph::DiGraph;
-    let graph = &built.graph;
-
-    let mut imports: DiGraph<petgraph::graph::NodeIndex, ()> = DiGraph::new();
-    let mut map = std::collections::HashMap::new();
-    for edge in graph.graph.edge_indices() {
-        if graph.graph[edge] != EdgeKind::Imports {
-            continue;
-        }
-        let (a, b) = graph.graph.edge_endpoints(edge).unwrap();
-        if rust_module_hierarchy(graph.entity(a), graph.entity(b)) {
-            continue;
-        }
-        let ia = *map.entry(a).or_insert_with(|| imports.add_node(a));
-        let ib = *map.entry(b).or_insert_with(|| imports.add_node(b));
-        imports.add_edge(ia, ib, ());
-    }
-
-    let mut findings = Vec::new();
-    for scc in petgraph::algo::tarjan_scc(&imports) {
-        if scc.len() < 2 {
-            continue;
-        }
-        let mut members: Vec<&str> = scc
-            .iter()
-            .map(|&i| graph.entity(imports[i]).id.as_str())
-            .collect();
-        members.sort();
-        let cycle = members.join(" -> ");
-        for &i in &scc {
-            let entity = graph.entity(imports[i]);
-            findings.push(Finding {
-                rule: "circular-import",
-                severity: Severity::Blocking,
-                entity: entity.id.clone(),
-                file: entity.file.clone(),
-                lines: entity.source_range,
-                related: Vec::new(),
-                message: format!("`{}` is part of an import cycle: {cycle}", entity.id),
-                fix_guidance: format!(
-                    "Break the cycle {cycle} — move the shared dependency into a module neither imports, or defer the import into the function that needs it"
-                ),
-            });
-        }
-    }
     findings
 }
 
@@ -487,15 +414,6 @@ pub fn purity_lie(built: &BuiltGraph) -> Vec<Finding> {
     findings
 }
 
-// Cyclomatic complexity (McCabe, incl. boolean operators) is the entry gate,
-// but on its own it flags a wall of barely-over-threshold functions whose
-// score comes from one fat boolean guard, not real tangle (368 Warnings on
-// vigil, median 15). An agent can't drive a useful refactor from those. So a
-// spike must *also* show genuine structure: deep nesting or many independent
-// control-flow branches. This keeps the flagged set the ones worth splitting.
-const COMPLEXITY_THRESHOLD: u32 = 10;
-const NESTING_THRESHOLD: u32 = 4;
-const BRANCH_THRESHOLD: u32 = 12;
 /// A structural shape shared by more than this many functions is a codebase
 /// convention (plugin/registry/handler boilerplate — every entry has the same
 /// control flow *by design*), not a copy-paste worth unifying. Flagging it just
@@ -661,69 +579,11 @@ fn dedup_members(built: &BuiltGraph, facts: &[crate::source::FileFacts]) -> Vec<
         .collect()
 }
 
-/// Tier-1 (exact) and Tier-2 (structural) duplication, complexity spikes,
-/// and over-commenting — the parser-backed deterministic detectors.
+/// Tier-1 (exact) and Tier-2 (structural) duplication — the parser-backed
+/// deterministic detectors.
 pub fn source_detectors(built: &BuiltGraph, facts: &[crate::source::FileFacts]) -> Vec<Finding> {
     use std::collections::HashMap;
-    let index = crate::source::location_index(built);
     let mut findings = Vec::new();
-
-    for ff in facts {
-        for fact in &ff.functions {
-            let entity_label = label(built, &index, &ff.file, fact);
-            let lines = (fact.start_line as usize, fact.end_line as usize);
-
-            let tangled = fact.max_nesting_depth >= NESTING_THRESHOLD
-                || fact.branch_points >= BRANCH_THRESHOLD;
-            if fact.complexity > COMPLEXITY_THRESHOLD && tangled {
-                // Anchor guidance on the concrete locus: the deepest-nested
-                // block (1-based) is what to lift out first.
-                let deep_line = fact.deepest_line as usize + 1;
-                findings.push(Finding {
-                    rule: "complexity-spike",
-                    severity: Severity::Warning,
-                    entity: entity_label.clone(),
-                    file: ff.file.clone(),
-                    lines,
-                    related: Vec::new(),
-                    message: format!(
-                        "`{}` is tangled: {} control-flow branches nested {} deep (cyclomatic {})",
-                        fact.name, fact.branch_points, fact.max_nesting_depth, fact.complexity
-                    ),
-                    fix_guidance: if fact.max_nesting_depth >= NESTING_THRESHOLD {
-                        format!(
-                            "Extract the deepest block (around line {deep_line}, nested {} deep) into a named helper, or flatten it with early-return guard clauses",
-                            fact.max_nesting_depth
-                        )
-                    } else {
-                        format!(
-                            "Split the {} branches into smaller functions — group the ones that share a purpose behind one call",
-                            fact.branch_points
-                        )
-                    },
-                });
-            }
-
-            if fact.comment_lines >= 4 && fact.comment_lines * 2 >= fact.code_lines.max(1) {
-                findings.push(Finding {
-                    rule: "over-commenting",
-                    severity: Severity::Advisory,
-                    entity: entity_label.clone(),
-                    file: ff.file.clone(),
-                    lines,
-                    related: Vec::new(),
-                    message: format!(
-                        "`{}` has {} comment lines against {} code lines",
-                        fact.name, fact.comment_lines, fact.code_lines
-                    ),
-                    fix_guidance:
-                        "Delete comments that restate the code; keep only constraints the code cannot express"
-                            .into(),
-                });
-            }
-        }
-    }
-
     let members = dedup_members(built, facts);
 
     // Tier-1: identical bodies. One finding per exact-duplicate set.
@@ -1038,7 +898,6 @@ pub fn run_all(
     built: &BuiltGraph,
     policy: &Policy,
     facts: &[crate::source::FileFacts],
-    repo: &std::path::Path,
 ) -> Vec<Finding> {
     let index = crate::source::location_index(built);
     let decorated: std::collections::HashSet<String> = facts
@@ -1062,15 +921,12 @@ pub fn run_all(
         .collect();
 
     let mut findings = infra_bypass(built, policy);
-    findings.extend(circular_import(built));
     findings.extend(dead_island(built, policy, &decorated));
     findings.extend(purity_lie(built));
     findings.extend(effect_layer_violation(built, policy));
     findings.extend(source_detectors(built, facts));
     findings.extend(parallel_implementation(built, facts));
-    findings.extend(crate::config::config_sprawl(repo, facts));
     findings.extend(crate::coverage::untested_effect(built, policy, &branching, &decorated));
-    findings.extend(crate::naming::naming_convention(built));
     // `split::split_candidate` is deliberately absent: adjudicated at ~1 useful
     // finding in 1184 functions, so it does not ship. See the module header.
     findings.sort_by(|a, b| {

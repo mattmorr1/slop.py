@@ -22,8 +22,8 @@
 //! findings split cleanly: setup delivery and `Baseline::save` are untested
 //! behaviour, while `serve_stdio` and `run` are straight-line delegations whose
 //! only effect is to hand off. A branchless effectful function has no path to
-//! regress silently down, so the branch count from the parser (already computed
-//! for `complexity-spike`) is what separates the two.
+//! regress silently down, so the branch count from the parser is what separates
+//! the two.
 
 use std::collections::{HashSet, VecDeque};
 

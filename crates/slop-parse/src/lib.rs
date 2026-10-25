@@ -1,5 +1,5 @@
 //! Token/AST facts per function, for the parser-dependent detectors:
-//! Tier-1/Tier-2 duplication, complexity spikes, over-commenting.
+//! Tier-1/Tier-2 duplication, purity, branch coverage.
 //!
 //! Tier-1 hash = token kinds + source text, comments/blank-lines excluded:
 //! "exact duplicate modulo comments and whitespace."
@@ -27,7 +27,7 @@ mod scope;
 mod ts_state;
 
 /// A source language slop can produce per-function facts for. The parser-based
-/// detectors (duplication, complexity, over-commenting) need a language-aware
+/// detectors (duplication, purity, branch coverage) need a language-aware
 /// parser; the graph/effect detectors work over SCIP for *any* indexed
 /// language regardless of what's here. Adding a language = a new variant, an
 /// extension in [`Language::from_path`], and a parse arm — the rest of the
