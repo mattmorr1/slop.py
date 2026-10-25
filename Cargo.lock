@@ -2194,7 +2194,6 @@ dependencies = [
  "slop-lsp",
  "slop-mcp",
  "slop-parse",
- "slop-proxy",
  "slop-resolve",
  "slop-tui",
  "toml",
@@ -2254,17 +2253,6 @@ dependencies = [
  "tree-sitter-javascript",
  "tree-sitter-rust",
  "tree-sitter-typescript",
-]
-
-[[package]]
-name = "slop-proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "slop-analyze",
- "ureq",
 ]
 
 [[package]]

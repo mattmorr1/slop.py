@@ -180,37 +180,6 @@ enum Command {
         #[arg(long)]
         stats: bool,
     },
-    /// ANTHROPIC_BASE_URL reverse proxy (M5): steer + observe any Anthropic
-    /// client. Set ANTHROPIC_BASE_URL=http://localhost:<port> to route through it.
-    Proxy {
-        /// Port to listen on (localhost only)
-        #[arg(long, default_value_t = 8787)]
-        port: u16,
-        /// Upstream Anthropic API base URL
-        #[arg(long, default_value = "https://api.anthropic.com")]
-        upstream: String,
-        /// Repo whose sanctioned-channel policy is injected when --steer is set
-        #[arg(long)]
-        repo: Option<PathBuf>,
-        /// Augment the request's system prompt with the repo's channel policy
-        #[arg(long)]
-        steer: bool,
-        /// Append per-request token usage to this JSONL log
-        #[arg(long)]
-        log: Option<PathBuf>,
-        /// Maximum simultaneous client connections; excess receives HTTP 503.
-        #[arg(long, default_value_t = 32)]
-        max_connections: usize,
-        /// Maximum request body size in MiB.
-        #[arg(long, default_value_t = 16)]
-        max_request_mib: usize,
-        /// Maximum response bytes retained for usage extraction in MiB.
-        #[arg(long, default_value_t = 2)]
-        max_capture_mib: usize,
-        /// Client/upstream I/O timeout in seconds.
-        #[arg(long, default_value_t = 300)]
-        timeout_seconds: u64,
-    },
     /// Validation gate (M5): run the check and exit non-zero if anything
     /// blocks, printing a JSON verdict a CI step or agent fix-loop consumes.
     Gate {
@@ -403,9 +372,8 @@ enum Command {
     },
     /// Launch Claude Code with slop's context layer active. Idempotently wires
     /// the harness (MCP tools + read/prompt hooks + skill) into the repo, then
-    /// starts `claude` there so it loads them. `--proxy` also routes the session
-    /// through slop's steering + token-observability proxy. Args after `--` pass
-    /// through to claude (e.g. `slop claude -- --resume`).
+    /// starts `claude` there so it loads them. Args after `--` pass through to
+    /// claude (e.g. `slop claude -- --resume`).
     #[command(hide = true)]
     Claude {
         /// Repo root (default: current directory)
@@ -414,12 +382,6 @@ enum Command {
         /// Skip the idempotent harness install (assume it's already wired)
         #[arg(long)]
         no_install: bool,
-        /// Also start `slop proxy --steer` and point this claude session at it
-        #[arg(long)]
-        proxy: bool,
-        /// Port for the steering proxy when --proxy is set
-        #[arg(long, default_value_t = 8787)]
-        proxy_port: u16,
         /// Args passed through to claude (everything after `--`)
         #[arg(last = true)]
         claude_args: Vec<String>,
@@ -760,29 +722,6 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Command::Proxy {
-            port,
-            upstream,
-            repo,
-            steer,
-            log,
-            max_connections,
-            max_request_mib,
-            max_capture_mib,
-            timeout_seconds,
-        } => {
-            slop_proxy::serve(slop_proxy::ProxyConfig {
-                port,
-                upstream,
-                repo,
-                steer,
-                log,
-                max_connections,
-                max_request_bytes: max_request_mib.saturating_mul(1024 * 1024),
-                max_capture_bytes: max_capture_mib.saturating_mul(1024 * 1024),
-                timeout: std::time::Duration::from_secs(timeout_seconds),
-            })?;
-        }
         Command::Gate {
             repo,
             index,
@@ -965,11 +904,9 @@ fn main() -> Result<()> {
         Command::Claude {
             repo,
             no_install,
-            proxy,
-            proxy_port,
             claude_args,
         } => {
-            launch_claude(&repo, no_install, proxy, proxy_port, &claude_args)?;
+            launch_claude(&repo, no_install, &claude_args)?;
         }
         Command::Calibrate { repo, max_commits, holdout, budget, force, dry_run } => {
             run_calibrate(&repo, max_commits, holdout, budget, force, dry_run)?
@@ -1337,17 +1274,10 @@ fn install_harness(repo: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Launch Claude Code in `repo` with slop's context layer active. Wires the
-/// harness (unless `no_install`), optionally starts the steering proxy and
-/// points the session at it via `ANTHROPIC_BASE_URL`, then runs `claude` with
-/// the repo as its working directory so it loads `.mcp.json` + the hooks.
-fn launch_claude(
-    repo: &Path,
-    no_install: bool,
-    proxy: bool,
-    proxy_port: u16,
-    claude_args: &[String],
-) -> Result<()> {
+/// Launch Claude Code in `repo` with slop's context layer active: wire the
+/// harness (unless `no_install`), then run `claude` with the repo as its working
+/// directory so it loads `.mcp.json` + the hooks.
+fn launch_claude(repo: &Path, no_install: bool, claude_args: &[String]) -> Result<()> {
     let repo = repo
         .canonicalize()
         .with_context(|| format!("resolving repo path {}", repo.display()))?;
@@ -1357,77 +1287,16 @@ fn launch_claude(
         eprintln!();
     }
 
-    // Optional steering/observability proxy: start it, wait for the port, and
-    // set ANTHROPIC_BASE_URL so this claude session routes through it. Killed
-    // when claude exits.
-    let mut proxy_child = None;
-    let mut envs: Vec<(String, String)> = Vec::new();
-    if proxy {
-        if !repo.join("slop.toml").exists() {
-            eprintln!(
-                "note: {} has no slop.toml — the proxy will log tokens but inject no steering (run `slop init`)",
-                repo.display()
-            );
-        }
-        let exe = std::env::current_exe().context("resolving the slop binary path")?;
-        let log = repo.join(".slop-proxy.jsonl");
-        let child = Process::new(&exe)
-            .arg("proxy")
-            .args(["--port", &proxy_port.to_string()])
-            .arg("--repo")
-            .arg(&repo)
-            .arg("--steer")
-            .arg("--log")
-            .arg(&log)
-            .spawn()
-            .context("starting slop proxy")?;
-        wait_for_port(proxy_port)?;
-        envs.push((
-            "ANTHROPIC_BASE_URL".to_string(),
-            format!("http://localhost:{proxy_port}"),
-        ));
-        eprintln!(
-            "slop proxy on :{proxy_port} — this claude session routes through it (usage log: {})",
-            log.display()
-        );
-        proxy_child = Some(child);
-    }
-
     // Hand the terminal to claude (a full TUI); wait for it to exit.
     let status = Process::new("claude")
         .current_dir(&repo)
         .args(claude_args)
-        .envs(envs)
         .status()
-        .context("launching claude (is Claude Code on PATH?)");
-
-    if let Some(mut child) = proxy_child {
-        let _ = child.kill();
-    }
-    let status = status?;
+        .context("launching claude (is Claude Code on PATH?)")?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
-}
-
-/// Block until `127.0.0.1:port` accepts a connection (the proxy has bound), or
-/// give up after ~5s.
-fn wait_for_port(port: u16) -> Result<()> {
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::{Duration, Instant};
-    let addr = ("127.0.0.1", port)
-        .to_socket_addrs()?
-        .next()
-        .context("resolving proxy address")?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(150));
-    }
-    bail!("slop proxy did not come up on :{port}");
 }
 
 /// Create a detached `git worktree` of `repo` in a temp dir and return its
