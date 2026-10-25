@@ -168,6 +168,9 @@ enum Command {
         #[arg(long)]
         index: Option<PathBuf>,
     },
+    /// Print this binary's absolute path; the plugin launcher caches it.
+    #[command(hide = true)]
+    SelfPath,
     /// Generate SCIP artifacts for every detected language. Explicit
     /// --indexer/--output retains the single-artifact compatibility seam.
     Index {
@@ -442,6 +445,7 @@ fn main() -> Result<()> {
         Command::Mcp { repo, index } => {
             slop_cli::mcp::serve_stdio(repo, index)?;
         }
+        Command::SelfPath => println!("{}", std::env::current_exe()?.canonicalize()?.display()),
         Command::Index {
             repo,
             output,

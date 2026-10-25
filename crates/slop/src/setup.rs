@@ -10,7 +10,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-const SKILL: &str = include_str!("../assets/slop-skill.md");
+const SKILL: &str = include_str!("../../../plugin/skills/slop/SKILL.md");
 const CODEX_BLOCK_START: &str = "# >>> slop managed: mcp";
 const CODEX_BLOCK_END: &str = "# <<< slop managed: mcp";
 const STATE_PATH: &str = ".slop/install-state.json";

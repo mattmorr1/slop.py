@@ -1,0 +1,21 @@
+{
+  "description": "slop: session baseline and world model at start, warn-only steering before writes, the reconcile gate at Stop",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/slop-run hook session-start", "timeout": 60}]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/slop-run hook pre-tool-use", "timeout": 5}]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/slop-run hook stop", "timeout": 15}]
+      }
+    ]
+  }
+}

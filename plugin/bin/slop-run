@@ -1,0 +1,30 @@
+#!/bin/sh
+# Resolve the slop binary for this plugin version once, cache its absolute path, then exec it.
+# Order: $SLOP_BIN, a matching `slop` on PATH, then `uvx --from slop-cli==VERSION`.
+set -eu
+VERSION=0.1.0
+CACHE="${TMPDIR:-/tmp}/slop-plugin-$VERSION.path"
+
+if [ -n "${SLOP_BIN:-}" ]; then
+  exec "$SLOP_BIN" "$@"
+fi
+if [ -r "$CACHE" ]; then
+  bin=$(cat "$CACHE")
+  if [ -x "$bin" ]; then
+    exec "$bin" "$@"
+  fi
+fi
+
+bin=""
+found=$(command -v slop 2>/dev/null || true)
+if [ -n "$found" ] && [ "$("$found" --version 2>/dev/null </dev/null || true)" = "slop $VERSION" ]; then
+  bin=$found
+elif command -v uvx >/dev/null 2>&1; then
+  bin=$(uvx --quiet --from "slop-cli==$VERSION" slop self-path </dev/null 2>/dev/null || true)
+fi
+if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+  echo "slop plugin: no slop $VERSION binary found. Set SLOP_BIN to a slop $VERSION binary, put slop $VERSION on PATH, or install uv so uvx can fetch slop-cli==$VERSION." >&2
+  exit 1
+fi
+printf '%s\n' "$bin" >"$CACHE.$$" && mv "$CACHE.$$" "$CACHE"
+exec "$bin" "$@"
