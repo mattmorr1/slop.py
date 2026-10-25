@@ -273,7 +273,7 @@ def score(a):
     for u in us:
         if not scorable(u):
             print(f"  {u['repo']} {u['commit'][:10]}: {u.get('index', {}).get('error') or (u['errors'] + u.get('hook_errors', []))}")
-    print(f"\nlatency: index s p50 {pct([u['index']['s'] for u in us if u.get('index', {}).get('ok')], .5)}; reconcile ms p50 {pct([u['reconcile_ms'] for u in us if 'reconcile_ms' in u], .5)}")
+    print(f"\nlatency: index s p50 {pct([u['index']['s'] for u in us if u.get('index', {}).get('ok')], .5)}; SessionStart ms p50 {pct([u['start_ms'] for u in us if scorable(u)], .5)} p95 {pct([u['start_ms'] for u in us if scorable(u)], .95)}; reconcile ms p50 {pct([u['reconcile_ms'] for u in us if 'reconcile_ms' in u], .5)}, retries {sum(u.get('reconcile_retries', 0) for u in us)}")
     if todo:
         print(f"\nunlabeled ({len(todo)}):")
         for repo, i, f in todo:
