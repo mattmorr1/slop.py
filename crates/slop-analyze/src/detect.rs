@@ -429,6 +429,19 @@ pub fn effect_creep(built: &BuiltGraph, baseline: &crate::baseline::Baseline) ->
     findings
 }
 
+fn to_snake_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    let mut prev_lower_or_digit = false;
+    for ch in name.chars() {
+        if ch.is_uppercase() && prev_lower_or_digit {
+            out.push('_');
+        }
+        out.extend(ch.to_lowercase());
+        prev_lower_or_digit = ch.is_lowercase() || ch.is_ascii_digit();
+    }
+    out
+}
+
 /// Purity-lie: the name promises a pure computation; the (transitive)
 /// effect signature says I/O.
 pub fn purity_lie(built: &BuiltGraph) -> Vec<Finding> {
@@ -444,7 +457,7 @@ pub fn purity_lie(built: &BuiltGraph) -> Vec<Finding> {
             continue;
         }
         let name = entity.id.rsplit("::").next().unwrap_or(&entity.id);
-        let name = crate::rename::to_snake_case(name);
+        let name = to_snake_case(name);
         if !PURE_NAME_PREFIXES.iter().any(|p| name.starts_with(p)) {
             continue;
         }
@@ -859,8 +872,7 @@ pub struct WrapperCandidate {
     pub forward_identity: bool,
     /// Distinct functions with a resolved `Calls` edge to this one. An
     /// over-count: SCIP records a callback pass (`register(load)`) as a call
-    /// too, so this bounds the real caller set from above — safe for the gate,
-    /// but the rewrite (fix::plan_inlines) must re-check each textual site.
+    /// too, so this bounds the real caller set from above.
     pub callers: usize,
 }
 

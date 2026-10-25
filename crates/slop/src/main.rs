@@ -6,13 +6,13 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use slop_analyze::baseline::Baseline;
 use slop_analyze::check::{self, CheckRequest, CheckResult};
-use slop_analyze::findings::{FindingId, Severity};
+use slop_analyze::findings::Severity;
 
 use slop_analyze::compress::{self, CompressConfig};
 use slop_analyze::index::{
     default_project_name, ensure_index, run_indexer, run_scip_index, Indexer,
 };
-use slop_analyze::{gate, harness, infer, repair, retrieve};
+use slop_analyze::{gate, harness, infer, retrieve};
 use slop_resolve::{IndexSet, Resolver, ScipResolver};
 
 mod setup;
@@ -117,37 +117,6 @@ enum Command {
         /// indexer). Without it, a stale index only earns a warning.
         #[arg(long)]
         reindex: bool,
-    },
-    /// Preview or transactionally apply snapshot-bound repairs. Index-verified
-    /// renames are enabled by default; graded repairs require an opt-in flag.
-    Fix {
-        /// Repo root (default: current directory)
-        #[arg(default_value = ".")]
-        repo: PathBuf,
-        /// Path to index.scip (default: <repo>/index.scip)
-        #[arg(long)]
-        index: Option<PathBuf>,
-        /// Apply changes to disk (default: report only)
-        #[arg(long)]
-        write: bool,
-        /// Repair exactly one finding ID from `slop check --json`.
-        #[arg(long)]
-        finding: Option<String>,
-        /// Include graded restating-comment repairs. Tooling directives remain
-        /// protected, but the classification is heuristic and requires review.
-        #[arg(long)]
-        allow_advisory: bool,
-        /// Also remove dead free functions (Warning `dead-island`). Opt-in even
-        /// with --write: deleting code is riskier than the comment/rename fixes
-        /// (SCIP can miss a dynamic caller), so review the dry-run first.
-        #[arg(long)]
-        remove_dead: bool,
-        /// Also inline judge-confirmed trivial wrappers (`trivial-wrapper`):
-        /// rewrite every reference to the callee and delete the wrapper. Runs
-        /// the Tier-3 judge (needs an API key) and touches multiple files, so
-        /// it is opt-in; review the dry-run first.
-        #[arg(long)]
-        inline_wrappers: bool,
     },
     /// Zoned graph-distance compression of a file (D11): full fidelity within
     /// --hops of the --edit loci, skeletons beyond. Prints the compressed
@@ -496,131 +465,6 @@ fn main() -> Result<()> {
             }
             if result.blocking > 0 {
                 std::process::exit(1);
-            }
-        }
-        Command::Fix {
-            repo,
-            index,
-            write,
-            finding,
-            allow_advisory,
-            remove_dead,
-            inline_wrappers,
-        } => {
-            let analysis = check::load_analysis(&repo, index.as_deref())?;
-            let mut findings = check::effective_findings(&analysis, false)?;
-            if inline_wrappers {
-                findings.extend(check::tier3_wrapper_findings(
-                    &analysis.built,
-                    &analysis.policy,
-                    &analysis.facts,
-                    &repo,
-                )?);
-            }
-            let selection = match finding {
-                Some(value) => repair::RepairSelection::Finding(
-                    value.parse::<FindingId>().map_err(anyhow::Error::msg)?,
-                ),
-                None => repair::RepairSelection::All,
-            };
-            let eligible: Vec<_> = findings
-                .into_iter()
-                .filter(|finding| match finding.rule {
-                    "naming-convention" => true,
-                    "over-commenting" => allow_advisory,
-                    "dead-island" => remove_dead,
-                    "trivial-wrapper" => inline_wrappers,
-                    _ => false,
-                })
-                .collect();
-            let safety = if allow_advisory || remove_dead || inline_wrappers {
-                repair::SafetyClass::Advisory
-            } else {
-                repair::SafetyClass::IndexVerified
-            };
-            let plan = repair::plan(&analysis, &eligible, selection, safety)?;
-            for action in &plan.actions {
-                println!(
-                    "{} [{}] {} — {} ({})",
-                    if write { "apply" } else { "would apply" },
-                    action.rule,
-                    action.entity,
-                    action.summary,
-                    action.finding
-                );
-            }
-            for skipped in &plan.skipped {
-                eprintln!("skip {}: {}", skipped.entity, skipped.reason);
-            }
-            if plan.files.is_empty() {
-                println!("nothing to fix");
-            } else if write {
-                let action_ids: std::collections::HashSet<_> = plan
-                    .actions
-                    .iter()
-                    .map(|action| action.finding.clone())
-                    .collect();
-                let pending = repair::apply(&analysis, &plan)?;
-                let verification = (|| -> Result<_> {
-                    run_scip_index(&repo, index.as_deref())?;
-                    let verified = check::load_analysis_fresh(
-                        &repo,
-                        index.as_deref(),
-                        check::Freshness::Warn,
-                    )?;
-                    let remaining = check::effective_findings(&verified, false)?
-                        .into_iter()
-                        .filter(|finding| action_ids.contains(&finding.id()))
-                        .count();
-                    if remaining > 0 {
-                        bail!("verification left {remaining} selected finding(s)");
-                    }
-                    verified.write_prewrite_sidecar()?;
-                    Ok(verified)
-                })();
-                let verified = match verification {
-                    Ok(verified) => verified,
-                    Err(verification_error) => {
-                        pending.rollback().with_context(|| {
-                            format!("repair verification failed ({verification_error:#}) and rollback failed")
-                        })?;
-                        if let Err(index_error) = run_scip_index(&repo, index.as_deref()) {
-                            bail!(
-                                "repair verification failed and source was rolled back, but restoring the index failed: {verification_error:#}; {index_error:#}"
-                            );
-                        }
-                        let restore_evidence = (|| -> Result<()> {
-                            let restored = check::load_analysis_fresh(
-                                &repo,
-                                index.as_deref(),
-                                check::Freshness::Warn,
-                            )?;
-                            restored.write_prewrite_sidecar()?;
-                            Ok(())
-                        })();
-                        if let Err(restored_error) = restore_evidence {
-                            bail!(
-                                "repair verification failed and source/index were restored, but rebuilding prewrite evidence failed: {verification_error:#}; {restored_error:#}"
-                            );
-                        }
-                        return Err(verification_error
-                            .context("repair verification failed; source and index rolled back"));
-                    }
-                };
-                let receipt = pending.commit()?;
-                println!(
-                    "applied {} repair(s) across {} file(s); verified snapshot {}",
-                    receipt.actions,
-                    receipt.files.len(),
-                    verified.id()
-                );
-            } else {
-                println!(
-                    "dry-run: {} repair(s) across {} file(s)",
-                    plan.actions.len(),
-                    plan.files.len()
-                );
-                println!("apply with: slop fix --write");
             }
         }
         Command::Compress {
@@ -1036,7 +880,7 @@ fn run_suggest(
 }
 
 /// Low-level SCIP introspection behind `slop debug`. Kept off the top-level
-/// help so the everyday surface (check / fix / gate / …) stays legible.
+/// help so the everyday surface (check / gate / …) stays legible.
 fn run_debug(command: DebugCommand) -> Result<()> {
     match command {
         DebugCommand::IndexInfo { index } => {
