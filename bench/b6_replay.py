@@ -71,7 +71,7 @@ def later_touch(repo, commit, file, line, end):
 
 def tip(repo, commit):
     """The branch tip that contains `commit` (HEAD if it does), so 'later' follows the commit's own line."""
-    head = git(repo, "rev-parse", "HEAD").strip()
+    head = git(repo, "rev-parse", "refs/remotes/origin/HEAD").strip()
     if sh(["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, head], check=False).returncode == 0:
         return head
     tips = git(repo, "for-each-ref", "--contains", commit, "--format=%(objectname)", "refs/remotes").split()
@@ -145,9 +145,10 @@ def replay(repo, name, commit, parent, py_files):
 
 def manifest(repos, seed_counts):
     sha = sh(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).stdout.strip()
+    crates = sh(["git", "-C", str(ROOT), "log", "-1", "--format=%H", "--", "crates", "Cargo.toml", "Cargo.lock"]).stdout.strip()
     dirty = bool(sh(["git", "-C", str(ROOT), "status", "--porcelain", "--", "crates"]).stdout.strip())
-    return {"bench": "B6", "slop_sha": sha, "dirty": dirty, "binary": str(BIN), "seed": SEED, "cap": CAP, "platform": platform.platform(),
-            "python": platform.python_version(), "repos": {n: {"head": git(r, "rev-parse", "HEAD").strip(), **seed_counts[n]} for n, r in repos.items()}}
+    return {"bench": "B6", "slop_sha": sha, "crates_sha": crates, "dirty": dirty, "binary": str(BIN), "seed": SEED, "cap": CAP, "platform": platform.platform(),
+            "python": platform.python_version(), "repos": {n: {"head": git(r, "rev-parse", "refs/remotes/origin/HEAD").strip(), **seed_counts[n]} for n, r in repos.items()}}
 
 
 def run(a):
