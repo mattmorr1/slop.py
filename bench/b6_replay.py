@@ -126,7 +126,7 @@ def replay(repo, name, commit, parent, py_files):
         u["index"] = {"ok": True, "s": round(time.perf_counter() - at, 1)}
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         u["index"] = {"ok": False, "s": round(time.perf_counter() - at, 1), "error": str(e)[-400:]}
-        # Exploratory only (pre-registration change 2): go on when the Python artifact was written.
+        # Exploratory only (pre-registration change 3): go on when the Python artifact was written.
         u["partial_index"] = PARTIAL and (repo / ".slop/index/python.scip").is_file()
         if not u["partial_index"]:
             u["scorable"] = False

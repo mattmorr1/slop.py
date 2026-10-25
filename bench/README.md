@@ -220,6 +220,106 @@ httpx possibly memorised). One post-generation change, a crash fix in the
 call-bucket bookkeeping, is listed in the pre-registration; the ledger entry
 is marked dirty because that fix was uncommitted when it was scored.
 
+## `b6_replay.py`: B6, the Stop gate replayed over Claude-written commits
+
+Pre-registered in `bench/B6_PREREGISTRATION.md` (115dcbe) before any corpus
+run; three later changes are listed there (two to the harness, one
+exploratory rerun). Question: how often does the Stop reconcile gate fire on
+real Claude-written commits, and what share of its firings are right?
+
+Unit: a commit with a `Co-Authored-By: Claude` trailer, one parent, and at
+least one `.py` file changed: 138 units across four of the owner's repos,
+claude-skills capped at 60 (seed 20261025). Per unit: index the parent,
+SessionStart, check out the commit, Stop, then `reconcile` over MCP. Binary
+built at 9dd2d80 (crates last changed in 9df41f4, clean). No repo has a
+`slop.toml`, and `slop init` never marks a channel confirmed (it proposed one
+or two in 53 primary units), so `infra-bypass` could not fire anywhere.
+
+```
+cargo build --release -p slop-cli
+python3 bench/b6_replay.py run --repo claude-skills=PATH --repo gen-ai-privacy=PATH --repo LatexUEA=PATH --repo hiring-agent=PATH
+python3 bench/b6_replay.py score
+```
+
+### Result (`bench/results/replay.jsonl`, labels in `bench/results/b6_labels.jsonl`)
+
+| repo | units | unscorable | units blocked | duplicate | missing | infra-bypass | block precision | advisory precision | Stop p50 / p95 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| claude-skills | 60 | 1 | 10 of 59 | 374 | 0 | 0 | 0 / 374 | 0 / 13 | 117 / 483 |
+| gen-ai-privacy | 46 | 42 | 0 of 4 | 0 | 0 | 0 | n/a | n/a | 73 / 287 |
+| LatexUEA | 28 | 1 | 0 of 27 | 0 | 0 | 0 | n/a | n/a | 114 / 166 |
+| hiring-agent | 4 | 0 | 0 of 4 | 0 | 0 | 0 | n/a | n/a | 40 / 100 |
+| **all** | **138** | **44** | **10 of 94 (11%)** | **374** | **0** | **0** | **0%** | **0%** | **113 / 394** |
+| gen-ai-privacy, partial index (exploratory) | 46 | 1 | 2 of 45 | 0 | 4 | 0 | 0 / 4 | n/a | 126 / 1,108 |
+
+- **Blocks (374): 0 TRUE, 4 fact-true-but-useless, 370 FALSE, 0 UNSURE.**
+  Advisory (all 13 items, fewer than the 40 cap): 0 TRUE, 9 useless, 4 FALSE.
+  The exploratory `missing` findings: 0 TRUE, 4 useless.
+- Unscorable, 44: 42 gen-ai-privacy units where `slop index` exits 1 because
+  rust-analyzer cannot index the repo's Rust crates (pinned 1.90 toolchain
+  has no rust-analyzer; stable fails too); 1 claude-skills checkout that
+  collides on case (`.github/PULL_REQUEST_TEMPLATE.md` and
+  `pull_request_template.md` on macOS); 1 LatexUEA unit where `slop mcp`
+  closed its pipe mid-reconcile (a rerun returned 0 findings).
+- Latency: index p50 9.4 s; SessionStart p50 185 ms, p95 917 ms; reconcile p50
+  9.8 s (it runs the full detector suite) and hit its own index race 9 times.
+  Stop stays under the 500 ms p95 budget in the primary run (worst repo 483
+  ms) and misses it on gen-ai-privacy's 283-file reorg commits (1.1 s).
+- Wall clock: 51 min primary, 16 min exploratory, one M-series laptop.
+- "Fixed later" is uninformative here: 372 of 374 flagged lines sit in files a
+  later commit removed, because claude-skills was reorganised again.
+
+Examples (file:line at the unit's commit):
+
+| unit | file:line | rule | label | why |
+| --- | --- | --- | --- | --- |
+| claude-skills bbba25a8 | `marketing-skill/social-media-analyzer/scripts/analyze_performance.py:21` | duplicate | FALSE | pure move `{ => scripts}/`; the "existing" original is the old path this commit deleted. 7 units, 363 blocks are this. |
+| claude-skills 4b7a084e | `product-team/code-to-prd/scripts/codebase_analyzer.py:235` | duplicate | FALSE | `frontend_analyzer.py` renamed and extended; 7 blocks and 1 advice point at the deleted name |
+| claude-skills 9dd6fd18 | `engineering/skills/slo-architect/scripts/slo_review.py:30` | duplicate | USELESS | the best catch: `_read` is byte-identical to the kubernetes-operator skill's, but skills ship standalone. The same commit adds the whole skill twice and slop says nothing, because both copies are new. |
+| claude-skills 87f3a007 | `engineering-team/gcp-cloud-architect/scripts/cost_optimizer.py:27` | duplicate | USELESS | same body as the AWS skill's method, but it dispatches on `self` to GCP-specific helpers; "call the existing one" would run AWS logic, from an unimportable hyphenated path |
+| gen-ai-privacy 95f37a81 (exploratory) | `investigations/03-generated-tools-lit-survey/examples/03-codeact.py:16` | missing | USELESS | `goto` is an ALFWorld tool in a verbatim dataset specimen; re-flagged only because a reorg moved the file |
+| claude-skills bb6f2fa8 | `engineering-team/senior-computer-vision/scripts/inference_optimizer.py:411` | advisory | FALSE | a dict lookup of speedups "has the same shape" as a dict lookup of test frameworks |
+
+Slop bugs found (recorded, not fixed):
+
+1. **A moved or renamed file blocks as a copy of itself.** `session::changes`
+   skips paths that no longer exist, so a deleted original never enters
+   `parsed`, and `reconcile`'s `live` check (`parsed.get(file).is_none_or(..)`)
+   then treats the sidecar's site in the deleted file as alive. Every function
+   in a moved file becomes a "provable" duplicate. This is 370 of 374 blocks
+   and 8 of 10 blocked units. The same blind spot makes `missing` re-report old
+   calls in a moved file (it has no `before`).
+2. **`reconcile` over MCP races its own refresher.** The tool's first capture
+   queues a background reindex that rewrites the index while the same call's
+   `check::run` captures again: "an index was rewritten while capturing
+   analysis; retry the command" on the first edit-bearing call. The harness
+   retries (9 primary, 1 exploratory); the broken-pipe unit likely shares the cause.
+3. **One failing indexer silently disables duplicate detection.** With Rust
+   unindexable, the snapshot is stale, SessionStart refuses to persist the
+   sidecar, and Stop runs `missing` only. The only trace is a line in
+   `.slop/hooks.jsonl`; `slop index` exits 1 although the Python artifact is fine.
+4. Two copies of one function share one `duplicate:<hash>` id, so a single
+   `acknowledge` silences both; and the action names calls across hyphenated,
+   unimportable skill directories.
+
+**Verdict: on this corpus the Stop gate has no demonstrated utility and is
+net harmful.** It blocked 11% of scorable Claude commits and was right, in
+the sense of "acting on it improves the code", zero times out of 374.
+99% of its blocks are a bug (file moves), and the remaining 1% are true
+but useless in a repo whose unit of distribution is a self-contained skill.
+`missing` never fired on primary units, and on 45 more exploratory units it
+fired only on quoted dataset specimens. `infra-bypass` was unreachable
+without a confirmed policy. Advice was never worth reading. Strip out the
+move bug and the gate would have blocked 2 of 94 commits, both wrongly in
+practice. So the honest reading is that Claude's committed Python here
+contains no provable mistakes of the three kinds for the gate to catch. The
+caveat that bounds this: commits are final states, so mistakes Claude made
+and fixed mid-session are invisible, and claude-skills is a copy-by-design
+monorepo, the worst case for a duplicate check. Before any live trial
+(roadmap P4), bug 1 must be fixed and the duplicate rule needs a package
+boundary; otherwise the first `git mv` in a session costs a turn per
+function moved.
+
 ## Archive
 
 The scripts in `bench/archive/` measured surfaces removed in P0 (the context
