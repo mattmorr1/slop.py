@@ -107,7 +107,7 @@ pub fn reconcile(repo: &Path, changes: &[Change], sidecar: Option<&PrewriteSidec
                 }
                 let body: String = after.lines().skip(function.start_line as usize).take((function.end_line - function.start_line + 1) as usize).collect::<Vec<_>>().join("\n");
                 let query = crate::analyze::retrieve::query_from_source(language, &body);
-                if let Some(m) = sidecar.neighborhood.matches(&query, None, 3).into_iter().find(|m| m.score_ppm >= MIN_REUSE_SCORE_PPM && !(m.file == file && simple(&m.label) == function.name)) {
+                if let Some(m) = sidecar.neighborhood.matches(&query, 3).into_iter().find(|m| m.score_ppm >= MIN_REUSE_SCORE_PPM && !(m.file == file && simple(&m.label) == function.name)) {
                     report.advisory.push(format!("`{}` ({file}:{}) overlaps existing `{}` ({}:{}) through calls [{}]", function.name, line + 1, m.label, m.file, m.line + 1, m.distinctive.join(", ")));
                 }
             }

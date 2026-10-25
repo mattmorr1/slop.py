@@ -39,8 +39,6 @@ slop check              # findings in the working-tree diff vs HEAD
 slop check --all        # whole repo
 slop check --json       # for CI and tooling
 slop gate               # exit non-zero on blocking findings, JSON verdict
-slop suggest            # where proposed code (on stdin) belongs
-slop baseline           # grandfather current findings
 slop init               # propose a slop.toml from dominant patterns
 ```
 
@@ -63,7 +61,6 @@ JSON result names the repository snapshot it was computed from.
 | Rule | Severity | Flags |
 | --- | --- | --- |
 | `infra-bypass` | Blocking | Raw net/fs/db/env access where the repo has a sanctioned channel for it |
-| `effect-creep` | Blocking | A function that was pure at baseline now does I/O |
 | `effect-layer-violation` | Warning | An effect a declared layer forbids |
 | `duplicate-exact` | Warning | Identical bodies, ignoring comments and whitespace |
 | `duplicate-equivalent` | Warning | Python functions provably equal up to renaming and sound rewrites ([ADR 0004](docs/adr/0004-e-equivalence-normalizer-with-egglog-as-oracle.md)) |
@@ -74,9 +71,9 @@ JSON result names the repository snapshot it was computed from.
 | `untested-effect` | Advisory | Branching I/O no test reaches, in a repo that usually tests it |
 
 `infra-bypass` needs a `slop.toml` policy; `slop init` proposes one from the
-repo's dominant patterns. `slop baseline` grandfathers current findings and
-records effect signatures for `effect-creep`. Rule ids removed in P0
-(`circular-import`, `complexity-spike`, `config-sprawl`, `naming-convention`,
+repo's dominant patterns. Pre-existing findings are out of scope by default:
+`slop check` judges the diff. Retired rule ids (`effect-creep`, and from P0
+`circular-import`, `complexity-spike`, `config-sprawl`, `naming-convention`,
 `slop-name`, `over-commenting`) stay reserved: old suppressions naming them are
 accepted and do nothing.
 

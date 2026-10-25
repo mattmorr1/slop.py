@@ -142,19 +142,11 @@ impl Neighborhood {
     }
 
     /// Existing functions whose neighborhood overlaps `proposed`, best first.
-    /// `exclude` drops one label, which is what makes leave-one-out evaluation
-    /// possible: feed an existing body back in and hide its own entry.
-    pub fn matches(
-        &self,
-        proposed: &BTreeSet<String>,
-        exclude: Option<&str>,
-        limit: usize,
-    ) -> Vec<Match> {
+    pub fn matches(&self, proposed: &BTreeSet<String>, limit: usize) -> Vec<Match> {
         let cutoff = self.common_df();
         let mut out: Vec<Match> = self
             .functions
             .iter()
-            .filter(|c| exclude != Some(c.label.as_str()))
             // If the proposed code calls this function, it is a collaborator, not
             // a home for it. Without this, every caller/callee pair matched: the
             // query text carries its own definition line, so a function and the

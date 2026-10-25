@@ -169,14 +169,6 @@ fn suppression_scan_silences_reasoned_allow_only() {
 }
 
 #[test]
-fn baseline_grandfathers_everything() {
-    let (_, findings) = analyze("toy_repo_slopped", true);
-    let baseline = slop_core::analyze::baseline::Baseline::from_findings(&findings);
-    let kept = baseline.filter(findings);
-    assert!(kept.is_empty());
-}
-
-#[test]
 fn channel_inference_proposes_the_clean_repo_convention() {
     let (built, _) = analyze("toy_repo", true);
     let proposals = slop_core::analyze::infer::infer_channels(&built);

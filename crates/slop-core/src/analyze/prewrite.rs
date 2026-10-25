@@ -208,7 +208,7 @@ fn assess(
         .with_context(|| format!("unsupported source language for {file}"))?;
     let query = retrieve::query_from_source(language, source);
     let reuse_suggestions = neighborhood
-        .matches(&query, None, limit)
+        .matches(&query, limit)
         .into_iter()
         .filter(|candidate| candidate.score_ppm >= MIN_REUSE_SCORE_PPM)
         .collect();

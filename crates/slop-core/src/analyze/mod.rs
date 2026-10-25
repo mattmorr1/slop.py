@@ -1,6 +1,5 @@
 //! The analysis layer: graph build, effect inference, policy, detectors.
 
-pub mod baseline;
 pub mod build;
 pub mod check;
 pub mod config;

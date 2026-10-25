@@ -8,7 +8,6 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use crate::resolve::{IndexSet, Resolver};
 
-use crate::analyze::baseline::Baseline;
 use crate::analyze::build::{self, BuiltGraph};
 use crate::analyze::effects;
 use crate::analyze::index::{self, Digest, Stamp};
@@ -87,7 +86,6 @@ pub struct RepositorySnapshot {
     indexed_files: BTreeSet<String>,
     pub resolver: IndexSet,
     pub policy: Policy,
-    pub baseline: Baseline,
     neighborhood: OnceLock<Neighborhood>,
     /// Entities of reparsed documents whose function no longer exists.
     gone: std::collections::HashSet<petgraph::graph::NodeIndex>,
@@ -281,13 +279,8 @@ fn cache_key(
             hasher.update(&[0]);
         }
     }
-    for path in [
-        policy_path.to_path_buf(),
-        repo.join(crate::analyze::baseline::BASELINE_FILE),
-    ] {
-        hasher.update(&std::fs::read(path).unwrap_or_default());
-        hasher.update(&[0]);
-    }
+    hasher.update(&std::fs::read(policy_path).unwrap_or_default());
+    hasher.update(&[0]);
     *hasher.finalize().as_bytes()
 }
 
@@ -312,18 +305,10 @@ fn snapshot_id(
         hasher.update(&[0]);
         hasher.update(source.as_bytes());
     }
-    let baseline_path = repo.join(crate::analyze::baseline::BASELINE_FILE);
-    for path in [policy_path, baseline_path.as_path()] {
-        hasher.update(
-            path.file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .as_bytes(),
-        );
-        hasher.update(&[0]);
-        if path.exists() {
-            hasher.update(&index::hash_source(path)?);
-        }
+    hasher.update(policy_path.file_name().and_then(|s| s.to_str()).unwrap_or("").as_bytes());
+    hasher.update(&[0]);
+    if policy_path.exists() {
+        hasher.update(&index::hash_source(policy_path)?);
     }
     Ok(SnapshotId(hasher.finalize().to_hex().to_string()))
 }
@@ -491,7 +476,6 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
     let mut degraded = degraded;
     let gone = crate::analyze::overlay::remap(&mut built, &facts, &mut degraded);
     let policy = Policy::load_file(&policy_path)?;
-    let baseline = Baseline::load(&repo)?;
     let id = snapshot_id(&repo, &index_paths, &policy_path, &sources)?;
     if index_paths
         .iter()
@@ -513,7 +497,6 @@ fn capture(request: CaptureRequest<'_>) -> Result<Arc<RepositorySnapshot>> {
         indexed_files,
         resolver,
         policy,
-        baseline,
         neighborhood: OnceLock::new(),
         gone,
     });

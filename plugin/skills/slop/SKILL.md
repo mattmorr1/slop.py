@@ -1,6 +1,6 @@
 ---
 name: slop
-description: Check code against the codebase it lives in with the `slop` engine: provable copies of existing functions, calls to names that do not exist, sanctioned-channel bypasses, effect-layer violations, effect-creep, dead code and purity lies, in Python, JS/TS or Rust. Use when the user wants to check code quality, find or clean AI-generated slop, validate a change before committing, answer a slop Stop-hook block, or explicitly says to run slop.
+description: Check code against the codebase it lives in with the `slop` engine: provable copies of existing functions, calls to names that do not exist, sanctioned-channel bypasses, effect-layer violations, dead code and purity lies, in Python, JS/TS or Rust. Use when the user wants to check code quality, find or clean AI-generated slop, validate a change before committing, answer a slop Stop-hook block, or explicitly says to run slop.
 ---
 
 # slop: codebase-relative checks
@@ -34,7 +34,7 @@ whose name lies about its effects.
 1. **Index** once, and after large edits: `slop index <repo>`.
 2. **Check** the working-tree diff (`slop check <repo>`) or everything (`--all`).
 3. **Triage by severity**; every finding carries `fix_guidance`:
-   - BLOCKING: `infra-bypass`, `effect-creep`.
+   - BLOCKING: `infra-bypass`.
    - WARNING: `duplicate-exact`, `duplicate-equivalent`, `purity-lie`,
      `effect-layer-violation`, `dead-island`.
    - ADVISORY: `duplicate-structural`, `parallel-implementation`, `untested-effect`.
@@ -50,6 +50,4 @@ whose name lies about its effects.
   design. `slop init <repo>` proposes a channel policy; `[[layer]]` rules forbid
   effects in a layer. `[agent] gate = "off" | "steer" | "reconcile"` sets how hard
   the hooks push (default `reconcile`).
-- `slop baseline <repo>` grandfathers existing findings and records effect
-  signatures, which is what enables `effect-creep`.
 - Acknowledgements live in `.slop/acks.jsonl`; commit it so reviewers see them.

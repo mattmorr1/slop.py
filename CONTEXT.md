@@ -79,13 +79,13 @@ A callable the codebase already provides, offered to an agent as an alternative 
 
 **Repository snapshot**:
 An immutable, content-identified generation of indexed source, graph, effect
-signatures, policy, baseline, and parsed facts. Every finding and context
+signatures, policy, and parsed facts. Every finding and context
 artifact names the repository snapshot it came from.
 
 **Judgment**:
 The deterministic projection that turns one repository snapshot into ordered
-findings after suppression, submodule exclusion, baseline classification, and
-scope selection. CLI, MCP, hooks, gate, and baseline share it.
+findings after suppression, submodule exclusion, and scope selection. CLI, MCP,
+hooks, and gate share it.
 
 **Context artifact**:
 A deterministic, provenance-bearing selection of full source and contract
@@ -154,7 +154,7 @@ The direction a codebase actually grows, measured from history: adding cases ver
 
 Locked decisions the code cites by id. They come from the original execution plan's decision log, trimmed to what survives P0; ids are stable and never reused.
 
-- **D2: the effect graph is the flagship.** Headline checks are infra-bypass, effect-layer violation, effect-creep and purity-lie; effect-bucketed redundancy comes second. Effect-as-guardrail is the novelty; redundancy is the demo everyone understands.
+- **D2: the effect graph is the flagship.** Headline checks are infra-bypass, effect-layer violation and purity-lie; effect-bucketed redundancy comes second. Effect-as-guardrail is the novelty; redundancy is the demo everyone understands.
 - **D3: effect inference is coarse and conservative.** About 8 to 10 effect categories, a hand-curated seed table, and `Unknown` as the top of the lattice. Precise effect inference in dynamic languages is research-grade; coarse effects are tractable and still sufficient for every check.
 - **D4: duplication tiers 1 and 2 are deterministic.** Tier 1 is an exact body hash, tier 2 a structural near-duplicate hash, and their output order is deterministic. Semantic redundancy is advisory, never blocking: a fuzzy signal that blocked would destroy trust.
 - **D5: name resolution lives behind an adapter.** It is backed by batch SCIP indexes (scip-python, scip-typescript, rust-analyzer). Reuse mature resolution and keep the artifact decoupled, so a native resolver later is a swap, not a rewrite.
@@ -162,5 +162,5 @@ Locked decisions the code cites by id. They come from the original execution pla
 - **D7: the primary mode is diff-relative.** The whole repo is the baseline and model; the diff is what gets judged. `slop check --all` is secondary and builds the baseline. Slop is a delta phenomenon, and this avoids a 4000-finding storm on existing code.
 - **D8: sanctioned channels are inferred from the dominant pattern, written to an editable `slop.toml`, and confirmed by the user.** An empty policy keeps infra-bypass and every other policy-relative check silent. No cold-start false-positive storm and no config-writing burden.
 - **D9: slop is never its own coding agent.** It is a findings engine with machine-readable fix guidance, plus an MCP tool surface and validation gate that an existing agent (Claude Code) drives. Building an agent would reinvent the host, which is the exact sin slop detects.
-- **D12: severity is confidence times impact, collapsed onto the detector taxonomy.** Confidence is intrinsic to the detector: deterministic can block, fuzzy can only advise. Health is severity-weighted slop density; the diff delta is the headline number. A baseline file and reasoned inline suppression (`# slop: allow <rule> — <reason>`) handle existing code.
+- **D12: severity is confidence times impact, collapsed onto the detector taxonomy.** Confidence is intrinsic to the detector: deterministic can block, fuzzy can only advise. Health is severity-weighted slop density; the diff delta is the headline number. Diff-relative judgment and reasoned inline suppression (`# slop: allow <rule> — <reason>`) handle existing code.
 - **D20: def-use comes from SCIP, not from a tree-sitter walk.** Occurrences inside a function's enclosing range, filtered to local and parameter symbols, give scope-exact definitions and uses. tree-sitter keeps the one job it is right for: partitioning body lines into top-level statements, which SCIP does not encode.

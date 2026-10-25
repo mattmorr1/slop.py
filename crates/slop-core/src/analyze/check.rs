@@ -1,6 +1,6 @@
 //! The `check` flow shared by the CLI (`slop check`) and the MCP
-//! `reconcile` tool (M4c): build the graph, run detectors, suppress,
-//! baseline, then either judge the whole repo
+//! `reconcile` tool (M4c): build the graph, run detectors, suppress, then
+//! either judge the whole repo
 //! (`--all`) or just the diff against a git ref (D7's diff-relative mode).
 
 use std::path::{Path, PathBuf};
@@ -74,81 +74,9 @@ pub fn load_analysis_fresh(
     RepositorySnapshot::capture(CaptureRequest { repo, index, policy: None, freshness })
 }
 
-/// One finding plus whether the baseline already grandfathers it. The
-/// interactive dashboard (and any "show me everything" view) needs the full
-/// set *with* the grandfathered ones marked, not silently dropped the way
-/// `run` drops them — that opacity is exactly what makes `slop baseline`
-/// confusing ("why is my repo suddenly clean?").
-pub struct AuditFinding {
-    pub finding: Finding,
-    pub grandfathered: bool,
-}
-
-/// A whole-repo audit: every finding, tagged, most-severe first, with health
-/// scored two ways — counting everything vs. counting only what isn't
-/// grandfathered (what `run` reports).
-pub struct AuditResult {
-    pub snapshot: SnapshotId,
-    pub freshness: SnapshotFreshness,
-    pub findings: Vec<AuditFinding>,
-    /// Health counting every finding (the honest state of the repo).
-    pub health_all: u32,
-    /// Health counting only un-grandfathered findings (what a gated loop acts on).
-    pub health_new: u32,
-    /// How many findings the baseline grandfathers.
-    pub grandfathered: usize,
-    pub policy_is_empty: bool,
-}
-
-/// Run the full detector set over the whole repo and return every finding,
-/// tagging each with whether the baseline grandfathers it. Unlike `run`, this
-/// never hides grandfathered findings — it marks them, so a UI can show the
-/// real state and let the user choose what to look at.
-fn evaluated_findings(analysis: &RepositorySnapshot) -> Result<Vec<AuditFinding>> {
-    let (built, facts) = (&analysis.built, &analysis.facts);
-    let mut raw = crate::analyze::detect::run_all(built, &analysis.policy, facts);
-    raw.extend(crate::analyze::detect::effect_creep(built, &analysis.baseline));
-    let suppressions = suppress::scan(analysis.repo(), facts);
-    let submodules = source::submodule_paths(analysis.repo());
-    let all: Vec<_> = suppress::filter(raw, &suppressions)
-        .into_iter()
-        .filter(|f| !source::in_submodule(&f.file, &submodules))
-        .collect();
-    let grandfathered_set: std::collections::HashSet<(&str, &str)> = analysis
-        .baseline
-        .findings
-        .iter()
-        .map(|e| (e.rule.as_str(), e.entity.as_str()))
-        .collect();
-
-    let mut findings: Vec<AuditFinding> = all
-        .into_iter()
-        .map(|f| {
-            let grandfathered = grandfathered_set.contains(&(f.rule, f.entity.as_str()));
-            AuditFinding { finding: f, grandfathered }
-        })
-        .collect();
-    // Most-severe first, then a stable (rule, entity) order within a severity.
-    findings.sort_by(|a, b| {
-        b.finding
-            .severity
-            .cmp(&a.finding.severity)
-            .then_with(|| a.finding.rule.cmp(b.finding.rule))
-            .then_with(|| a.finding.entity.cmp(&b.finding.entity))
-    });
-
-    Ok(findings)
-}
-
-pub fn effective_findings(analysis: &RepositorySnapshot) -> Result<Vec<Finding>> {
-    Ok(evaluated_findings(analysis)?
-        .into_iter()
-        .filter(|record| !record.grandfathered)
-        .map(|record| record.finding)
-        .collect())
-}
-
-pub fn baseline_findings(analysis: &RepositorySnapshot) -> Vec<Finding> {
+/// Every finding the detectors report over the whole repo after suppressions and
+/// submodule exclusion, most severe first, then by (rule, entity).
+pub fn effective_findings(analysis: &RepositorySnapshot) -> Vec<Finding> {
     let raw = crate::analyze::detect::run_all(&analysis.built, &analysis.policy, &analysis.facts);
     let suppressions = suppress::scan(analysis.repo(), &analysis.facts);
     let submodules = source::submodule_paths(analysis.repo());
@@ -165,31 +93,6 @@ pub fn baseline_findings(analysis: &RepositorySnapshot) -> Vec<Finding> {
     findings
 }
 
-pub fn audit_snapshot(analysis: &RepositorySnapshot) -> Result<AuditResult> {
-    let findings = evaluated_findings(analysis)?;
-    let all: Vec<Finding> = findings.iter().map(|record| record.finding.clone()).collect();
-    let new_only: Vec<Finding> = findings
-        .iter()
-        .filter(|record| !record.grandfathered)
-        .map(|record| record.finding.clone())
-        .collect();
-    let grandfathered = findings.len() - new_only.len();
-    Ok(AuditResult {
-        snapshot: analysis.id().clone(),
-        freshness: analysis.freshness().clone(),
-        findings,
-        health_all: health::score(&all, &analysis.built),
-        health_new: health::score(&new_only, &analysis.built),
-        grandfathered,
-        policy_is_empty: analysis.policy.channels.is_empty(),
-    })
-}
-
-pub fn audit(repo: &Path, index: Option<&Path>) -> Result<AuditResult> {
-    let analysis = load_analysis_fresh(repo, index, Freshness::Reindex)?;
-    audit_snapshot(&analysis)
-}
-
 pub fn run(req: CheckRequest) -> Result<CheckResult> {
     run_with_freshness(req, Freshness::Reindex)
 }
@@ -202,7 +105,7 @@ pub fn run_with_freshness(req: CheckRequest, freshness: Freshness) -> Result<Che
         freshness,
     })?;
     let built = &analysis.built;
-    let effective = effective_findings(&analysis)?;
+    let effective = effective_findings(&analysis);
 
     let current_health = health::score(&effective, built);
     let coverage = scan::coverage(&analysis);
@@ -251,32 +154,26 @@ mod tests {
     }
 
     #[test]
-    fn audit_reports_all_findings_severity_ordered_with_no_baseline() {
-        let out = audit(&fixture("toy_repo_slopped"), None).expect("audit");
+    fn check_reports_findings_most_severe_first() {
+        let out = run(CheckRequest { repo: fixture("toy_repo_slopped").to_path_buf(), all: true, ..Default::default() }).expect("check");
         assert!(!out.findings.is_empty(), "slopped repo should have findings");
-        // No baseline in the fixture -> nothing grandfathered, both healths equal.
-        assert_eq!(out.grandfathered, 0);
-        assert!(out.findings.iter().all(|f| !f.grandfathered));
-        assert_eq!(out.health_all, out.health_new);
-        // Most-severe first.
         for pair in out.findings.windows(2) {
-            assert!(pair[0].finding.severity >= pair[1].finding.severity);
+            assert!(pair[0].severity >= pair[1].severity);
         }
     }
 
     #[test]
-    fn audit_clean_repo_scores_full_health() {
-        let out = audit(&fixture("toy_repo"), None).expect("audit");
+    fn check_clean_repo_scores_full_health() {
+        let out = run(CheckRequest { repo: fixture("toy_repo").to_path_buf(), all: true, ..Default::default() }).expect("check");
         assert!(out.findings.is_empty());
-        assert_eq!(out.health_all, 100);
+        assert_eq!(out.current_health, 100);
     }
 
     #[test]
-    fn check_audit_and_fix_projection_share_fingerprints() {
+    fn check_and_snapshot_projection_share_fingerprints() {
         let repo = fixture("toy_repo_slopped");
         let snapshot = load_analysis_fresh(&repo, None, Freshness::Reindex).expect("snapshot");
-        let audit = audit_snapshot(&snapshot).expect("audit");
-        let fix = effective_findings(&snapshot).expect("fix projection");
+        let effective = effective_findings(&snapshot);
         let check = run(CheckRequest {
             repo: repo.to_path_buf(),
             all: true,
@@ -289,14 +186,7 @@ mod tests {
                 .map(|finding| (finding.rule, finding.entity.clone()))
                 .collect::<Vec<_>>()
         };
-        let active: Vec<Finding> = audit
-            .findings
-            .into_iter()
-            .filter(|record| !record.grandfathered)
-            .map(|record| record.finding)
-            .collect();
-        assert_eq!(keys(&active), keys(&fix));
-        assert_eq!(keys(&fix), keys(&check.findings));
+        assert_eq!(keys(&effective), keys(&check.findings));
         assert_eq!(snapshot.id(), &check.snapshot);
     }
 }
