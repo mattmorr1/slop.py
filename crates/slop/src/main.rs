@@ -64,7 +64,7 @@ impl From<IndexerArg> for Indexer {
 /// Severity threshold at which `slop gate` fails (exits non-zero).
 #[derive(Clone, Copy, ValueEnum)]
 enum FailOn {
-    /// Only deterministic blockers (infra-bypass). Default.
+    /// Only deterministic blockers (infra-bypass, effect-creep). Default.
     Blocking,
     /// ...also Warnings (duplicate-exact, duplicate-equivalent, purity-lie).
     Warning,
@@ -288,6 +288,7 @@ enum Command {
         eval: bool,
     },
     /// Low-level SCIP index introspection (index-info / occurrences / resolve).
+    #[command(hide = true)]
     Debug {
         #[command(subcommand)]
         command: DebugCommand,
