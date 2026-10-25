@@ -31,11 +31,11 @@ functions whose names lie about their effects, and tangled control flow.
    - **BLOCKING** — `infra-bypass`, `effect-creep`. Fix these.
    - **WARNING** — `duplicate-exact`, `duplicate-equivalent`, `purity-lie`,
      `effect-layer-violation`, `dead-island`. Should fix.
-   - **ADVISORY** — `duplicate-structural`, `semantic-redundancy`. Consider.
+   - **ADVISORY** — `duplicate-structural`, `parallel-implementation`, `untested-effect`. Consider.
 4. **Act on `fix_guidance`** for the rest, using what each rule tells you:
    - `infra-bypass` / `effect-layer-violation` → route the I/O through the named
      sanctioned channel / a lower layer, don't do it inline.
-   - `duplicate-exact` / `duplicate-equivalent` / `duplicate-structural` / `semantic-redundancy` → unify
+   - `duplicate-exact` / `duplicate-equivalent` / `duplicate-structural` / `parallel-implementation` → unify
      behind one implementation and delete the copies.
    - `purity-lie` → rename to reflect the I/O, or extract the pure part.
    - `dead-island` → delete, or declare it in `slop.toml` `entry_points`.

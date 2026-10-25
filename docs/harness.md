@@ -1,12 +1,11 @@
 # The slop harness (v2)
 
-`slop` applies only explicit snapshot-bound repairs itself. Semantic changes
-remain driven by the configured agent host:
+`slop` never edits code. Changes are driven by the configured agent host,
+which slop feeds through three surfaces:
 
-1. **MCP tools** — `assess_write`, `validate_change`, `get_context_envelope`, `query_subgraph`.
-2. **Hooks** — read-path compression + sanctioned-channel steering.
+1. **MCP tools** — `find_capability`, `assess_write`, `validate_change`, `query_subgraph`.
+2. **Hooks** — write-time duplicate checks, sanctioned-channel steering, and the session world model.
 3. **Gate** — `slop gate`, the CI/loop entry point (see below).
-4. **Proxy** — `slop proxy`, agent-agnostic steering/observability (see below).
 
 All of it reuses the same analysis engine `slop check` runs — no reimplementation.
 
@@ -22,7 +21,7 @@ slop setup <repo-root> --ai codex --editor zed
 
 wires slop into the selected agent host and saves the AI/editor preference in
 the user's slop config. Claude setup merges the MCP server into `.mcp.json`,
-the read/prompt hooks into `.claude/settings.json`, and drops the **slop skill**
+the write/prompt/session hooks into `.claude/settings.json`, and drops the **slop skill**
 at `.claude/skills/slop/SKILL.md` (an agent
 playbook for `/slop` — check, triage, fix, gate), pointing every entry at the
 binary you invoked. Codex setup adds a delimited project-scoped MCP block to
@@ -32,20 +31,8 @@ re-running updates slop's entries and preserves every other MCP server, hook,
 and Codex TOML byte-for-byte. It
 refuses to touch a config file that isn't valid JSON unless you pass `--force`.
 `slop uninstall` structurally removes only owned entries; `slop doctor` checks
-the host, editor, receipt, project markers, and index. `slop install` remains a
-Claude-only compatibility command. Restart the agent host after setup.
-
-### Local LLM (Ollama)
-
-Anywhere slop needs an LLM it can use a local Ollama model instead of the
-Claude API — free, offline, no key:
-
-- **Tier-3 judging**: `SLOP_JUDGE=ollama slop check <repo> --tier3` (or via
-  `validate_change`). Selects the local backend; otherwise Claude is used.
-- **Skeleton densification**: `slop compress … --densify` adds a one-line
-  semantic summary above each skeleton (pure gain on undocumented functions).
-- Config: `OLLAMA_HOST` (default `http://localhost:11434`), `OLLAMA_MODEL`
-  (default `qwen2.5:1.5b`). Requires `ollama serve` running.
+the host, editor, receipt, project markers, and index. Restart the agent host
+after setup.
 
 ---
 
@@ -83,15 +70,13 @@ slop index <repo>
 | --- | --- | --- |
 | `find_capability` | What the codebase already provides for an intent | `intent`, `effect`, `limit` |
 | `assess_write` | Proposed-source policy findings and existing homes | `file`, `content`, `limit` |
-| `validate_change` | Full detector suite → findings + fix guidance | `all`, `base`, `tier3` |
-| `get_context_envelope` | Calibrated, budget-capped context around an entity (ADR 0005) | `target_entity`, `token_budget`, `edit_zone_hops`, `min_probability` |
+| `validate_change` | Full detector suite → findings + fix guidance | `all`, `base` |
 | `query_subgraph` | Callers/callees/imports + effect signature | `entity`, `depth`, `edge_kinds` |
 
 `find_capability` is the intent-first entry point: the graph tools take an entity
 id, and until now nothing produced one — the graph's only lookup was an exact
 match on an id the agent had no way to guess. Ask it what exists before writing
-a new implementation, then feed any id it returns to `query_subgraph` or
-`get_context_envelope`. Ranking is deterministic (name / module / docstring
+a new implementation, then feed any id it returns to `query_subgraph`. Ranking is deterministic (name / module / docstring
 token overlap, ties broken by how many places call it): no embeddings, no LLM.
 
 ---
@@ -131,32 +116,10 @@ Every hook call appends one line to `<repo>/.slop/hooks.jsonl` (event, file,
 latency, injected tokens, duplicates and reuse suggestions fired) for measuring
 the harness in daily use. `SLOP_HOOK_LOG=0` turns it off.
 
-- `slop hook post-tool-use` — maintains a **session edit zone** and does
-  **zoned graph-distance compression** on reads:
-  - On a `Write`/`Edit`/`MultiEdit` of a file in any supported language
-    (Python, JS/TS, Rust), records it in the edit zone (a small state file in
-    the system temp dir, keyed by repo).
-  - On a `Read` of such a file, skeletonizes functions that are more than
-    `edit_zone_hops` (1) graph hops from the edit zone — full fidelity for the
-    code you're working near, a signature + effect-signature + docstring
-    contract for the distant context — and attaches sanctioned-channel
-    steering (`additionalContext`).
-  - **Edit-invertibility guarantee:** a read is *only ever* remapped by that
-    zoned skeletonization of graph-distant code (which you're editing
-    elsewhere, so you won't string-edit against it). Every other read is served
-    **verbatim** — no strip, no skeleton — so an `Edit` can always match the
-    real file. A **re-read** is served verbatim too (the agent came back to it,
-    likely to edit): this self-corrects a first-read edit that missed against a
-    skeleton (fail → re-read → verbatim → succeeds). Set
-    `SLOP_COMPRESS_READS=0` to disable read compression entirely (steering
-    still applies).
-  - Non-`Read`/`Write`/`Edit` calls, and reads of files in no supported
-    language, pass through untouched.
-
-  > Cost: a read that triggers zoned compression builds the graph
-  > (~0.1–0.5s depending on repo size, needs `<repo>/index.scip`). Small
-  > files, cold reads, and re-reads skip it. Preview/measure with `slop
-  > compress <repo> <file> --edit-file <other-file> --hops 1 --stats`.
+- `slop hook post-tool-use` — attaches sanctioned-channel steering to a `Read`
+  of a supported source file. Setup no longer registers it (and removes an old
+  registration); it is kept so installs from before read compression was removed
+  keep working.
 - `slop hook user-prompt-submit` — injects the repo's sanctioned-channel
   policy plus a pointer to `validate_change` as pre-hoc steering.
 - `slop hook session-start` / `slop hook subagent-start` — injects the
@@ -175,9 +138,8 @@ the harness in daily use. `SLOP_HOOK_LOG=0` turns it off.
     capabilities are trimmed first, so the policy facts always survive.
   - Silent when there is nothing to say (no policy and no graph).
 
-Register in `.claude/settings.json` (or just run `slop setup --ai claude`, which writes
-exactly this). The matcher covers the write tools too, so the hook can record
-the session edit zone that read compression measures graph distance against:
+Register in `.claude/settings.json` (or just run `slop setup --ai claude`, which
+writes these plus the `SessionStart` and `SubagentStart` entries):
 
 ```json
 {
@@ -187,14 +149,6 @@ the session edit zone that read compression measures graph distance against:
         "matcher": "Write|Edit|MultiEdit",
         "hooks": [
           { "type": "command", "command": "/abs/path/to/target/release/slop hook pre-tool-use" }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Read|Write|Edit|MultiEdit",
-        "hooks": [
-          { "type": "command", "command": "/abs/path/to/target/release/slop hook post-tool-use" }
         ]
       }
     ],
@@ -209,11 +163,6 @@ the session edit zone that read compression measures graph distance against:
 }
 ```
 
-> Field-name note: the read-remap reads the file text from `tool_output` or
-> `tool_response` (string, or `{content|file|text}` object). If your Claude
-> Code version names it differently, the hook passes the read through
-> unchanged rather than corrupting it. Steering still applies.
-
 ---
 
 ## 3. Gate
@@ -225,12 +174,12 @@ It runs the full check and **exits non-zero when any finding is at or above the
 edits.
 
 ```
-slop gate <repo> [--base HEAD] [--all] [--tier3] [--fail-on blocking|warning|advisory] [--reindex] [--worktree]
+slop gate <repo> [--base HEAD] [--all] [--fail-on blocking|warning|advisory] [--reindex] [--worktree]
 ```
 
 - `--fail-on warning` makes the gate fail on Warnings too — this is what lets
-  the loop act on `duplicate-exact`, `duplicate-equivalent`, `complexity-spike` and `purity-lie`, not
-  just the deterministic blockers (`infra-bypass`, `circular-import`). The JSON
+  the loop act on `duplicate-exact`, `duplicate-equivalent` and `purity-lie`, not
+  just the deterministic blockers (`infra-bypass`, `effect-creep`). The JSON
   reports `fail_on`, `failing` (count at/above threshold), and `blocking`.
 - `--reindex` regenerates every detected language's SCIP artifact before checking,
   so a re-run after edits sees the new graph.
@@ -245,26 +194,3 @@ loop:
   → agent edits
 ```
 
----
-
-## 4. Proxy
-
-`slop proxy` is an `ANTHROPIC_BASE_URL` reverse proxy for agent-agnostic
-steering and token observability (never cert-MITM). Point any Anthropic client
-at it:
-
-```
-slop proxy --port 8787 [--repo <repo>] [--steer] [--log slop-proxy.jsonl]
-ANTHROPIC_BASE_URL=http://localhost:8787 <your agent>
-```
-
-- Streams responses through untouched (SSE `stream:true` included).
-- Appends one JSONL record per request to `--log` with model + token usage.
-- `--steer` (with `--repo`) augments the request's system prompt with the repo's
-  **world model** — the same sanctioned channels, layer rules and capability
-  index the `SessionStart` hook injects (`world::render`). The hook only reaches
-  Claude Code; this is how every other Anthropic client gets it. Rendered once
-  at startup, so it costs one graph build per launch rather than one per
-  request, and degrades to policy-only when the repo has no index.
-- Compression stays on the hook path. The proxy sees the request after context
-  is assembled, which is too late to compress it (D10).
