@@ -49,6 +49,6 @@ functions whose names lie about their effects, and tangled control flow.
 - `slop baseline <repo>` grandfathers existing findings *and* records each
   function's effect signature — which is what later enables `effect-creep`
   (a function that was pure then, doing I/O now).
-- If slop's MCP server is registered (via `slop install`), the
+- If slop's MCP server is registered (via `slop setup`), the
   `find_capability`, `assess_write`, `validate_change`, and `query_subgraph` tools are
   available directly — prefer `validate_change` over shelling out mid-session.

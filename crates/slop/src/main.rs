@@ -246,35 +246,6 @@ enum Command {
         #[arg(long, default_value_t = 12)]
         iterations: usize,
     },
-    /// Wire slop's harness into a repo's agent-host config: merge the MCP
-    /// server into `<repo>/.mcp.json` and the read/prompt hooks into
-    /// `<repo>/.claude/settings.json`, pointing at this binary. Idempotent —
-    /// re-running updates slop's own entries and leaves the rest untouched.
-    #[command(hide = true)]
-    Install {
-        /// Repo root to install into (default: current directory)
-        #[arg(default_value = ".")]
-        repo: PathBuf,
-        /// Overwrite even if an existing config file fails to parse as JSON
-        #[arg(long)]
-        force: bool,
-    },
-    /// Launch Claude Code with slop's context layer active. Idempotently wires
-    /// the harness (MCP tools + read/prompt hooks + skill) into the repo, then
-    /// starts `claude` there so it loads them. Args after `--` pass through to
-    /// claude (e.g. `slop claude -- --resume`).
-    #[command(hide = true)]
-    Claude {
-        /// Repo root (default: current directory)
-        #[arg(default_value = ".")]
-        repo: PathBuf,
-        /// Skip the idempotent harness install (assume it's already wired)
-        #[arg(long)]
-        no_install: bool,
-        /// Args passed through to claude (everything after `--`)
-        #[arg(last = true)]
-        claude_args: Vec<String>,
-    },
     /// Record current findings as the grandfathered baseline.
     Baseline {
         /// Repo root (default: current directory)
@@ -553,16 +524,6 @@ fn main() -> Result<()> {
             setup::launch(&repo, ai, editor, no_setup, no_editor, &args)?;
         }
         Command::Equiv { pairs, iterations } => run_equiv(&pairs, iterations)?,
-        Command::Install { repo, force } => {
-            install_harness(&repo, force)?;
-        }
-        Command::Claude {
-            repo,
-            no_install,
-            claude_args,
-        } => {
-            launch_claude(&repo, no_install, &claude_args)?;
-        }
         Command::Baseline { repo, index } => {
             let analysis = check::load_analysis(&repo, index.as_deref())?;
             let findings = check::baseline_findings(&analysis);
@@ -916,38 +877,6 @@ fn print_check_json(result: &CheckResult) -> Result<()> {
         "findings": result.findings,
     });
     println!("{}", serde_json::to_string_pretty(&out)?);
-    Ok(())
-}
-
-/// Compatibility shim for the original Claude-only command.
-fn install_harness(repo: &Path, force: bool) -> Result<()> {
-    let _ = setup::configure_claude(repo, force)?;
-    println!("Claude harness installed; `slop setup` configures other hosts and editors");
-    Ok(())
-}
-
-/// Launch Claude Code in `repo` with slop's context layer active: wire the
-/// harness (unless `no_install`), then run `claude` with the repo as its working
-/// directory so it loads `.mcp.json` + the hooks.
-fn launch_claude(repo: &Path, no_install: bool, claude_args: &[String]) -> Result<()> {
-    let repo = repo
-        .canonicalize()
-        .with_context(|| format!("resolving repo path {}", repo.display()))?;
-
-    if !no_install {
-        install_harness(&repo, false)?;
-        eprintln!();
-    }
-
-    // Hand the terminal to claude (a full TUI); wait for it to exit.
-    let status = Process::new("claude")
-        .current_dir(&repo)
-        .args(claude_args)
-        .status()
-        .context("launching claude (is Claude Code on PATH?)")?;
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
     Ok(())
 }
 

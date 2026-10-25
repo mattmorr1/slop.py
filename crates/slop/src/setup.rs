@@ -102,18 +102,6 @@ pub fn configure(
     Ok(preferences)
 }
 
-pub fn configure_claude(repo: &Path, force: bool) -> Result<Preferences> {
-    configure(
-        repo,
-        Some(AgentHost::Claude),
-        load_preferences()
-            .ok()
-            .map(|p| p.editor)
-            .or(Some(Editor::None)),
-        force,
-    )
-}
-
 pub fn uninstall(repo: &Path, force: bool) -> Result<Vec<PathBuf>> {
     let repo = canonical_repo(repo)?;
     let state_path = repo.join(STATE_PATH);
