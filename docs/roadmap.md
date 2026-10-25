@@ -1,9 +1,41 @@
 # Roadmap: sketch, bind, lower
 
-Status: signed off 2026-10-25. P0 and P1 have PRDs in `docs/prd/`; P2 to P5
-get theirs after gate G1, because G1 decides what they contain.
+Status: re-planned 2026-10-25 after G1 failed. P0 is merged; the current plan
+is the next section. The sections after it are the plan as first signed off,
+kept for the record.
 
-## Mission
+## Re-plan after G1: a verifier, not a retriever
+
+B5 and B5b both failed their gates (`bench/README.md`). Blind sketches name too
+few repository helpers to bind; priming them with nearby names only ties the
+envelope, and ranking those names with no sketch does as well. Two R8 runs
+showed the same for ranked context before writing. Ranked retrieval, before or
+after the write, has not produced a measured gain at 7-8B.
+
+What held up is what is exact: E-sound equivalence (B3, zero false
+equivalences), channel steering (two pilots), and one bind signal, cross-file
+recall (+15.3 points over the envelope, +10.2 over the names-only control),
+which comes from resolving the names a draft calls.
+
+Mission: **slop checks what Claude wrote against facts about the repository
+that Claude cannot compute by reading, and will not let a turn end on one it
+got wrong.** The facts are provable: the code duplicates an existing function,
+calls a name that does not exist, or bypasses a sanctioned channel. Ranked
+matches ride along as advice, never as blocks.
+
+| Phase | Work | PRD |
+| --- | --- | --- |
+| P0 | Cut and consolidate | done (merged) |
+| P1 | B5, B5b | done: G1 and G1b fail |
+| P3 | Claude Code plugin: reconcile gate (L2) on provable facts; unresolved-name check with cross-file suggestions; structural duplicates as advice | `docs/prd/P3-plugin-and-reconcile-gate.md` |
+| P5 | PyPI wheel `slop-cli` (`slop` is taken), so the plugin can run `uvx --from slop-cli slop` | `docs/prd/P5-pypi-wheel.md` |
+| P4 | R9 on Claude Code: arms no plugin, L1, L2 | after budget is agreed |
+
+Dropped: P2 (a Rust port of the binder); its one useful signal moves into P3 as
+the unresolved-name check. Not restored: the context envelope, which wins a
+proxy metric that two end-to-end runs show does not become better code.
+
+## Mission (as first signed off)
 
 > The agent sketches; slop binds the sketch to your codebase; the agent lowers it
 > to production code.
