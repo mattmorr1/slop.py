@@ -170,6 +170,8 @@ def summarise(tasks: dict, per_task: dict, per_sketch: list[dict]) -> dict:
         for s in per_sketch:
             if key is None or (tasks[s["id"]]["repo"] if key == "repo" else s[key]) == want:
                 by_task[s["id"]].append(s)
+        if not by_task:
+            continue
         # Cluster = task: a task's sketches are averaged first, then tasks are resampled.
         values = {i: {**per_task[i], **{arm: {m: mean([s[arm][m] for s in rows]) for m in metrics + [f"tokens@{b}" for b in BUDGETS]}
                                         for arm in ("bind", "bind+file")}} for i, rows in sorted(by_task.items())}
